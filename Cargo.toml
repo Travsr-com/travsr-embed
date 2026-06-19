@@ -29,9 +29,9 @@ tokenizers = "0.23"
 # SQLite (bundled amalgamation — no system SQLite required) for graph.db I/O.
 rusqlite   = { version = "0.32", features = ["bundled"] }
 
-# Pure-Rust HNSW index for O(log n) approximate nearest-neighbour search.
-# Replaces sqlite-vec (whose 0.1.10-alpha.4 packaging omits sqlite-vec-diskann.c).
-hnsw_rs = "0.3"
+# usearch HNSW index — disk-persistent, mmap-loadable, incremental inserts.
+# Replaces in-memory hnsw_rs (RFC-018, Option B).
+usearch = "2.25.3"
 
 dirs    = "5"
 anyhow  = "1"

@@ -33,8 +33,14 @@ pub struct NomicModel {
 
 impl NomicModel {
     pub fn load(model_dir: &Path) -> Result<Self> {
+        let parallelism = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+
         let session = Session::builder()
             .context("ORT session builder")?
+            .with_intra_threads(parallelism)
+            .map_err(|e| anyhow::anyhow!("setting intra-op thread count: {e}"))?
             .commit_from_file(model_dir.join("model_int8.onnx"))
             .context("loading model_int8.onnx")?;
 
@@ -88,6 +94,19 @@ impl NomicModel {
         let batch = encodings.len();
         let seq = encodings.iter().map(|e| e.get_ids().len()).max().unwrap_or(1);
 
+        // Pre-compute real token counts from encodings before building flat arrays,
+        // so attn_mask_flat can be moved into the tensor without cloning.
+        let n_real_per_item: Vec<usize> = encodings
+            .iter()
+            .map(|e| {
+                e.get_attention_mask()
+                    .iter()
+                    .filter(|&&m| m == 1)
+                    .count()
+                    .max(1)
+            })
+            .collect();
+
         let mut input_ids_flat = vec![0i64; batch * seq];
         let mut attn_mask_flat = vec![0i64; batch * seq];
         let token_type_flat = vec![0i64; batch * seq]; // always 0 for single-sentence
@@ -109,7 +128,7 @@ impl NomicModel {
         let ids_tensor = Tensor::from_array(([batch, seq], input_ids_flat.into_boxed_slice()))
             .context("build input_ids tensor")?;
         let mask_tensor =
-            Tensor::from_array(([batch, seq], attn_mask_flat.clone().into_boxed_slice()))
+            Tensor::from_array(([batch, seq], attn_mask_flat.into_boxed_slice()))
                 .context("build attention_mask tensor")?;
         let types_tensor =
             Tensor::from_array(([batch, seq], token_type_flat.into_boxed_slice()))
@@ -135,12 +154,7 @@ impl NomicModel {
             .context("extract last_hidden_state")?;
 
         let mut blobs = Vec::with_capacity(batch);
-        for i in 0..batch {
-            let n_real = attn_mask_flat[i * seq..(i + 1) * seq]
-                .iter()
-                .filter(|&&m| m == 1)
-                .count()
-                .max(1);
+        for (i, &n_real) in n_real_per_item.iter().enumerate() {
 
             let mut pooled = [0f32; HIDDEN];
             for j in 0..n_real {

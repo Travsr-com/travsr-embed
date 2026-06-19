@@ -1,0 +1,98 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  BINARY: travsr-embed-nomic
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14           # native ARM64 runner
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04
+            cross: true
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+      # travsr (sibling repo) is required for [patch.crates-io] path deps.
+      - uses: actions/checkout@v4
+        with:
+          repository: Travsr-com/travsr
+          path: ../travsr
+          ref: master
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross (Linux cross-compile)
+        if: matrix.cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build (native)
+        if: "!matrix.cross"
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.cross
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Bundle binary + ORT dylib
+        shell: bash
+        run: |
+          TARGET_DIR="target/${{ matrix.target }}/release"
+          OUTDIR="dist"
+          mkdir -p "$OUTDIR"
+
+          BIN="${{ env.BINARY }}-${{ matrix.target }}"
+          cp "$TARGET_DIR/${{ env.BINARY }}" "$OUTDIR/$BIN"
+
+          # Bundle the ORT shared library (copy-dylibs placed it next to binary).
+          for lib in "$TARGET_DIR"/libonnxruntime.*; do
+            [ -f "$lib" ] && cp "$lib" "$OUTDIR/"
+          done
+
+          # SHA256 sidecar for CLI integrity check.
+          cd "$OUTDIR"
+          if command -v sha256sum &>/dev/null; then
+            sha256sum "$BIN" | awk '{print $1}' > "$BIN.sha256"
+          else
+            shasum -a 256 "$BIN" | awk '{print $1}' > "$BIN.sha256"
+          fi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BINARY }}-${{ matrix.target }}
+          path: dist/
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/**
+          generate_release_notes: true

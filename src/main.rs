@@ -166,8 +166,39 @@ fn write_current_embed_model_meta(conn: &rusqlite::Connection) -> Result<()> {
 /// Byte-count-based token estimate for bin-packing: BPE encodes ~4 bytes/token
 /// for ASCII code. +4 accounts for the "search_document:" prefix tokens.
 /// Accurate enough to bound padded tensor cost; actual count differs by <20%.
-fn estimate_tokens(kind: &str, sig: &str) -> usize {
-    (kind.len() + sig.len() + 2) / 4 + 4
+fn estimate_tokens(text: &str) -> usize {
+    text.len() / 4 + 4
+}
+
+/// Build the embedding text for a file node by concatenating the kind and
+/// signature of every non-file symbol that shares the same path, ordered by
+/// source line.  The file path is prepended so the model can anchor on it.
+///
+/// Falls back to the bare path when the file has no indexed symbols (e.g. an
+/// empty file or one that was never parsed), so we never embed an empty string.
+fn build_file_text(conn: &Connection, file_path: &str) -> String {
+    let mut stmt = match conn.prepare_cached(
+        "SELECT kind, signature FROM nodes \
+         WHERE path = ?1 \
+         AND kind != 'file' AND kind != 'file-module' \
+         ORDER BY line",
+    ) {
+        Ok(s) => s,
+        Err(_) => return file_path.to_string(),
+    };
+    let parts: Vec<String> = stmt
+        .query_map([file_path], |row| {
+            let kind: String = row.get(0)?;
+            let sig: String = row.get(1)?;
+            Ok(format!("{kind}: {sig}"))
+        })
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default();
+    if parts.is_empty() {
+        file_path.to_string()
+    } else {
+        format!("file: {file_path}\n{}", parts.join("\n"))
+    }
 }
 
 // ── --reindex mode ────────────────────────────────────────────────────────────
@@ -211,27 +242,37 @@ fn reindex(model_dir: &Path, db_path: &Path, shard: Option<(usize, usize)>) -> R
     )
     .context("configure SQLite pragmas")?;
 
+    // Only embed file nodes (~2.5k per repo vs ~115k symbols).
+    // Embedding text is built from contained symbols via build_file_text().
     // Use ((id % n) + n) % n for unsigned-safe modulo: SQLite's % returns negative
     // values for negative inputs, so bare `id % n` misses nodes with negative IDs
     // (Kythe VName hashes are i64 and can be negative).
     let mut stmt = conn.prepare(
-        "SELECT n.id, n.kind, n.signature \
+        "SELECT n.id, n.path \
          FROM nodes n \
-         WHERE NOT EXISTS ( \
+         WHERE n.kind = 'file' \
+         AND NOT EXISTS ( \
              SELECT 1 FROM node_embeddings e \
              WHERE e.node_id = n.id AND e.model_id = ?1 \
          ) AND (((n.id % ?2) + ?2) % ?2 = ?3)",
     )?;
-    let pending: Vec<(i64, String, String)> = stmt
+    let pending: Vec<(i64, String)> = stmt
         .query_map(
             rusqlite::params![MODEL_ID, n_shards as i64, shard_idx as i64],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?
         .filter_map(|r| r.ok())
         .collect();
 
     let total = pending.len();
-    tracing::info!(total, shard_idx, n_shards, "nodes to embed");
+    tracing::info!(total, shard_idx, n_shards, "file nodes to embed");
+
+    // Pre-build embedding texts: one string per file, composed from contained symbols.
+    // Done before batching so token estimation has access to the full text length.
+    let texts: Vec<(i64, String)> = pending
+        .iter()
+        .map(|(id, path)| (*id, build_file_text(&conn, path)))
+        .collect();
 
     let index_path = index_path_for_db(db_path);
 
@@ -298,13 +339,13 @@ fn reindex(model_dir: &Path, db_path: &Path, shard: Option<(usize, usize)>) -> R
         Some(idx)
     };
 
-    // ── bin-pack pending nodes into token-budget-bounded batches ──────────────
+    // ── bin-pack file texts into token-budget-bounded batches ─────────────────
     //
     // Cost model: BatchLongest pads all items to max_seq × count tokens.
     // estimate_tokens() uses byte_len / 4 as a cheap proxy — accurate enough.
-    let est_lens: Vec<usize> = pending
+    let est_lens: Vec<usize> = texts
         .iter()
-        .map(|(_, kind, sig)| estimate_tokens(kind, sig))
+        .map(|(_, text)| estimate_tokens(text))
         .collect();
 
     let mut batch_ranges: Vec<std::ops::Range<usize>> = Vec::new();
@@ -324,8 +365,8 @@ fn reindex(model_dir: &Path, db_path: &Path, shard: Option<(usize, usize)>) -> R
                 batch_max_est = new_max;
             }
         }
-        if batch_start < pending.len() {
-            batch_ranges.push(batch_start..pending.len());
+        if batch_start < texts.len() {
+            batch_ranges.push(batch_start..texts.len());
         }
     }
 
@@ -360,17 +401,13 @@ fn reindex(model_dir: &Path, db_path: &Path, shard: Option<(usize, usize)>) -> R
     };
 
     for range in batch_ranges {
-        let chunk = &pending[range];
-        let texts: Vec<String> = chunk
-            .iter()
-            .map(|(_, kind, sig)| format!("{kind}: {sig}"))
-            .collect();
-        let text_refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let chunk = &texts[range];
+        let text_refs: Vec<&str> = chunk.iter().map(|(_, t)| t.as_str()).collect();
 
         // ONNX inference: no transaction open, write lock not held.
         let blobs = model.embed_documents(&text_refs)?;
 
-        for ((node_id, _, _), blob) in chunk.iter().zip(blobs.iter()) {
+        for ((node_id, _), blob) in chunk.iter().zip(blobs.iter()) {
             tx_buffer.push((*node_id, blob.clone()));
         }
 

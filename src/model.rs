@@ -44,9 +44,8 @@ impl NomicModel {
             .commit_from_file(model_dir.join("model_int8.onnx"))
             .context("loading model_int8.onnx")?;
 
-        let mut tokenizer =
-            Tokenizer::from_file(model_dir.join("tokenizer.json"))
-                .map_err(|e| anyhow::anyhow!("tokenizer load: {e}"))?;
+        let mut tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))
+            .map_err(|e| anyhow::anyhow!("tokenizer load: {e}"))?;
 
         tokenizer.with_padding(Some(PaddingParams {
             strategy: PaddingStrategy::BatchLongest,
@@ -63,7 +62,10 @@ impl NomicModel {
             }))
             .map_err(|e| anyhow::anyhow!("truncation config: {e}"))?;
 
-        Ok(Self { session: Mutex::new(session), tokenizer })
+        Ok(Self {
+            session: Mutex::new(session),
+            tokenizer,
+        })
     }
 
     /// Embed texts for indexing.  Returns one 1024-byte BLOB per input.
@@ -76,7 +78,9 @@ impl NomicModel {
     pub fn embed_query(&self, text: &str) -> Result<Vec<u8>> {
         let prefixed = format!("{QUERY_PREFIX}{text}");
         let mut blobs = self.embed_raw(&[&prefixed])?;
-        blobs.pop().ok_or_else(|| anyhow::anyhow!("empty embed result"))
+        blobs
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("empty embed result"))
     }
 
     // ── shared inference core ─────────────────────────────────────────────────
@@ -92,7 +96,11 @@ impl NomicModel {
             .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
 
         let batch = encodings.len();
-        let seq = encodings.iter().map(|e| e.get_ids().len()).max().unwrap_or(1);
+        let seq = encodings
+            .iter()
+            .map(|e| e.get_ids().len())
+            .max()
+            .unwrap_or(1);
 
         // Pre-compute real token counts from encodings before building flat arrays,
         // so attn_mask_flat can be moved into the tensor without cloning.
@@ -127,12 +135,10 @@ impl NomicModel {
         // Shape ([batch, seq], Box<[T]>) uses the (D: ToShape, Box<[T]>) OwnedTensorArrayData impl.
         let ids_tensor = Tensor::from_array(([batch, seq], input_ids_flat.into_boxed_slice()))
             .context("build input_ids tensor")?;
-        let mask_tensor =
-            Tensor::from_array(([batch, seq], attn_mask_flat.into_boxed_slice()))
-                .context("build attention_mask tensor")?;
-        let types_tensor =
-            Tensor::from_array(([batch, seq], token_type_flat.into_boxed_slice()))
-                .context("build token_type_ids tensor")?;
+        let mask_tensor = Tensor::from_array(([batch, seq], attn_mask_flat.into_boxed_slice()))
+            .context("build attention_mask tensor")?;
+        let types_tensor = Tensor::from_array(([batch, seq], token_type_flat.into_boxed_slice()))
+            .context("build token_type_ids tensor")?;
 
         let mut guard = self
             .session
@@ -155,7 +161,6 @@ impl NomicModel {
 
         let mut blobs = Vec::with_capacity(batch);
         for (i, &n_real) in n_real_per_item.iter().enumerate() {
-
             let mut pooled = [0f32; HIDDEN];
             for j in 0..n_real {
                 let base = i * seq * HIDDEN + j * HIDDEN;

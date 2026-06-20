@@ -62,10 +62,18 @@ impl NomicPlugin {
 }
 
 impl EmbedPlugin for NomicPlugin {
-    fn model_id(&self) -> &str { MODEL_ID }
-    fn embedding_dim(&self) -> u32 { EMBED_DIM }
-    fn backend(&self) -> &str { BACKEND }
-    fn max_batch(&self) -> u32 { MAX_BATCH }
+    fn model_id(&self) -> &str {
+        MODEL_ID
+    }
+    fn embedding_dim(&self) -> u32 {
+        EMBED_DIM
+    }
+    fn backend(&self) -> &str {
+        BACKEND
+    }
+    fn max_batch(&self) -> u32 {
+        MAX_BATCH
+    }
 
     fn embed_batch(&self, req: &EmbedRequest) -> EmbedResponse {
         let texts: Vec<&str> = req.texts.iter().map(String::as_str).collect();
@@ -80,10 +88,16 @@ impl EmbedPlugin for NomicPlugin {
 
     fn knn(&self, req: &KnnRequest) -> KnnResponse {
         match self.knn_impl(req) {
-            Ok((ids, scores)) => KnnResponse { node_ids: ids, scores },
+            Ok((ids, scores)) => KnnResponse {
+                node_ids: ids,
+                scores,
+            },
             Err(e) => {
                 tracing::warn!("knn failed (non-fatal): {e:#}");
-                KnnResponse { node_ids: vec![], scores: vec![] }
+                KnnResponse {
+                    node_ids: vec![],
+                    scores: vec![],
+                }
             }
         }
     }
@@ -115,7 +129,10 @@ impl NomicPlugin {
         let raw = idx.knn(&query_blob, req.k)?;
         let ids: Vec<i64> = raw.iter().map(|&(id, _)| id).collect();
         // usearch returns cosine distance; convert to similarity score.
-        let scores: Vec<f32> = raw.iter().map(|&(_, d)| (1.0 - d).clamp(0.0, 1.0)).collect();
+        let scores: Vec<f32> = raw
+            .iter()
+            .map(|&(_, d)| (1.0 - d).clamp(0.0, 1.0))
+            .collect();
         Ok((ids, scores))
     }
 }
@@ -147,27 +164,46 @@ fn reindex(model_dir: &Path, db_path: &Path) -> Result<()> {
          )",
     )?;
     let pending: Vec<(i64, String, String)> = stmt
-        .query_map([MODEL_ID], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .query_map([MODEL_ID], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
         .filter_map(|r| r.ok())
         .collect();
 
     let total = pending.len();
     tracing::info!(total, "nodes to embed");
 
+    let index_path = model_dir.join("hnsw.usearch");
+
     if total == 0 {
-        println!("All nodes already have embeddings for {MODEL_ID}.");
+        // All nodes already embedded. If the index file is also present, nothing to do.
+        // If the index file is missing (e.g. first run after upgrading from hnsw_rs, or
+        // after accidental deletion), rebuild it by streaming from node_embeddings.
+        if index_path.exists() {
+            println!("All nodes already have embeddings for {MODEL_ID}. Index up to date.");
+            return Ok(());
+        }
+        let existing: usize = conn
+            .query_row(
+                "SELECT COUNT(*) FROM node_embeddings WHERE model_id = ?1",
+                [MODEL_ID],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        println!("All nodes already embedded ({existing} rows). Building missing HNSW index...");
+        index::VecIndex::build_from_db(db_path, MODEL_ID, &index_path, existing)
+            .context("build_from_db")?;
+        println!("Done — index saved to {}.", index_path.display());
         return Ok(());
     }
 
     // Open or create the usearch HNSW index.
-    let index_path = model_dir.join("hnsw.usearch");
     let idx = if index_path.exists() {
         index::VecIndex::try_load(&index_path)
             .context("load existing HNSW index")?
             .expect("index file exists but load returned None")
     } else {
-        index::VecIndex::new_empty(&index_path, total)
-            .context("create new HNSW index")?
+        index::VecIndex::new_empty(&index_path, total).context("create new HNSW index")?
     };
 
     // Prepare INSERT once; reuse across all chunks.
@@ -210,6 +246,15 @@ fn reindex(model_dir: &Path, db_path: &Path) -> Result<()> {
 
     conn.execute("COMMIT", [])?;
     idx.save()?;
+
+    // Record which model produced the embeddings so the daemon's model-mismatch
+    // guard has a value to compare against on startup.
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES ('current_embed_model', ?1)",
+        [MODEL_ID],
+    )
+    .context("writing current_embed_model meta")?;
+
     println!(
         "Done — {inserted} nodes embedded. Index saved to {}.",
         index_path.display()
@@ -251,22 +296,20 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        None => {
-            match NomicPlugin::load(&model_dir) {
-                Ok(plugin) => {
-                    tracing::info!(
-                        model_dir = %model_dir.display(),
-                        model_id  = MODEL_ID,
-                        "embed sidecar ready"
-                    );
-                    run_embed_plugin(plugin);
-                }
-                Err(e) => {
-                    eprintln!("travsr-embed: startup failed: {e:#}");
-                    std::process::exit(1);
-                }
+        None => match NomicPlugin::load(&model_dir) {
+            Ok(plugin) => {
+                tracing::info!(
+                    model_dir = %model_dir.display(),
+                    model_id  = MODEL_ID,
+                    "embed sidecar ready"
+                );
+                run_embed_plugin(plugin);
             }
-        }
+            Err(e) => {
+                eprintln!("travsr-embed: startup failed: {e:#}");
+                std::process::exit(1);
+            }
+        },
         Some(other) => {
             eprintln!("unknown argument: {other}");
             eprintln!("usage: travsr-embed-nomic [--reindex <db-path>]");

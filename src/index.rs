@@ -90,9 +90,8 @@ impl VecIndex {
         let inner = Index::new(&make_options()).context("create usearch Index")?;
         inner.reserve(n).context("reserve capacity")?;
 
-        let mut stmt = conn.prepare(
-            "SELECT node_id, embedding FROM node_embeddings WHERE model_id = ?1",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT node_id, embedding FROM node_embeddings WHERE model_id = ?1")?;
         let mut rows = stmt.query([model_id])?;
         let mut count = 0usize;
         while let Some(row) = rows.next()? {
@@ -123,9 +122,7 @@ impl VecIndex {
     /// Add one node's embedding to the index. Called per-node during reindex.
     /// usearch handles internal synchronisation; takes &self.
     pub fn add(&self, node_id: i64, vec: &[f32]) -> Result<()> {
-        self.inner
-            .add(node_id as u64, vec)
-            .context("usearch add")
+        self.inner.add(node_id as u64, vec).context("usearch add")
     }
 
     /// Persist the current index to self.index_path.
@@ -174,6 +171,7 @@ impl VecIndex {
             .collect())
     }
 
+    #[allow(dead_code)]
     pub fn count(&self) -> usize {
         self.inner.size()
     }
@@ -212,8 +210,8 @@ mod tests {
 
     #[test]
     fn build_save_load_knn_roundtrip() {
-        let dir = std::env::temp_dir()
-            .join(format!("travsr_embed_idx_test_{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("travsr_embed_idx_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("test.usearch");
 
@@ -231,7 +229,10 @@ mod tests {
         let results = loaded.knn(&query_blob, 5).unwrap();
 
         assert!(!results.is_empty(), "KNN must return at least one result");
-        assert_eq!(results[0].0, 42, "top-1 must be the query vector itself (node 42)");
+        assert_eq!(
+            results[0].0, 42,
+            "top-1 must be the query vector itself (node 42)"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -139,6 +139,15 @@ impl NomicPlugin {
 
 // ── --reindex mode ────────────────────────────────────────────────────────────
 
+fn write_current_embed_model_meta(conn: &rusqlite::Connection) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES ('current_embed_model', ?1)",
+        [MODEL_ID],
+    )
+    .context("writing current_embed_model meta")?;
+    Ok(())
+}
+
 /// One-shot embedding: read all nodes from graph.db that do not yet have a
 /// nomic-v1.5-int8 row in node_embeddings, embed them in batches, write the
 /// BLOBs, and update hnsw.usearch with the new vectors.  Exits when done.
@@ -180,6 +189,7 @@ fn reindex(model_dir: &Path, db_path: &Path) -> Result<()> {
         // If the index file is missing (e.g. first run after upgrading from hnsw_rs, or
         // after accidental deletion), rebuild it by streaming from node_embeddings.
         if index_path.exists() {
+            write_current_embed_model_meta(&conn)?;
             println!("All nodes already have embeddings for {MODEL_ID}. Index up to date.");
             return Ok(());
         }
@@ -193,17 +203,36 @@ fn reindex(model_dir: &Path, db_path: &Path) -> Result<()> {
         println!("All nodes already embedded ({existing} rows). Building missing HNSW index...");
         index::VecIndex::build_from_db(db_path, MODEL_ID, &index_path, existing)
             .context("build_from_db")?;
+        write_current_embed_model_meta(&conn)?;
         println!("Done — index saved to {}.", index_path.display());
         return Ok(());
     }
 
     // Open or create the usearch HNSW index.
+    // When the index file is missing but the DB already has embeddings (e.g. accidental
+    // deletion after a partial reindex), rebuild from the existing rows first so those
+    // nodes are not silently dropped from KNN. The pending loop then appends new ones.
     let idx = if index_path.exists() {
         index::VecIndex::try_load(&index_path)
             .context("load existing HNSW index")?
             .expect("index file exists but load returned None")
     } else {
-        index::VecIndex::new_empty(&index_path, total).context("create new HNSW index")?
+        let existing: usize = conn
+            .query_row(
+                "SELECT COUNT(*) FROM node_embeddings WHERE model_id = ?1",
+                [MODEL_ID],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if existing > 0 {
+            index::VecIndex::build_from_db(db_path, MODEL_ID, &index_path, existing)
+                .context("rebuild HNSW from existing embeddings before adding pending")?;
+            index::VecIndex::try_load(&index_path)
+                .context("load freshly-rebuilt HNSW")?
+                .expect("just-rebuilt index must be loadable")
+        } else {
+            index::VecIndex::new_empty(&index_path, total).context("create new HNSW index")?
+        }
     };
 
     // Prepare INSERT once; reuse across all chunks.
@@ -238,7 +267,7 @@ fn reindex(model_dir: &Path, db_path: &Path) -> Result<()> {
             tx_rows = 0;
         }
 
-        inserted += chunk.len();
+        inserted += blobs.len().min(chunk.len());
         if inserted % 1_000 == 0 || inserted == total {
             println!("  embedded {inserted}/{total}");
         }
@@ -246,14 +275,7 @@ fn reindex(model_dir: &Path, db_path: &Path) -> Result<()> {
 
     conn.execute("COMMIT", [])?;
     idx.save()?;
-
-    // Record which model produced the embeddings so the daemon's model-mismatch
-    // guard has a value to compare against on startup.
-    conn.execute(
-        "INSERT OR REPLACE INTO meta (key, value) VALUES ('current_embed_model', ?1)",
-        [MODEL_ID],
-    )
-    .context("writing current_embed_model meta")?;
+    write_current_embed_model_meta(&conn)?;
 
     println!(
         "Done — {inserted} nodes embedded. Index saved to {}.",

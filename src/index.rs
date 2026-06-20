@@ -125,13 +125,20 @@ impl VecIndex {
         self.inner.add(node_id as u64, vec).context("usearch add")
     }
 
-    /// Persist the current index to self.index_path.
+    /// Persist the current index to self.index_path atomically.
+    ///
+    /// Writes to a `.tmp` sibling first, then renames, so the daemon's
+    /// mtime-triggered reload in `knn()` never reads a partially-written file.
     pub fn save(&self) -> Result<()> {
-        let path_str = self
-            .index_path
+        let tmp = self.index_path.with_extension("usearch.tmp");
+        let tmp_str = tmp
             .to_str()
-            .ok_or_else(|| anyhow::anyhow!("index path not UTF-8"))?;
-        self.inner.save(path_str).context("save usearch index")
+            .ok_or_else(|| anyhow::anyhow!("index tmp path not UTF-8"))?;
+        self.inner
+            .save(tmp_str)
+            .context("save usearch index to tmp")?;
+        std::fs::rename(&tmp, &self.index_path).context("atomic rename usearch index")?;
+        Ok(())
     }
 
     /// K-nearest-neighbour search.

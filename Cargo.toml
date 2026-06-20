@@ -45,3 +45,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [patch.crates-io]
 travsr-plugin-protocol = { path = "../travsr/crates/travsr-plugin-protocol" }
 travsr-plugin-sdk      = { path = "../travsr/crates/travsr-plugin-sdk" }
+
+# CoreML EP deferred: ORT 2.0.0-rc.12 loads CoreML.framework at binary startup
+# when the feature is compiled in, regardless of whether the EP is requested at
+# runtime.  macOS 26 (Tahoe) changed the CoreML ABI and triggers a load-time
+# crash.  Revisit when ORT ships a release that lazy-loads platform EPs.

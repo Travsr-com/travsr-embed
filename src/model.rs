@@ -32,14 +32,33 @@ pub struct NomicModel {
 }
 
 impl NomicModel {
+    /// Standard load: full thread count + CoreML EP on macOS.
+    /// Use for daemon mode and serial (non-shard) reindex.
     pub fn load(model_dir: &Path) -> Result<Self> {
         let parallelism = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4);
+        Self::load_opts(model_dir, parallelism, true)
+    }
 
-        let session = Session::builder()
-            .context("ORT session builder")?
-            .with_intra_threads(parallelism)
+    /// Shard-safe load: explicit thread count, CPU EP only.
+    /// Use when N shard processes run in parallel — each gets cores/N threads
+    /// so total threads = cores (no oversubscription), and no simultaneous
+    /// CoreML compilations (which would freeze the system on first run).
+    pub fn load_for_shard(model_dir: &Path, intra_threads: usize) -> Result<Self> {
+        Self::load_opts(model_dir, intra_threads, false)
+    }
+
+    fn load_opts(model_dir: &Path, intra_threads: usize, use_accelerator: bool) -> Result<Self> {
+        let builder = Session::builder().context("ORT session builder")?;
+
+        // CoreML EP deferred: ORT 2.0.0-rc.12 crashes at load time on macOS 26
+        // (Tahoe) when the coreml feature is compiled in.  Suppress the warning
+        // on all platforms until CoreML is re-enabled.
+        let _ = use_accelerator;
+
+        let session = builder
+            .with_intra_threads(intra_threads)
             .map_err(|e| anyhow::anyhow!("setting intra-op thread count: {e}"))?
             .commit_from_file(model_dir.join("model_int8.onnx"))
             .context("loading model_int8.onnx")?;

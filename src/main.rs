@@ -235,6 +235,13 @@ fn reindex(model_dir: &Path, db_path: &Path) -> Result<()> {
         }
     };
 
+    // Ensure the index has room for all pending nodes on top of whatever is
+    // already there.  load() freezes capacity at save time, so we must
+    // re-reserve before inserting.  new_empty() and build_from_db() already
+    // reserve enough for their own count, but not for the pending additions.
+    idx.reserve(idx.size() + total)
+        .context("reserve HNSW capacity for pending nodes")?;
+
     // Prepare INSERT once; reuse across all chunks.
     let mut ins = conn.prepare(
         "INSERT OR REPLACE INTO node_embeddings (node_id, model_id, embedding) \

@@ -121,7 +121,15 @@ impl VecIndex {
 
     /// Add one node's embedding to the index. Called per-node during reindex.
     /// usearch handles internal synchronisation; takes &self.
+    ///
+    /// Skip-if-present: handles crash-recovery where HNSW was updated but the
+    /// matching SQLite COMMIT was rolled back, leaving the key in HNSW without
+    /// a node_embeddings row.  The embedding is identical (same node, same model),
+    /// so skipping the add is correct; the caller still writes the DB row.
     pub fn add(&self, node_id: i64, vec: &[f32]) -> Result<()> {
+        if self.inner.contains(node_id as u64) {
+            return Ok(());
+        }
         self.inner.add(node_id as u64, vec).context("usearch add")
     }
 
@@ -176,6 +184,19 @@ impl VecIndex {
             .zip(results.distances.iter())
             .map(|(&key, &dist)| (key as i64, dist))
             .collect())
+    }
+
+    /// Reserve capacity for `total` elements (absolute, not additional).
+    /// Call this after loading an existing index before inserting new vectors.
+    pub fn reserve(&self, total: usize) -> Result<()> {
+        self.inner
+            .reserve(total)
+            .context("reserve usearch capacity")
+    }
+
+    /// Current number of indexed vectors.
+    pub fn size(&self) -> usize {
+        self.inner.size()
     }
 
     #[allow(dead_code)]

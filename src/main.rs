@@ -192,7 +192,12 @@ fn estimate_tokens(text: &str) -> usize {
 /// When `shard = Some((i, n))`, only processes nodes where `id % n = i` and
 /// skips all HNSW operations — the CLI orchestrator calls rebuild_index() when
 /// all n shards have finished.
-fn reindex(model_dir: &Path, db_path: &Path, shard: Option<(usize, usize)>, phase: Phase) -> Result<()> {
+fn reindex(
+    model_dir: &Path,
+    db_path: &Path,
+    shard: Option<(usize, usize)>,
+    phase: Phase,
+) -> Result<()> {
     let shard_mode = shard.is_some();
     let (shard_idx, n_shards) = shard.unwrap_or((0, 1));
 
@@ -337,8 +342,7 @@ fn reindex(model_dir: &Path, db_path: &Path, shard: Option<(usize, usize)>, phas
                     .context("load freshly-rebuilt HNSW")?
                     .expect("just-rebuilt index must be loadable")
             } else {
-                index::VecIndex::new_empty(&index_path, total)
-                    .context("create new HNSW index")?
+                index::VecIndex::new_empty(&index_path, total).context("create new HNSW index")?
             }
         };
         // load() freezes capacity at save time; re-reserve before inserting.
@@ -437,19 +441,23 @@ fn reindex(model_dir: &Path, db_path: &Path, shard: Option<(usize, usize)>, phas
         tx_buffer.clear();
     }
 
-    if matches!(phase, Phase::Phase2(_)) {
-        println!("  Phase 2 complete — {inserted} nodes embedded.");
-        println!("  Rebuilding HNSW index from all embeddings (Phase 1 + Phase 2)...");
-        rebuild_index(db_path)?;
-    } else if let Some(ref idx_inner) = idx {
-        idx_inner.save()?;
-        write_current_embed_model_meta(&conn)?;
-        println!(
-            "Done — {inserted} nodes embedded. Index saved to {}.",
-            index_path.display()
-        );
-    } else {
+    if shard_mode {
         println!("  shard {shard_idx}/{n_shards}: {inserted} nodes embedded.");
+    } else {
+        // Both Phase 1 and Phase 2 rebuild from DB rather than saving in-memory state.
+        // This prevents the race where Phase 1's incremental HNSW (Phase 1 nodes only)
+        // overwrites a full rebuild done by Phase 2 that finished first on large repos.
+        // rebuild_index reads all committed embeddings, so last-writer-wins is correct
+        // regardless of which phase finishes last.
+        drop(idx); // free HNSW memory before rebuild_index opens its own connection
+        let phase_label = if matches!(phase, Phase::Phase2(_)) {
+            "Phase 2"
+        } else {
+            "Phase 1"
+        };
+        println!("  {phase_label} complete — {inserted} nodes embedded.");
+        println!("  Rebuilding HNSW index from all embeddings...");
+        rebuild_index(db_path)?;
     }
 
     tracing::info!(inserted, total, shard_idx, n_shards, "reindex complete");

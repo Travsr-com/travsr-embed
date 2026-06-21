@@ -147,6 +147,7 @@ impl VecIndex {
     ///
     /// Writes to a `.tmp` sibling first, then renames, so the daemon's
     /// mtime-triggered reload in `knn()` never reads a partially-written file.
+    #[allow(dead_code)]
     pub fn save(&self) -> Result<()> {
         let tmp = self.index_path.with_extension("usearch.tmp");
         let tmp_str = tmp

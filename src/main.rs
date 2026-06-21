@@ -49,6 +49,19 @@ const TOKEN_BUDGET: usize = 4_096;
 // Commit to SQLite every TX_BATCH rows: limits WAL growth during long runs.
 const TX_BATCH: usize = 5_000;
 
+/// Which nodes to embed in a reindex run.
+#[derive(Clone, Copy)]
+enum Phase {
+    /// All pending nodes (default `--reindex` with no phase flag).
+    All,
+    /// Only nodes with `shell_number >= threshold` — high-centrality fast pass.
+    Phase1(u32),
+    /// Only nodes with `shell_number < threshold` — background sweep.
+    /// Skips inline HNSW updates and rebuilds the full index at the end so it
+    /// includes both Phase 1 and Phase 2 nodes without a HNSW file race.
+    Phase2(u32),
+}
+
 // ── Plugin struct ─────────────────────────────────────────────────────────────
 
 struct NomicPlugin {
@@ -170,37 +183,6 @@ fn estimate_tokens(text: &str) -> usize {
     text.len() / 4 + 4
 }
 
-/// Build the embedding text for a file node by concatenating the kind and
-/// signature of every non-file symbol that shares the same path, ordered by
-/// source line.  The file path is prepended so the model can anchor on it.
-///
-/// Falls back to the bare path when the file has no indexed symbols (e.g. an
-/// empty file or one that was never parsed), so we never embed an empty string.
-fn build_file_text(conn: &Connection, file_path: &str) -> String {
-    let mut stmt = match conn.prepare_cached(
-        "SELECT kind, signature FROM nodes \
-         WHERE path = ?1 \
-         AND kind != 'file' AND kind != 'file-module' \
-         ORDER BY line",
-    ) {
-        Ok(s) => s,
-        Err(_) => return file_path.to_string(),
-    };
-    let parts: Vec<String> = stmt
-        .query_map([file_path], |row| {
-            let kind: String = row.get(0)?;
-            let sig: String = row.get(1)?;
-            Ok(format!("{kind}: {sig}"))
-        })
-        .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        .unwrap_or_default();
-    if parts.is_empty() {
-        file_path.to_string()
-    } else {
-        format!("file: {file_path}\n{}", parts.join("\n"))
-    }
-}
-
 // ── --reindex mode ────────────────────────────────────────────────────────────
 
 /// One-shot embedding: read all nodes from graph.db that do not yet have a
@@ -210,7 +192,7 @@ fn build_file_text(conn: &Connection, file_path: &str) -> String {
 /// When `shard = Some((i, n))`, only processes nodes where `id % n = i` and
 /// skips all HNSW operations — the CLI orchestrator calls rebuild_index() when
 /// all n shards have finished.
-fn reindex(model_dir: &Path, db_path: &Path, shard: Option<(usize, usize)>) -> Result<()> {
+fn reindex(model_dir: &Path, db_path: &Path, shard: Option<(usize, usize)>, phase: Phase) -> Result<()> {
     let shard_mode = shard.is_some();
     let (shard_idx, n_shards) = shard.unwrap_or((0, 1));
 
@@ -242,43 +224,66 @@ fn reindex(model_dir: &Path, db_path: &Path, shard: Option<(usize, usize)>) -> R
     )
     .context("configure SQLite pragmas")?;
 
-    // Only embed file nodes (~2.5k per repo vs ~115k symbols).
-    // Embedding text is built from contained symbols via build_file_text().
+    // Embed symbol nodes (skips file/file-module containers).
     // Use ((id % n) + n) % n for unsigned-safe modulo: SQLite's % returns negative
     // values for negative inputs, so bare `id % n` misses nodes with negative IDs
     // (Kythe VName hashes are i64 and can be negative).
-    let mut stmt = conn.prepare(
-        "SELECT n.id, n.path \
+    // Phase1(t): shell_number >= t — high-centrality pass (~26s on travsr self).
+    // Phase2(t): shell_number < t  — background sweep for remaining symbols.
+    let phase_clause = match phase {
+        Phase::All => String::new(),
+        Phase::Phase1(t) => format!("AND n.shell_number >= {t} "),
+        Phase::Phase2(t) => format!("AND n.shell_number < {t} "),
+    };
+    // Exclude structurally-inert node kinds: imports are file-level dependency
+    // declarations with no body; fields/variables/modules are too low-signal for
+    // semantic search (a struct field name alone tells the model nothing useful).
+    // go-pkg, class, interface, type, function, method, var retain meaningful
+    // signatures and are the nodes callers actually search for.
+    let sql = format!(
+        "SELECT n.id, n.kind, n.signature \
          FROM nodes n \
-         WHERE n.kind = 'file' \
+         WHERE n.kind NOT IN ('file', 'file-module', 'import', 'module', 'field', 'variable') \
          AND NOT EXISTS ( \
              SELECT 1 FROM node_embeddings e \
              WHERE e.node_id = n.id AND e.model_id = ?1 \
-         ) AND (((n.id % ?2) + ?2) % ?2 = ?3)",
-    )?;
+         ) {phase_clause}\
+         AND (((n.id % ?2) + ?2) % ?2 = ?3) \
+         ORDER BY \
+             CASE WHEN n.path LIKE '%_test.%' OR n.path LIKE '%/testing/%' OR n.path LIKE 'test/%' THEN 0 ELSE 1 END DESC, \
+             n.shell_number DESC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let pending: Vec<(i64, String)> = stmt
         .query_map(
             rusqlite::params![MODEL_ID, n_shards as i64, shard_idx as i64],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| {
+                let id: i64 = row.get(0)?;
+                let kind: String = row.get(1)?;
+                let sig: String = row.get(2)?;
+                Ok((id, format!("{kind}: {sig}")))
+            },
         )?
         .filter_map(|r| r.ok())
         .collect();
 
     let total = pending.len();
-    tracing::info!(total, shard_idx, n_shards, "file nodes to embed");
+    tracing::info!(total, shard_idx, n_shards, "symbol nodes to embed");
 
-    // Pre-build embedding texts: one string per file, composed from contained symbols.
-    // Done before batching so token estimation has access to the full text length.
-    let texts: Vec<(i64, String)> = pending
-        .iter()
-        .map(|(id, path)| (*id, build_file_text(&conn, path)))
-        .collect();
+    // Sort by ascending token count before bin-packing — reduces BatchLongest
+    // padding waste from ~8x to ~1.2x when short and long texts mix in a batch.
+    let mut texts = pending;
+    texts.sort_by_key(|(_, text)| estimate_tokens(text));
 
     let index_path = index_path_for_db(db_path);
 
     if total == 0 {
         if shard_mode {
             println!("  shard {shard_idx}/{n_shards}: no pending nodes.");
+            return Ok(());
+        }
+        if matches!(phase, Phase::Phase2(_)) {
+            println!("Phase 2 complete — no pending symbol nodes.");
             return Ok(());
         }
         // Non-shard: if the index file is also present, nothing to do.
@@ -304,7 +309,10 @@ fn reindex(model_dir: &Path, db_path: &Path, shard: Option<(usize, usize)>) -> R
     }
 
     // In shard mode, skip HNSW entirely — orchestrator rebuilds after all shards.
-    let idx: Option<index::VecIndex> = if shard_mode {
+    // In Phase 2, also skip inline HNSW: Phase 2 rebuilds the full index at the end
+    // from all embeddings, so both Phase 1 and Phase 2 nodes are included and the
+    // HNSW file race between the two concurrent background processes is avoided.
+    let idx: Option<index::VecIndex> = if shard_mode || matches!(phase, Phase::Phase2(_)) {
         None
     } else {
         let idx = if index_path.exists() {
@@ -429,7 +437,11 @@ fn reindex(model_dir: &Path, db_path: &Path, shard: Option<(usize, usize)>) -> R
         tx_buffer.clear();
     }
 
-    if let Some(ref idx_inner) = idx {
+    if matches!(phase, Phase::Phase2(_)) {
+        println!("  Phase 2 complete — {inserted} nodes embedded.");
+        println!("  Rebuilding HNSW index from all embeddings (Phase 1 + Phase 2)...");
+        rebuild_index(db_path)?;
+    } else if let Some(ref idx_inner) = idx {
         idx_inner.save()?;
         write_current_embed_model_meta(&conn)?;
         println!(
@@ -454,11 +466,14 @@ fn rebuild_index(db_path: &Path) -> Result<()> {
     let conn = Connection::open(db_path).context("open graph.db")?;
     let existing: usize = conn
         .query_row(
-            "SELECT COUNT(*) FROM node_embeddings WHERE model_id = ?1",
+            "SELECT COUNT(*) FROM node_embeddings e \
+             JOIN nodes n ON n.id = e.node_id \
+             WHERE e.model_id = ?1 \
+             AND n.kind NOT IN ('file', 'file-module', 'import', 'module', 'field', 'variable')",
             [MODEL_ID],
             |r| r.get(0),
         )
-        .context("counting existing embeddings")?;
+        .context("counting existing meaningful embeddings")?;
     anyhow::ensure!(
         existing > 0,
         "no embeddings in node_embeddings — run `travsr embed reindex` first"
@@ -500,9 +515,32 @@ fn main() {
     let mut daemon_db: Option<PathBuf> = None;
     let mut rebuild_db: Option<PathBuf> = None;
     let mut shard: Option<(usize, usize)> = None;
+    let mut phase = Phase::All;
     let mut i = 1usize;
     while i < args.len() {
         match args[i].as_str() {
+            "--phase1" => {
+                i += 1;
+                let t = args
+                    .get(i)
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .unwrap_or_else(|| {
+                        eprintln!("usage: --phase1 <shell-threshold>");
+                        std::process::exit(1);
+                    });
+                phase = Phase::Phase1(t);
+            }
+            "--phase2" => {
+                i += 1;
+                let t = args
+                    .get(i)
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .unwrap_or_else(|| {
+                        eprintln!("usage: --phase2 <shell-threshold>");
+                        std::process::exit(1);
+                    });
+                phase = Phase::Phase2(t);
+            }
             "--reindex" => {
                 i += 1;
                 reindex_db = Some(args.get(i).map(PathBuf::from).unwrap_or_else(|| {
@@ -553,7 +591,7 @@ fn main() {
                 eprintln!("unknown argument: {other}");
                 eprintln!(
                     "usage: travsr-embed-nomic \
-                     [--reindex <db> [--shard <i>/<n>]] \
+                     [--reindex <db> [--phase1 <n>|--phase2 <n>] [--shard <i>/<n>]] \
                      [--rebuild-index <db>] \
                      [--db-path <db>]"
                 );
@@ -578,7 +616,7 @@ fn main() {
             std::process::exit(1);
         }
     } else if let Some(db_path) = reindex_db {
-        if let Err(e) = reindex(&model_dir, &db_path, shard) {
+        if let Err(e) = reindex(&model_dir, &db_path, shard, phase) {
             eprintln!("reindex failed: {e:#}");
             std::process::exit(1);
         }

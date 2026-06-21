@@ -81,7 +81,10 @@ impl VecIndex {
 
         let n: usize = conn
             .query_row(
-                "SELECT COUNT(*) FROM node_embeddings WHERE model_id = ?1",
+                "SELECT COUNT(*) FROM node_embeddings e \
+                 JOIN nodes n ON n.id = e.node_id \
+                 WHERE e.model_id = ?1 \
+                 AND n.kind NOT IN ('file', 'file-module', 'import', 'module', 'field', 'variable')",
                 [model_id],
                 |r| r.get(0),
             )
@@ -90,8 +93,15 @@ impl VecIndex {
         let inner = Index::new(&make_options()).context("create usearch Index")?;
         inner.reserve(n).context("reserve capacity")?;
 
-        let mut stmt =
-            conn.prepare("SELECT node_id, embedding FROM node_embeddings WHERE model_id = ?1")?;
+        // Join to nodes to exclude structural-noise kinds (import, module, field,
+        // variable) that have no meaningful body text — same exclusion as reindex().
+        let mut stmt = conn.prepare(
+            "SELECT e.node_id, e.embedding \
+             FROM node_embeddings e \
+             JOIN nodes n ON n.id = e.node_id \
+             WHERE e.model_id = ?1 \
+             AND n.kind NOT IN ('file', 'file-module', 'import', 'module', 'field', 'variable')",
+        )?;
         let mut rows = stmt.query([model_id])?;
         let mut count = 0usize;
         while let Some(row) = rows.next()? {

@@ -35,10 +35,15 @@ impl NomicModel {
     /// Standard load: full thread count + CoreML EP on macOS.
     /// Use for daemon mode and serial (non-shard) reindex.
     pub fn load(model_dir: &Path) -> Result<Self> {
-        let parallelism = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
-        Self::load_opts(model_dir, parallelism, true)
+        // nomic-embed int8 (137 MB) is a small model — more threads hurt throughput
+        // due to sync overhead and L3 cache thrashing.  Benchmarks show 2 threads
+        // is optimal on both Apple Silicon and x86 laptops for seq_len ≤ 128.
+        // Override with TRAVSR_EMBED_THREADS=N for profiling.
+        let threads = std::env::var("TRAVSR_EMBED_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(2);
+        Self::load_opts(model_dir, threads, true)
     }
 
     /// Shard-safe load: explicit thread count, CPU EP only.

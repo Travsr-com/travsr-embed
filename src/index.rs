@@ -67,21 +67,31 @@ impl VecIndex {
         })
     }
 
-    /// Full rebuild by streaming node_embeddings from graph.db.
+    /// Full rebuild by streaming node_embeddings from embed.db.
     /// Peak RAM: one BLOB (1024 bytes) at a time — no full materialisation.
     /// Used as a recovery path when hnsw.usearch is missing but node_embeddings
     /// is already populated (e.g., after accidental index deletion).
+    ///
+    /// RFC-019: embeddings live in embed.db; graph.db holds nodes for the JOIN.
+    /// embed.db is ATTACHed to the graph.db connection as "edb" so the kind-filter
+    /// JOIN works across both files without loading everything into memory.
     pub fn build_from_db(
         db_path: &Path,
+        embed_db_path: &Path,
         model_id: &str,
         index_path: &Path,
         expected_count: usize,
     ) -> Result<Self> {
         let conn = Connection::open(db_path).context("open graph.db")?;
+        let embed_db_str = embed_db_path
+            .to_str()
+            .context("embed.db path is not valid UTF-8")?;
+        conn.execute_batch(&format!("ATTACH DATABASE '{embed_db_str}' AS edb"))
+            .context("attach embed.db")?;
 
         let n: usize = conn
             .query_row(
-                "SELECT COUNT(*) FROM node_embeddings e \
+                "SELECT COUNT(*) FROM edb.node_embeddings e \
                  JOIN nodes n ON n.id = e.node_id \
                  WHERE e.model_id = ?1 \
                  AND n.kind NOT IN ('file', 'file-module', 'import', 'module', 'field', 'variable')",
@@ -93,11 +103,11 @@ impl VecIndex {
         let inner = Index::new(&make_options()).context("create usearch Index")?;
         inner.reserve(n).context("reserve capacity")?;
 
-        // Join to nodes to exclude structural-noise kinds (import, module, field,
-        // variable) that have no meaningful body text — same exclusion as reindex().
+        // Join edb.node_embeddings with nodes to exclude structural-noise kinds —
+        // same exclusion list as reindex().
         let mut stmt = conn.prepare(
             "SELECT e.node_id, e.embedding \
-             FROM node_embeddings e \
+             FROM edb.node_embeddings e \
              JOIN nodes n ON n.id = e.node_id \
              WHERE e.model_id = ?1 \
              AND n.kind NOT IN ('file', 'file-module', 'import', 'module', 'field', 'variable')",

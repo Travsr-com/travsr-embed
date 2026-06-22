@@ -7,16 +7,24 @@
 //                              knows which repo's per-repo HNSW index to load.
 //
 //   --reindex <db>             One-shot: embed all pending nodes in graph.db,
-//                              write node_embeddings rows, and update the
-//                              per-repo HNSW index.  Exits when done.
+//                              write node_embeddings rows to embed.db, and
+//                              update the per-repo HNSW index. Exits when done.
+//
+//   --reindex <db> --embed-db <embed.db>
+//                              Same as above with an explicit embed.db path.
+//                              Defaults to <db's dir>/embed.db when omitted.
 //
 //   --reindex <db> --shard <i>/<n>
 //                              One-shot shard: embed only nodes where id % n = i.
 //                              Skips HNSW writes — the CLI orchestrator calls
 //                              --rebuild-index when all shards complete.
 //
-//   --rebuild-index <db>       Rebuild per-repo HNSW from node_embeddings.
+//   --rebuild-index <db>       Rebuild per-repo HNSW from embed.db.node_embeddings.
 //                              No ONNX inference — pure SQLite stream.
+//
+// RFC-019: node_embeddings lives in embed.db (sibling of graph.db), not graph.db.
+// graph.db is opened read-only for node queries; embed.db is opened with
+// synchronous=OFF + wal_autocheckpoint=0 for fast bulk writes (~8-15x faster).
 //
 // HNSW index placement: <db-path's dir>/<MODEL_ID>.hnsw.usearch
 // (co-located with graph.db so every repo has its own index; node IDs are
@@ -46,7 +54,7 @@ const EMBED_DIM: u32 = 256;
 // MAX_BATCH=512, so the budget is the effective limit in practice.
 const MAX_BATCH: usize = 512;
 const TOKEN_BUDGET: usize = 4_096;
-// Commit to SQLite every TX_BATCH rows: limits WAL growth during long runs.
+// Commit to embed.db every TX_BATCH rows.
 const TX_BATCH: usize = 5_000;
 
 /// Which nodes to embed in a reindex run.
@@ -183,11 +191,27 @@ fn estimate_tokens(text: &str) -> usize {
     text.len() / 4 + 4
 }
 
+/// Derive the embed.db path as a sibling of graph.db.
+fn embed_db_path_for(db_path: &Path) -> PathBuf {
+    db_path.with_file_name("embed.db")
+}
+
 // ── --reindex mode ────────────────────────────────────────────────────────────
 
 /// One-shot embedding: read all nodes from graph.db that do not yet have a
-/// nomic-v1.5-int8 row in node_embeddings, embed them in token-budget-bounded
-/// batches, write the BLOBs, and update the per-repo HNSW index.
+/// nomic-v1.5-int8 row in embed.db.node_embeddings, embed them in
+/// token-budget-bounded batches, write the BLOBs to embed.db, and update the
+/// per-repo HNSW index.
+///
+/// RFC-019: node_embeddings lives in embed.db (separate from graph.db) to
+/// eliminate WAL write contention. graph.db is used read-only for node queries;
+/// embed.db is ATTACHed with synchronous=OFF + wal_autocheckpoint=0 for bulk
+/// writes (~8-15× faster than writing into the shared graph.db WAL).
+///
+/// CDC tombstones: node deletions captured in graph.db.node_tombstones are
+/// applied to embed.db.node_embeddings atomically before the embedding loop,
+/// then acked by clearing the tombstone table. At-least-once delivery: if the
+/// sidecar crashes between delete and ack, tombstones replay on next run.
 ///
 /// When `shard = Some((i, n))`, only processes nodes where `id % n = i` and
 /// skips all HNSW operations — the CLI orchestrator calls rebuild_index() when
@@ -195,6 +219,7 @@ fn estimate_tokens(text: &str) -> usize {
 fn reindex(
     model_dir: &Path,
     db_path: &Path,
+    embed_db_path: &Path,
     shard: Option<(usize, usize)>,
     phase: Phase,
 ) -> Result<()> {
@@ -203,13 +228,12 @@ fn reindex(
 
     tracing::info!(
         db = %db_path.display(),
+        embed_db = %embed_db_path.display(),
         shard_idx,
         n_shards,
         "starting reindex"
     );
 
-    // In shard mode, divide threads across shard processes to avoid oversubscription.
-    // N shards × (cores/N) threads = cores total — same utilisation, no thrashing.
     let cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
@@ -220,6 +244,9 @@ fn reindex(
     } else {
         model::NomicModel::load(model_dir).context("loading model")?
     };
+
+    // graph.db: node source + tombstone log. synchronous=NORMAL is fine — we
+    // only write the tombstone ack and meta, not the bulk embedding BLOBs.
     let conn = Connection::open(db_path).context("open graph.db")?;
     conn.execute_batch(
         "PRAGMA journal_mode = WAL;
@@ -227,30 +254,67 @@ fn reindex(
          PRAGMA cache_size = -16384;
          PRAGMA busy_timeout = 120000;",
     )
-    .context("configure SQLite pragmas")?;
+    .context("configure graph.db pragmas")?;
 
-    // Embed symbol nodes (skips file/file-module containers).
-    // Use ((id % n) + n) % n for unsigned-safe modulo: SQLite's % returns negative
-    // values for negative inputs, so bare `id % n` misses nodes with negative IDs
-    // (Kythe VName hashes are i64 and can be negative).
-    // Phase1(t): shell_number >= t — high-centrality pass (~26s on travsr self).
-    // Phase2(t): shell_number < t  — background sweep for remaining symbols.
+    // embed.db: ATTACH as "edb". RFC-019: synchronous=OFF eliminates per-commit
+    // fsyncs (safe — a crash means re-embed on next run, not graph corruption).
+    // wal_autocheckpoint=0 lets the WAL grow freely during bulk writes; one
+    // explicit TRUNCATE checkpoint at the end commits everything in a single fsync.
+    let embed_db_str = embed_db_path
+        .to_str()
+        .context("embed.db path is not valid UTF-8")?;
+    conn.execute_batch(&format!(
+        "ATTACH DATABASE '{embed_db_str}' AS edb;
+         PRAGMA edb.journal_mode = WAL;
+         PRAGMA edb.synchronous = OFF;
+         PRAGMA edb.wal_autocheckpoint = 0;
+         PRAGMA edb.cache_size = -65536;",
+    ))
+    .context("attach and configure embed.db")?;
+
+    // Create schema in embed.db on first run (idempotent).
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS edb.node_embeddings (
+             node_id   INTEGER NOT NULL,
+             model_id  TEXT    NOT NULL,
+             embedding BLOB    NOT NULL,
+             PRIMARY KEY (node_id, model_id)
+         ) WITHOUT ROWID;
+         CREATE INDEX IF NOT EXISTS edb.idx_node_embeddings_model
+             ON node_embeddings(model_id);",
+    )
+    .context("create embed.db schema")?;
+
+    // CDC: apply pending tombstones atomically — delete from embed.db, ack in graph.db.
+    let tombstone_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM node_tombstones", [], |r| r.get(0))
+        .unwrap_or(0);
+    if tombstone_count > 0 {
+        conn.execute_batch(
+            "BEGIN;
+             DELETE FROM edb.node_embeddings
+                 WHERE node_id IN (SELECT node_id FROM node_tombstones);
+             DELETE FROM node_tombstones;
+             COMMIT;",
+        )
+        .context("applying CDC tombstones")?;
+        tracing::info!(tombstone_count, "applied CDC tombstones to embed.db");
+    }
+
     let phase_clause = match phase {
         Phase::All => String::new(),
         Phase::Phase1(t) => format!("AND n.shell_number >= {t} "),
         Phase::Phase2(t) => format!("AND n.shell_number < {t} "),
     };
-    // Exclude structurally-inert node kinds: imports are file-level dependency
-    // declarations with no body; fields/variables/modules are too low-signal for
-    // semantic search (a struct field name alone tells the model nothing useful).
-    // go-pkg, class, interface, type, function, method, var retain meaningful
-    // signatures and are the nodes callers actually search for.
+
+    // NOT EXISTS checks edb.node_embeddings so graph.db WAL is never touched
+    // by embedding writes.
     let sql = format!(
         "SELECT n.id, n.kind, n.signature \
          FROM nodes n \
          WHERE n.kind NOT IN ('file', 'file-module', 'import', 'module', 'field', 'variable') \
          AND NOT EXISTS ( \
-             SELECT 1 FROM node_embeddings e \
+             SELECT 1 FROM edb.node_embeddings e \
              WHERE e.node_id = n.id AND e.model_id = ?1 \
          ) {phase_clause}\
          AND (((n.id % ?2) + ?2) % ?2 = ?3) \
@@ -275,8 +339,6 @@ fn reindex(
     let total = pending.len();
     tracing::info!(total, shard_idx, n_shards, "symbol nodes to embed");
 
-    // Sort by ascending token count before bin-packing — reduces BatchLongest
-    // padding waste from ~8x to ~1.2x when short and long texts mix in a batch.
     let mut texts = pending;
     texts.sort_by_key(|(_, text)| estimate_tokens(text));
 
@@ -291,8 +353,6 @@ fn reindex(
             println!("Phase 2 complete — no pending symbol nodes.");
             return Ok(());
         }
-        // Non-shard: if the index file is also present, nothing to do.
-        // If missing (e.g. accidental deletion), rebuild from node_embeddings.
         if index_path.exists() {
             write_current_embed_model_meta(&conn)?;
             println!("All nodes already have embeddings for {MODEL_ID}. Index up to date.");
@@ -300,23 +360,19 @@ fn reindex(
         }
         let existing: usize = conn
             .query_row(
-                "SELECT COUNT(*) FROM node_embeddings WHERE model_id = ?1",
+                "SELECT COUNT(*) FROM edb.node_embeddings WHERE model_id = ?1",
                 [MODEL_ID],
                 |r| r.get(0),
             )
             .unwrap_or(0);
         println!("All nodes already embedded ({existing} rows). Building missing HNSW index...");
-        index::VecIndex::build_from_db(db_path, MODEL_ID, &index_path, existing)
+        index::VecIndex::build_from_db(db_path, embed_db_path, MODEL_ID, &index_path, existing)
             .context("build_from_db")?;
         write_current_embed_model_meta(&conn)?;
         println!("Done — index saved to {}.", index_path.display());
         return Ok(());
     }
 
-    // In shard mode, skip HNSW entirely — orchestrator rebuilds after all shards.
-    // In Phase 2, also skip inline HNSW: Phase 2 rebuilds the full index at the end
-    // from all embeddings, so both Phase 1 and Phase 2 nodes are included and the
-    // HNSW file race between the two concurrent background processes is avoided.
     let idx: Option<index::VecIndex> = if shard_mode || matches!(phase, Phase::Phase2(_)) {
         None
     } else {
@@ -325,18 +381,15 @@ fn reindex(
                 .context("load existing HNSW index")?
                 .expect("index file exists but load returned None")
         } else {
-            // Index file missing but DB may already have embeddings (e.g. accidental
-            // deletion after a partial reindex): rebuild first so existing nodes are
-            // not silently dropped from KNN, then the pending loop appends new ones.
             let existing: usize = conn
                 .query_row(
-                    "SELECT COUNT(*) FROM node_embeddings WHERE model_id = ?1",
+                    "SELECT COUNT(*) FROM edb.node_embeddings WHERE model_id = ?1",
                     [MODEL_ID],
                     |r| r.get(0),
                 )
                 .unwrap_or(0);
             if existing > 0 {
-                index::VecIndex::build_from_db(db_path, MODEL_ID, &index_path, existing)
+                index::VecIndex::build_from_db(db_path, embed_db_path, MODEL_ID, &index_path, existing)
                     .context("rebuild HNSW from existing embeddings before adding pending")?;
                 index::VecIndex::try_load(&index_path)
                     .context("load freshly-rebuilt HNSW")?
@@ -345,16 +398,11 @@ fn reindex(
                 index::VecIndex::new_empty(&index_path, total).context("create new HNSW index")?
             }
         };
-        // load() freezes capacity at save time; re-reserve before inserting.
         idx.reserve(idx.size() + total)
             .context("reserve HNSW capacity for pending nodes")?;
         Some(idx)
     };
 
-    // ── bin-pack file texts into token-budget-bounded batches ─────────────────
-    //
-    // Cost model: BatchLongest pads all items to max_seq × count tokens.
-    // estimate_tokens() uses byte_len / 4 as a cheap proxy — accurate enough.
     let est_lens: Vec<usize> = texts
         .iter()
         .map(|(_, text)| estimate_tokens(text))
@@ -382,16 +430,12 @@ fn reindex(
         }
     }
 
-    // Prepare INSERT once; reuse across all transactions.
+    // INSERT into edb.node_embeddings — never touches graph.db WAL.
     let mut ins = conn.prepare(
-        "INSERT OR REPLACE INTO node_embeddings (node_id, model_id, embedding) \
+        "INSERT OR REPLACE INTO edb.node_embeddings (node_id, model_id, embedding) \
          VALUES (?1, ?2, ?3)",
     )?;
 
-    // Accumulate (node_id, blob) pairs from ONNX inference runs, then flush to
-    // SQLite in a short write transaction.  ONNX inference runs with NO open
-    // transaction so the WAL write lock is not held during the expensive GPU/CPU
-    // inference step — this lets parallel shard processes interleave writes.
     let mut tx_buffer: Vec<(i64, Vec<u8>)> = Vec::with_capacity(TX_BATCH + 512);
     let mut inserted = 0usize;
 
@@ -416,7 +460,6 @@ fn reindex(
         let chunk = &texts[range];
         let text_refs: Vec<&str> = chunk.iter().map(|(_, t)| t.as_str()).collect();
 
-        // ONNX inference: no transaction open, write lock not held.
         let blobs = model.embed_documents(&text_refs)?;
 
         for ((node_id, _), blob) in chunk.iter().zip(blobs.iter()) {
@@ -433,7 +476,6 @@ fn reindex(
         }
     }
 
-    // Flush remaining items.
     if !tx_buffer.is_empty() {
         flush_buffer(&tx_buffer, &conn, &mut ins, &idx)?;
         inserted += tx_buffer.len();
@@ -441,15 +483,14 @@ fn reindex(
         tx_buffer.clear();
     }
 
+    // Single fsync for all embed.db WAL writes — far cheaper than per-TX fsyncs.
+    conn.execute_batch("PRAGMA edb.wal_checkpoint(TRUNCATE)")
+        .context("checkpoint embed.db WAL")?;
+
     if shard_mode {
         println!("  shard {shard_idx}/{n_shards}: {inserted} nodes embedded.");
     } else {
-        // Both Phase 1 and Phase 2 rebuild from DB rather than saving in-memory state.
-        // This prevents the race where Phase 1's incremental HNSW (Phase 1 nodes only)
-        // overwrites a full rebuild done by Phase 2 that finished first on large repos.
-        // rebuild_index reads all committed embeddings, so last-writer-wins is correct
-        // regardless of which phase finishes last.
-        drop(idx); // free HNSW memory before rebuild_index opens its own connection
+        drop(idx);
         let phase_label = if matches!(phase, Phase::Phase2(_)) {
             "Phase 2"
         } else {
@@ -457,7 +498,9 @@ fn reindex(
         };
         println!("  {phase_label} complete — {inserted} nodes embedded.");
         println!("  Rebuilding HNSW index from all embeddings...");
-        rebuild_index(db_path)?;
+        // Drop the prepared statement before rebuild_index opens its own connection.
+        drop(ins);
+        rebuild_index(db_path, embed_db_path)?;
     }
 
     tracing::info!(inserted, total, shard_idx, n_shards, "reindex complete");
@@ -466,15 +509,25 @@ fn reindex(
 
 // ── --rebuild-index mode ──────────────────────────────────────────────────────
 
-/// Rebuild the per-repo HNSW index by streaming all rows from node_embeddings.
+/// Rebuild the per-repo HNSW index by streaming all rows from embed.db.node_embeddings.
 /// No ONNX inference — pure SQLite I/O.  Used as the final step by the CLI
 /// orchestrator after parallel shard embedding completes.
-fn rebuild_index(db_path: &Path) -> Result<()> {
-    tracing::info!(db = %db_path.display(), "rebuilding HNSW index");
+fn rebuild_index(db_path: &Path, embed_db_path: &Path) -> Result<()> {
+    tracing::info!(
+        db = %db_path.display(),
+        embed_db = %embed_db_path.display(),
+        "rebuilding HNSW index"
+    );
     let conn = Connection::open(db_path).context("open graph.db")?;
+    let embed_db_str = embed_db_path
+        .to_str()
+        .context("embed.db path is not valid UTF-8")?;
+    conn.execute_batch(&format!("ATTACH DATABASE '{embed_db_str}' AS edb"))
+        .context("attach embed.db")?;
+
     let existing: usize = conn
         .query_row(
-            "SELECT COUNT(*) FROM node_embeddings e \
+            "SELECT COUNT(*) FROM edb.node_embeddings e \
              JOIN nodes n ON n.id = e.node_id \
              WHERE e.model_id = ?1 \
              AND n.kind NOT IN ('file', 'file-module', 'import', 'module', 'field', 'variable')",
@@ -484,11 +537,11 @@ fn rebuild_index(db_path: &Path) -> Result<()> {
         .context("counting existing meaningful embeddings")?;
     anyhow::ensure!(
         existing > 0,
-        "no embeddings in node_embeddings — run `travsr embed reindex` first"
+        "no embeddings in embed.db — run `travsr embed reindex` first"
     );
     let index_path = index_path_for_db(db_path);
     println!("Building HNSW index from {existing} embeddings...");
-    index::VecIndex::build_from_db(db_path, MODEL_ID, &index_path, existing)
+    index::VecIndex::build_from_db(db_path, embed_db_path, MODEL_ID, &index_path, existing)
         .context("build_from_db")?;
     write_current_embed_model_meta(&conn)?;
     println!("Done — index saved to {}.", index_path.display());
@@ -499,7 +552,6 @@ fn rebuild_index(db_path: &Path) -> Result<()> {
 // ── entry point ───────────────────────────────────────────────────────────────
 
 fn main() {
-    // Structured logging to stderr — the daemon reads stdout for IPC.
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
@@ -517,11 +569,11 @@ fn main() {
         }
     };
 
-    // Parse argv into a flag map: --flag value pairs.
     let args: Vec<String> = std::env::args().collect();
     let mut reindex_db: Option<PathBuf> = None;
     let mut daemon_db: Option<PathBuf> = None;
     let mut rebuild_db: Option<PathBuf> = None;
+    let mut embed_db: Option<PathBuf> = None;
     let mut shard: Option<(usize, usize)> = None;
     let mut phase = Phase::All;
     let mut i = 1usize;
@@ -553,6 +605,13 @@ fn main() {
                 i += 1;
                 reindex_db = Some(args.get(i).map(PathBuf::from).unwrap_or_else(|| {
                     eprintln!("usage: travsr-embed-nomic --reindex <graph.db-path>");
+                    std::process::exit(1);
+                }));
+            }
+            "--embed-db" => {
+                i += 1;
+                embed_db = Some(args.get(i).map(PathBuf::from).unwrap_or_else(|| {
+                    eprintln!("usage: --embed-db <embed.db-path>");
                     std::process::exit(1);
                 }));
             }
@@ -599,8 +658,8 @@ fn main() {
                 eprintln!("unknown argument: {other}");
                 eprintln!(
                     "usage: travsr-embed-nomic \
-                     [--reindex <db> [--phase1 <n>|--phase2 <n>] [--shard <i>/<n>]] \
-                     [--rebuild-index <db>] \
+                     [--reindex <db> [--embed-db <embed.db>] [--phase1 <n>|--phase2 <n>] [--shard <i>/<n>]] \
+                     [--rebuild-index <db> [--embed-db <embed.db>]] \
                      [--db-path <db>]"
                 );
                 std::process::exit(1);
@@ -619,18 +678,21 @@ fn main() {
     }
 
     if let Some(db_path) = rebuild_db {
-        if let Err(e) = rebuild_index(&db_path) {
+        let embed_path = embed_db.unwrap_or_else(|| embed_db_path_for(&db_path));
+        if let Err(e) = rebuild_index(&db_path, &embed_path) {
             eprintln!("rebuild-index failed: {e:#}");
             std::process::exit(1);
         }
     } else if let Some(db_path) = reindex_db {
-        if let Err(e) = reindex(&model_dir, &db_path, shard, phase) {
+        let embed_path = embed_db.unwrap_or_else(|| embed_db_path_for(&db_path));
+        if let Err(e) = reindex(&model_dir, &db_path, &embed_path, shard, phase) {
             eprintln!("reindex failed: {e:#}");
             std::process::exit(1);
         }
     } else {
-        // Daemon / IPC mode.  --db-path is required so we know which per-repo
-        // HNSW to load.
+        // Daemon / IPC mode. --db-path is required so we know which per-repo
+        // HNSW index to load. KNN is served from the in-memory HNSW — req.db_path
+        // (now pointing to embed.db per RFC-019) is unused in this mode.
         let db_path = daemon_db.unwrap_or_else(|| {
             eprintln!("travsr-embed: --db-path <graph.db> is required in daemon mode");
             eprintln!("  (the travsr daemon passes this automatically)");

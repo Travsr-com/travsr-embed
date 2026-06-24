@@ -995,10 +995,11 @@ fn reindex_parallel(
 
     if matches!(phase, Phase::Phase2(_)) {
         println!("Phase 2 complete — {total_embedded} nodes embedded.");
-    } else {
-        println!("  Rebuilding HNSW index from all embeddings...");
-        rebuild_index(db_path, embed_db_path)?;
     }
+    // Always rebuild after Phase 2 so HNSW covers Phase 1 + Phase 2 nodes.
+    // Phase 1 rebuilds unconditionally too (same branch).
+    println!("  Rebuilding HNSW index from all embeddings...");
+    rebuild_index(db_path, embed_db_path)?;
 
     tracing::info!(total_embedded, parallel, "parallel reindex complete");
     Ok(())

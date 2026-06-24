@@ -36,6 +36,7 @@ mod index;
 mod model;
 
 use std::path::{Path, PathBuf};
+use std::collections::HashSet;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc, Mutex,
@@ -80,12 +81,18 @@ struct NomicPlugin {
     /// HNSW index — None until first KNN call if not present at startup.
     index: Mutex<Option<index::VecIndex>>,
     index_path: PathBuf,
+    /// graph.db path — for FTS candidate lookup in lazy embed path.
+    db_path: PathBuf,
+    /// embed.db path — for NOT-EXISTS filter + async persist of lazy embeds.
+    embed_db_path: PathBuf,
 }
 
 impl NomicPlugin {
     /// `model_dir`  — global model directory (ONNX + tokenizer files)
-    /// `index_path` — per-repo HNSW file (derived from db_path by the caller)
-    fn load(model_dir: &Path, index_path: PathBuf) -> Result<Self> {
+    /// `index_path` — per-repo HNSW file (co-located with graph.db)
+    /// `db_path`    — graph.db (for FTS candidate lookup in lazy embed path)
+    fn load(model_dir: &Path, index_path: PathBuf, db_path: PathBuf) -> Result<Self> {
+        let embed_db_path = embed_db_path_for(&db_path);
         let model = model::BgeModel::load(model_dir).context("loading model")?;
         let index = index::VecIndex::try_load(&index_path).unwrap_or_else(|e| {
             tracing::warn!(
@@ -97,6 +104,8 @@ impl NomicPlugin {
             model,
             index: Mutex::new(index),
             index_path,
+            db_path,
+            embed_db_path,
         })
     }
 }
@@ -146,37 +155,231 @@ impl EmbedPlugin for NomicPlugin {
 impl NomicPlugin {
     fn knn_impl(&self, req: &KnnRequest) -> Result<(Vec<i64>, Vec<f32>)> {
         let query_blob = self.model.embed_query(&req.query_text)?;
+        let query_vec  = model::blob_to_f32(&query_blob);
 
-        let mut guard = self
-            .index
-            .lock()
-            .map_err(|_| anyhow::anyhow!("index mutex poisoned"))?;
+        // ── KNN against HNSW (Phase 1 nodes) ─────────────────────────────
+        // Hold the mutex only for the index operation; release before the
+        // lazy embed path so we don't block other KNN calls during inference.
+        let knn_raw: Vec<(i64, f32)> = {
+            let mut guard = self
+                .index
+                .lock()
+                .map_err(|_| anyhow::anyhow!("index mutex poisoned"))?;
 
-        // Late-load: if the daemon started before reindex ran, pick up the index now.
-        if guard.is_none() && self.index_path.exists() {
-            *guard = index::VecIndex::try_load(&self.index_path)?;
-        }
-
-        let idx = match guard.as_mut() {
-            None => {
-                tracing::debug!("no HNSW index — run `travsr embed reindex`");
-                return Ok((vec![], vec![]));
+            // Late-load: daemon may start before the first reindex run.
+            if guard.is_none() && self.index_path.exists() {
+                *guard = index::VecIndex::try_load(&self.index_path)?;
             }
-            Some(i) => i,
+
+            match guard.as_mut() {
+                None => {
+                    tracing::debug!("no HNSW index — run `travsr embed reindex`");
+                    vec![]
+                }
+                Some(idx) => idx.knn(&query_blob, req.k)?,
+            }
         };
 
-        let raw = idx.knn(&query_blob, req.k)?;
-        let ids: Vec<i64> = raw.iter().map(|&(id, _)| id).collect();
-        // usearch returns cosine distance; convert to similarity score.
-        let scores: Vec<f32> = raw
-            .iter()
-            .map(|&(_, d)| (1.0 - d).clamp(0.0, 1.0))
-            .collect();
+        // ── Lazy embed: BM25 fallback for un-embedded nodes ───────────────
+        // Find nodes that matched the FTS index but haven't been embedded yet,
+        // embed them on-the-fly (~20-50ms for 10-20 nodes), add to the
+        // in-memory HNSW, and persist to embed.db asynchronously.
+        let lazy_scored = self
+            .lazy_embed_candidates(&req.query_text, &query_vec)
+            .unwrap_or_else(|e| {
+                tracing::debug!("lazy embed skipped (non-fatal): {e:#}");
+                vec![]
+            });
+
+        // ── Merge: KNN first (higher confidence), then lazy, dedup ───────
+        let mut seen: HashSet<i64> = HashSet::new();
+        let mut ids:    Vec<i64>  = Vec::with_capacity(req.k as usize);
+        let mut scores: Vec<f32>  = Vec::with_capacity(req.k as usize);
+
+        for (id, dist) in knn_raw {
+            if seen.insert(id) {
+                ids.push(id);
+                // usearch returns cosine distance → convert to similarity.
+                scores.push((1.0 - dist).clamp(0.0, 1.0));
+            }
+        }
+        for (id, sim) in lazy_scored {
+            if seen.insert(id) && ids.len() < req.k as usize {
+                ids.push(id);
+                scores.push(sim);
+            }
+        }
+
         Ok((ids, scores))
+    }
+
+    /// BM25/FTS fallback: find un-embedded candidates matching the query,
+    /// embed them on-the-fly, add to in-memory HNSW, persist to embed.db.
+    ///
+    /// Returns (node_id, cosine_similarity) pairs for the newly embedded nodes.
+    /// All errors are treated as non-fatal — the caller falls back to KNN-only.
+    fn lazy_embed_candidates(
+        &self,
+        query_text: &str,
+        query_vec: &[f32],
+    ) -> Result<Vec<(i64, f32)>> {
+        // Skip if embed.db doesn't exist (first-run before any reindex)
+        if !self.embed_db_path.exists() {
+            return Ok(vec![]);
+        }
+
+        let candidates = self.fts_candidates_unembedded(query_text, 20)?;
+        if candidates.is_empty() {
+            return Ok(vec![]);
+        }
+
+        tracing::debug!(n = candidates.len(), "lazy embed: on-the-fly embedding");
+
+        let texts: Vec<&str> = candidates.iter().map(|(_, t)| t.as_str()).collect();
+        let blobs = self.model.embed_documents(&texts)?;
+
+        // Add to in-memory HNSW + compute similarity against query
+        let mut results: Vec<(i64, f32)> = Vec::with_capacity(candidates.len());
+        {
+            let guard = self
+                .index
+                .lock()
+                .map_err(|_| anyhow::anyhow!("index mutex poisoned"))?;
+            if let Some(ref idx) = *guard {
+                for ((nid, _), blob) in candidates.iter().zip(blobs.iter()) {
+                    let vec = model::blob_to_f32(blob);
+                    // BGE CLS vectors are unit-normalised → dot product = cosine similarity
+                    let sim: f32 = vec
+                        .iter()
+                        .zip(query_vec.iter())
+                        .map(|(a, b)| a * b)
+                        .sum::<f32>()
+                        .clamp(0.0, 1.0);
+                    results.push((*nid, sim));
+                    let _ = idx.add(*nid, &vec); // skip-if-present is safe
+                }
+            }
+        }
+
+        // Persist to embed.db in a background thread so the hot query path
+        // is not blocked by SQLite I/O. INSERT OR IGNORE is safe under races.
+        let edb = self.embed_db_path.clone();
+        let pairs: Vec<(i64, Vec<u8>)> = candidates
+            .iter()
+            .map(|(nid, _)| *nid)
+            .zip(blobs.into_iter())
+            .collect();
+        std::thread::Builder::new()
+            .name("lazy-embed-persist".into())
+            .spawn(move || {
+                if let Err(e) = persist_lazy_embeddings(&edb, &pairs) {
+                    tracing::warn!("lazy embed persist failed (non-fatal): {e:#}");
+                }
+            })
+            .ok();
+
+        Ok(results)
+    }
+
+    /// Query the FTS5 trigram index for nodes relevant to `query_text` that
+    /// do not yet have an embedding in embed.db. Returns up to `limit` pairs
+    /// of (node_id, "kind: signature") ready for on-the-fly embedding.
+    fn fts_candidates_unembedded(
+        &self,
+        query_text: &str,
+        limit: usize,
+    ) -> Result<Vec<(i64, String)>> {
+        // Extract words ≥4 chars for a focused FTS5 trigram MATCH.
+        // Wrap each in double-quotes for FTS5 phrase semantics (exact substring).
+        // Take the 3 longest words to keep the query specific but not too narrow.
+        let mut words: Vec<&str> = query_text
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .filter(|w| w.len() >= 4)
+            .collect();
+        words.sort_unstable_by_key(|w| std::cmp::Reverse(w.len()));
+        words.dedup();
+        let fts_query: String = words
+            .iter()
+            .take(3)
+            .map(|w| format!("\"{w}\""))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        if fts_query.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let conn = Connection::open_with_flags(
+            &self.db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .context("lazy embed: open graph.db")?;
+
+        let embed_str = self
+            .embed_db_path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("embed.db path not UTF-8"))?;
+        let escaped = embed_str.replace('\'', "''");
+        conn.execute_batch(&format!("ATTACH DATABASE '{escaped}' AS edb"))
+            .context("lazy embed: attach embed.db")?;
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT f.rowid AS node_id, n.kind || ': ' || n.signature AS text \
+                 FROM nodes_fts f \
+                 JOIN nodes n ON n.id = f.rowid \
+                 WHERE nodes_fts MATCH ?1 \
+                 AND n.kind NOT IN \
+                     ('file','file-module','import','module','field','variable') \
+                 AND NOT EXISTS ( \
+                     SELECT 1 FROM edb.node_embeddings e \
+                     WHERE e.node_id = n.id AND e.model_id = ?2 \
+                 ) \
+                 ORDER BY rank \
+                 LIMIT ?3",
+            )
+            .context("lazy embed: prepare FTS query")?;
+
+        let candidates: Vec<(i64, String)> = stmt
+            .query_map(
+                rusqlite::params![fts_query, MODEL_ID, limit as i64],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .context("lazy embed: execute FTS query")?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(candidates)
     }
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
+
+/// Persist a batch of (node_id, blob) pairs to embed.db after lazy on-the-fly
+/// embedding. Called from a background thread — all errors are non-fatal.
+fn persist_lazy_embeddings(embed_db_path: &Path, pairs: &[(i64, Vec<u8>)]) -> Result<()> {
+    let conn = Connection::open(embed_db_path).context("lazy persist: open embed.db")?;
+    conn.execute_batch(
+        "PRAGMA journal_mode = WAL;
+         PRAGMA synchronous = NORMAL;
+         PRAGMA busy_timeout = 30000;",
+    )
+    .context("lazy persist: configure embed.db")?;
+    conn.execute("BEGIN", []).context("lazy persist: begin")?;
+    let mut ins = conn
+        .prepare(
+            "INSERT OR IGNORE INTO node_embeddings (node_id, model_id, embedding) \
+             VALUES (?1, ?2, ?3)",
+        )
+        .context("lazy persist: prepare insert")?;
+    for (nid, blob) in pairs {
+        ins.execute(rusqlite::params![nid, MODEL_ID, blob])
+            .context("lazy persist: insert")?;
+    }
+    conn.execute("COMMIT", []).context("lazy persist: commit")?;
+    Ok(())
+}
 
 fn write_current_embed_model_meta(conn: &rusqlite::Connection) -> Result<()> {
     conn.execute(
@@ -1100,7 +1303,7 @@ fn main() {
             std::process::exit(1);
         });
         let index_path = index_path_for_db(&db_path);
-        match NomicPlugin::load(&model_dir, index_path) {
+        match NomicPlugin::load(&model_dir, index_path, db_path.clone()) {
             Ok(plugin) => {
                 tracing::info!(
                     model_dir = %model_dir.display(),

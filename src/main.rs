@@ -36,7 +36,10 @@ mod index;
 mod model;
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, Mutex,
+};
 
 use anyhow::{Context as _, Result};
 use rusqlite::Connection;
@@ -523,13 +526,15 @@ fn reindex(
 /// N × 270 MB model-load memory cliff. RAM usage is ~constant regardless of N:
 /// 1 × model_weights (~127 MB) + N × per-connection SQLite caches.
 ///
-/// Pipeline (row-count partition):
+/// Pipeline (shared atomic batch queue):
 ///   Main thread materialises ALL pending (id, text) pairs in one read pass,
-///   then splits them into N equal-count chunks (ceiling division).  Each worker
-///   gets exactly ⌈total/N⌉ items — no ID-range skew from hash-based node IDs.
-///   Workers need no SQL connection; they receive their chunk by value.
-///   WAL serialises concurrent COMMITs; inference (~300 ms/batch) dominates,
-///   so write contention between threads is negligible.
+///   pre-builds ALL inference batches globally (sorted shortest-first), then
+///   exposes them via Arc<AtomicUsize> counter.  Workers loop: claim next batch
+///   index atomically → embed → write to embed.db.  All N workers run until the
+///   queue is empty — no worker idles while others still have pre-assigned work.
+///   Bottleneck is AMX saturation (4 threads share one AMX unit), so scheduling
+///   gains are marginal; this form is kept for correctness and code clarity.
+///   WAL serialises concurrent COMMITs; inference dominates write contention.
 fn reindex_parallel(
     model_dir: &Path,
     db_path: &Path,
@@ -638,46 +643,50 @@ fn reindex_parallel(
         return Ok(());
     }
 
-    // ── Step 3: split by row count into N equal-size chunks ───────────────────
-    // Ceiling division: each worker gets exactly ⌈total/N⌉ items (last may be smaller).
-    // Spawning min(parallel, total) workers avoids empty chunks.
-    let n_workers = parallel.min(total);
-    let chunk_size = (total + n_workers - 1) / n_workers;
-    let chunks: Vec<Vec<(i64, String)>> = all_pending
-        .chunks(chunk_size)
-        .map(<[_]>::to_vec)
-        .collect();
-    let n_chunks = chunks.len();
+    // ── Step 3: shared atomic batch queue (Kafka-style consumer group) ────────
+    // Sort all items shortest-first (optimal BatchLongest padding), pre-build
+    // ALL inference batches globally, then expose them via a shared AtomicUsize
+    // counter. Workers loop: atomically claim the next batch index → embed →
+    // write. All N workers run until the queue is empty; no worker idles while
+    // another still has pre-assigned work. Workload is AMX-bound in practice,
+    // so scheduling gains are marginal (~3%); this form is kept for code clarity.
+    let mut sorted = all_pending;
+    sorted.sort_by_key(|(_, t)| estimate_tokens(t));
+    let est_lens: Vec<usize> = sorted.iter().map(|(_, t)| estimate_tokens(t)).collect();
+    let batch_ranges = build_batch_ranges(&est_lens);
+    let n_batches = batch_ranges.len();
 
+    let items      = Arc::new(sorted);
+    let batches    = Arc::new(batch_ranges);
+    let next_batch = Arc::new(AtomicUsize::new(0));
+
+    let n_workers = parallel.min(n_batches).max(1);
     let model = model::BgeModel::load(model_dir).context("loading model")?;
     tracing::info!(
         total,
-        n_workers = n_chunks,
-        chunk_size,
-        "model loaded; spawning {} inference threads",
-        n_chunks
+        n_batches,
+        n_workers,
+        "model loaded; spawning {} inference threads (shared batch queue)",
+        n_workers
     );
 
-    // ── Steps 4-6: N inference+write threads ─────────────────────────────────
-    // Each thread receives its pre-built chunk by value — no SQL reads needed.
+    // ── Steps 4-6: N consumer threads ────────────────────────────────────────
+    // Workers share Arc<Vec<items>>, Arc<Vec<ranges>>, Arc<AtomicUsize>.
     // BgeModel::clone() is cheap (Arc<TypedRunnableModel> + Tokenizer clone).
-    // Each thread opens its own write connection to embed.db; WAL serialises COMMITs.
+    // Each worker opens its own write connection to embed.db; WAL serialises COMMITs.
     let edb_arc = Arc::new(embed_db_path.to_path_buf());
 
-    let worker_handles: Vec<_> = chunks
-        .into_iter()
-        .enumerate()
-        .map(|(i, chunk)| {
-            let model_w = model.clone();
-            let edb_w   = Arc::clone(&edb_arc);
+    let worker_handles: Vec<_> = (0..n_workers)
+        .map(|i| {
+            let model_w   = model.clone();
+            let edb_w     = Arc::clone(&edb_arc);
+            let items_w   = Arc::clone(&items);
+            let batches_w = Arc::clone(&batches);
+            let next_w    = Arc::clone(&next_batch);
 
             std::thread::Builder::new()
                 .name(format!("embed-{i}"))
                 .spawn(move || -> Result<usize> {
-                    // Sort shortest-first so BatchLongest pads as little as possible.
-                    let mut pending = chunk;
-                    pending.sort_by_key(|(_, t)| estimate_tokens(t));
-
                     // ── write: own connection, synchronous=OFF for bulk speed ──
                     let wconn = Connection::open(&*edb_w)
                         .context("worker: open embed.db")?;
@@ -709,15 +718,17 @@ fn reindex_parallel(
                         )
                         .context("worker: prepare insert")?;
 
-                    // ── batch → inference → write ──────────────────────────
-                    let batch_ranges = build_batch_ranges(
-                        &pending.iter().map(|(_, t)| estimate_tokens(t)).collect::<Vec<_>>(),
-                    );
                     let mut tx_buf: Vec<(i64, Vec<u8>)> = Vec::with_capacity(TX_BATCH + 512);
                     let mut inserted = 0usize;
 
-                    for range in batch_ranges {
-                        let batch = &pending[range];
+                    // ── consumer loop: claim batches until the queue is empty ─
+                    loop {
+                        let batch_idx = next_w.fetch_add(1, Ordering::Relaxed);
+                        if batch_idx >= batches_w.len() {
+                            break;
+                        }
+                        let range = batches_w[batch_idx].clone();
+                        let batch = &items_w[range];
                         let texts: Vec<&str> = batch.iter().map(|(_, t)| t.as_str()).collect();
                         let blobs = model_w.embed_documents(&texts).context("worker: embed")?;
                         for ((nid, _), blob) in batch.iter().zip(blobs.iter()) {
@@ -734,6 +745,7 @@ fn reindex_parallel(
                             tx_buf.clear();
                         }
                     }
+
                     if !tx_buf.is_empty() {
                         wconn.execute("BEGIN", []).context("worker: begin final")?;
                         for (nid, blob) in &tx_buf {

@@ -1,76 +1,75 @@
-// ONNX inference + HuggingFace tokenizer for nomic-embed-text-v1.5 int8.
+// candle backend for nomic-embed-text-v1.5.
+//
+// Replaces the ORT int8 ONNX backend (RFC-018 original) with candle fp32,
+// gaining Metal GPU on Apple M-series developer machines:
+//   macOS  → Device::new_metal(0), falls back to CPU on failure
+//   Linux  → Device::Cpu (OCI ARM64 A1 Flex target)
 //
 // Pipeline per batch:
 //   tokenize (BPE, max 512 tokens, right-pad to batch-longest)
-//   → ONNX int8 session → last_hidden_state [batch, seq, 768]
-//   → mean-pool over real tokens (attention_mask == 1)
-//   → MRL truncate to DIM=256
-//   → L2 normalise
-//   → pack as 256 × f32 little-endian bytes (1024 B per node)
+//   → NomicBertModel::forward → last_hidden_state [batch, seq, 768]
+//   → mean_pooling (masked, computed on device)
+//   → narrow to dim=256 (MRL truncation)
+//   → l2_normalize
+//   → single host copy → pack as 256×f32 LE bytes (1024 B per node)
 //
 // Task prefixes (nomic model requirement):
 //   indexing : "search_document: {text}"
 //   querying : "search_query: {text}"
 
-use std::{path::Path, sync::Mutex};
+use std::path::Path;
 
 use anyhow::{Context as _, Result};
-use ort::{session::Session, value::Tensor};
+use candle_core::{DType, Device, Tensor};
+use candle_nn::VarBuilder;
+use candle_transformers::models::nomic_bert::{self, NomicBertModel};
 use tokenizers::{PaddingDirection, PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 
 pub const DIM: usize = 256;
-const HIDDEN: usize = 768;
 const MAX_SEQ: usize = 512;
 const DOC_PREFIX: &str = "search_document: ";
 const QUERY_PREFIX: &str = "search_query: ";
+const DTYPE: DType = DType::F32;
 
 pub struct NomicModel {
-    // Session::run requires &mut self; Mutex provides interior mutability
-    // while embed_batch / knn (from &self) can still call us.
-    session: Mutex<Session>,
+    model: NomicBertModel,
     tokenizer: Tokenizer,
+    device: Device,
 }
 
 impl NomicModel {
-    /// Standard load: full thread count + CoreML EP on macOS.
-    /// Use for daemon mode and serial (non-shard) reindex.
     pub fn load(model_dir: &Path) -> Result<Self> {
-        // nomic-embed int8 (137 MB) is a small model — more threads hurt throughput
-        // due to sync overhead and L3 cache thrashing.  Benchmarks show 2 threads
-        // is optimal on both Apple Silicon and x86 laptops for seq_len ≤ 128.
-        // Override with TRAVSR_EMBED_THREADS=N for profiling.
-        let threads = std::env::var("TRAVSR_EMBED_THREADS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(2);
-        Self::load_opts(model_dir, threads, true)
+        Self::load_inner(model_dir)
     }
 
-    /// Shard-safe load: explicit thread count, CPU EP only.
-    /// Use when N shard processes run in parallel — each gets cores/N threads
-    /// so total threads = cores (no oversubscription), and no simultaneous
-    /// CoreML compilations (which would freeze the system on first run).
-    pub fn load_for_shard(model_dir: &Path, intra_threads: usize) -> Result<Self> {
-        Self::load_opts(model_dir, intra_threads, false)
+    /// Shard mode: Metal is a shared GPU resource; thread-count limiting
+    /// does not apply. CPU builds use rayon (set RAYON_NUM_THREADS if needed).
+    pub fn load_for_shard(model_dir: &Path, _intra_threads: usize) -> Result<Self> {
+        Self::load_inner(model_dir)
     }
 
-    fn load_opts(model_dir: &Path, intra_threads: usize, use_accelerator: bool) -> Result<Self> {
-        let builder = Session::builder().context("ORT session builder")?;
+    fn load_inner(model_dir: &Path) -> Result<Self> {
+        let device = make_device()?;
+        tracing::info!(backend = device_label(&device), "candle device selected");
 
-        // CoreML EP deferred: ORT 2.0.0-rc.12 crashes at load time on macOS 26
-        // (Tahoe) when the coreml feature is compiled in.  Suppress the warning
-        // on all platforms until CoreML is re-enabled.
-        let _ = use_accelerator;
+        let config: nomic_bert::Config = {
+            let f = std::fs::File::open(model_dir.join("config.json"))
+                .context("open config.json")?;
+            serde_json::from_reader(f).context("parse config.json")?
+        };
 
-        let session = builder
-            .with_intra_threads(intra_threads)
-            .map_err(|e| anyhow::anyhow!("setting intra-op thread count: {e}"))?
-            .commit_from_file(model_dir.join("model_int8.onnx"))
-            .context("loading model_int8.onnx")?;
+        // Load safetensors weights into device memory.
+        // Safe (non-mmap) path required by #![forbid(unsafe_code)].
+        // On Apple M-series unified memory the 270 MB fits comfortably.
+        let tensors =
+            candle_core::safetensors::load(model_dir.join("model.safetensors"), &device)
+                .context("load model.safetensors")?;
+        let vb = VarBuilder::from_tensors(tensors, DTYPE, &device);
+
+        let model = NomicBertModel::load(vb, &config).context("build NomicBertModel")?;
 
         let mut tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))
             .map_err(|e| anyhow::anyhow!("tokenizer load: {e}"))?;
-
         tokenizer.with_padding(Some(PaddingParams {
             strategy: PaddingStrategy::BatchLongest,
             direction: PaddingDirection::Right,
@@ -87,8 +86,9 @@ impl NomicModel {
             .map_err(|e| anyhow::anyhow!("truncation config: {e}"))?;
 
         Ok(Self {
-            session: Mutex::new(session),
+            model,
             tokenizer,
+            device,
         })
     }
 
@@ -107,8 +107,6 @@ impl NomicModel {
             .ok_or_else(|| anyhow::anyhow!("empty embed result"))
     }
 
-    // ── shared inference core ─────────────────────────────────────────────────
-
     fn embed_raw(&self, texts: &[&str]) -> Result<Vec<Vec<u8>>> {
         if texts.is_empty() {
             return Ok(vec![]);
@@ -126,86 +124,55 @@ impl NomicModel {
             .max()
             .unwrap_or(1);
 
-        // Pre-compute real token counts from encodings before building flat arrays,
-        // so attn_mask_flat can be moved into the tensor without cloning.
-        let n_real_per_item: Vec<usize> = encodings
-            .iter()
-            .map(|e| {
-                e.get_attention_mask()
-                    .iter()
-                    .filter(|&&m| m == 1)
-                    .count()
-                    .max(1)
-            })
-            .collect();
+        let mut input_ids_flat = Vec::with_capacity(batch * seq);
+        let mut attn_mask_flat = Vec::with_capacity(batch * seq);
 
-        let mut input_ids_flat = vec![0i64; batch * seq];
-        let mut attn_mask_flat = vec![0i64; batch * seq];
-        let token_type_flat = vec![0i64; batch * seq]; // always 0 for single-sentence
-
-        for (i, enc) in encodings.iter().enumerate() {
-            for (j, (&id, &m)) in enc
-                .get_ids()
-                .iter()
-                .zip(enc.get_attention_mask().iter())
-                .enumerate()
-            {
-                input_ids_flat[i * seq + j] = id as i64;
-                attn_mask_flat[i * seq + j] = m as i64;
+        for enc in &encodings {
+            let ids = enc.get_ids();
+            let mask = enc.get_attention_mask();
+            for j in 0..seq {
+                input_ids_flat.push(ids.get(j).copied().unwrap_or(0));
+                attn_mask_flat.push(mask.get(j).copied().unwrap_or(0));
             }
         }
 
-        // Build ort 2.0 tensors from flat vecs; no ndarray feature required.
-        // Shape ([batch, seq], Box<[T]>) uses the (D: ToShape, Box<[T]>) OwnedTensorArrayData impl.
-        let ids_tensor = Tensor::from_array(([batch, seq], input_ids_flat.into_boxed_slice()))
-            .context("build input_ids tensor")?;
-        let mask_tensor = Tensor::from_array(([batch, seq], attn_mask_flat.into_boxed_slice()))
-            .context("build attention_mask tensor")?;
-        let types_tensor = Tensor::from_array(([batch, seq], token_type_flat.into_boxed_slice()))
-            .context("build token_type_ids tensor")?;
+        let input_ids =
+            Tensor::from_vec(input_ids_flat, (batch, seq), &self.device)
+                .context("build input_ids tensor")?;
+        let attn_mask =
+            Tensor::from_vec(attn_mask_flat, (batch, seq), &self.device)
+                .context("build attention_mask tensor")?;
 
-        let mut guard = self
-            .session
-            .lock()
-            .map_err(|_| anyhow::anyhow!("session mutex poisoned"))?;
+        // Forward pass → [batch, seq, 768].
+        // token_type_ids = None (nomic_bert uses zeros internally when absent).
+        let hidden = self
+            .model
+            .forward(&input_ids, None, Some(&attn_mask))
+            .context("NomicBert forward")?;
 
-        let outputs = guard
-            .run(ort::inputs![
-                "input_ids"      => ids_tensor,
-                "attention_mask" => mask_tensor,
-                "token_type_ids" => types_tensor,
-            ])
-            .context("ONNX run")?;
+        // All reductions on-device: mean_pooling → [batch, 768]
+        //                           narrow       → [batch, 256]  (MRL)
+        //                           l2_normalize → [batch, 256]
+        let pooled = nomic_bert::mean_pooling(&hidden, &attn_mask)
+            .context("mean pooling")?;
+        let mrl = pooled.narrow(1, 0, DIM).context("MRL narrow")?;
+        let normalized = nomic_bert::l2_normalize(&mrl).context("L2 normalize")?;
 
-        // try_extract_tensor returns (&Shape, &[f32]) — flat layout [batch * seq * HIDDEN].
-        // Shape is [batch, seq, HIDDEN]; element at [i][j][k] = data[i*seq*HIDDEN + j*HIDDEN + k].
-        let (_shape, hidden) = outputs["last_hidden_state"]
-            .try_extract_tensor::<f32>()
-            .context("extract last_hidden_state")?;
+        // Single host-transfer for the whole batch.
+        let rows = normalized
+            .contiguous()
+            .context("make contiguous")?
+            .to_device(&Device::Cpu)
+            .context("copy to CPU")?
+            .to_dtype(DType::F32)
+            .context("cast to f32")?
+            .to_vec2::<f32>()
+            .context("extract embedding rows")?;
 
-        let mut blobs = Vec::with_capacity(batch);
-        for (i, &n_real) in n_real_per_item.iter().enumerate() {
-            let mut pooled = [0f32; HIDDEN];
-            for j in 0..n_real {
-                let base = i * seq * HIDDEN + j * HIDDEN;
-                for k in 0..HIDDEN {
-                    pooled[k] += hidden[base + k];
-                }
-            }
-            let scale = 1.0 / n_real as f32;
-            pooled.iter_mut().for_each(|v| *v *= scale);
-
-            // MRL truncation to DIM=256 then L2-normalise.
-            let mut mrl = pooled[..DIM].to_vec();
-            let norm: f32 = mrl.iter().map(|&v| v * v).sum::<f32>().sqrt().max(1e-12);
-            mrl.iter_mut().for_each(|v| *v /= norm);
-
-            // Pack as little-endian f32 bytes.
-            let blob: Vec<u8> = mrl.iter().flat_map(|&f| f.to_le_bytes()).collect();
-            blobs.push(blob);
-        }
-
-        Ok(blobs)
+        Ok(rows
+            .into_iter()
+            .map(|row| row.iter().flat_map(|&f| f.to_le_bytes()).collect())
+            .collect())
     }
 }
 
@@ -214,4 +181,12 @@ pub fn blob_to_f32(blob: &[u8]) -> Vec<f32> {
     blob.chunks_exact(4)
         .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
         .collect()
+}
+
+fn make_device() -> Result<Device> {
+    Ok(Device::Cpu)
+}
+
+fn device_label(d: &Device) -> &'static str {
+    if d.is_cpu() { "cpu" } else { "gpu" }
 }

@@ -221,26 +221,37 @@ fn reindex(
     db_path: &Path,
     embed_db_path: &Path,
     shard: Option<(usize, usize)>,
+    row_range: Option<(i64, i64)>,
+    busy_timeout_ms: u64,
     phase: Phase,
 ) -> Result<()> {
-    let shard_mode = shard.is_some();
-    let (shard_idx, n_shards) = shard.unwrap_or((0, 1));
+    // worker_mode: either shard or range partitioning — skip HNSW per-worker
+    let worker_mode = shard.is_some() || row_range.is_some();
+
+    // Partition clause: integer literals are safe (our own values, not user SQL).
+    let partition_clause = match (shard, row_range) {
+        (_, Some((start, end))) => format!("AND n.id >= {start} AND n.id < {end}"),
+        (Some((idx, total)), _) => {
+            format!("AND (((n.id % {total}) + {total}) % {total} = {idx})")
+        }
+        (None, None) => String::new(),
+    };
+
+    let worker_label: String = match (shard, row_range) {
+        (_, Some((start, end))) => format!("range [{start},{end})"),
+        (Some((idx, total)), _) => format!("shard {idx}/{total}"),
+        (None, None) => String::new(),
+    };
 
     tracing::info!(
         db = %db_path.display(),
         embed_db = %embed_db_path.display(),
-        shard_idx,
-        n_shards,
+        worker = %worker_label,
         "starting reindex"
     );
 
-    let cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
-    let model = if shard_mode {
-        let t = (cores / n_shards).max(1);
-        tracing::debug!(intra_threads = t, "shard mode: limiting ORT threads");
-        model::NomicModel::load_for_shard(model_dir, t).context("loading model (shard)")?
+    let model = if worker_mode {
+        model::NomicModel::load_for_shard(model_dir, 1).context("loading model (worker)")?
     } else {
         model::NomicModel::load(model_dir).context("loading model")?
     };
@@ -248,12 +259,12 @@ fn reindex(
     // graph.db: node source + tombstone log. synchronous=NORMAL is fine — we
     // only write the tombstone ack and meta, not the bulk embedding BLOBs.
     let conn = Connection::open(db_path).context("open graph.db")?;
-    conn.execute_batch(
+    conn.execute_batch(&format!(
         "PRAGMA journal_mode = WAL;
          PRAGMA synchronous = NORMAL;
          PRAGMA cache_size = -16384;
-         PRAGMA busy_timeout = 120000;",
-    )
+         PRAGMA busy_timeout = {busy_timeout_ms};",
+    ))
     .context("configure graph.db pragmas")?;
 
     // embed.db: ATTACH as "edb". RFC-019: synchronous=OFF eliminates per-commit
@@ -317,27 +328,24 @@ fn reindex(
              SELECT 1 FROM edb.node_embeddings e \
              WHERE e.node_id = n.id AND e.model_id = ?1 \
          ) {phase_clause}\
-         AND (((n.id % ?2) + ?2) % ?2 = ?3) \
+         {partition_clause} \
          ORDER BY \
              CASE WHEN n.path LIKE '%_test.%' OR n.path LIKE '%/testing/%' OR n.path LIKE 'test/%' THEN 0 ELSE 1 END DESC, \
              n.shell_number DESC"
     );
     let mut stmt = conn.prepare(&sql)?;
     let pending: Vec<(i64, String)> = stmt
-        .query_map(
-            rusqlite::params![MODEL_ID, n_shards as i64, shard_idx as i64],
-            |row| {
-                let id: i64 = row.get(0)?;
-                let kind: String = row.get(1)?;
-                let sig: String = row.get(2)?;
-                Ok((id, format!("{kind}: {sig}")))
-            },
-        )?
+        .query_map([MODEL_ID], |row| {
+            let id: i64 = row.get(0)?;
+            let kind: String = row.get(1)?;
+            let sig: String = row.get(2)?;
+            Ok((id, format!("{kind}: {sig}")))
+        })?
         .filter_map(|r| r.ok())
         .collect();
 
     let total = pending.len();
-    tracing::info!(total, shard_idx, n_shards, "symbol nodes to embed");
+    tracing::info!(total, worker = %worker_label, "symbol nodes to embed");
 
     let mut texts = pending;
     texts.sort_by_key(|(_, text)| estimate_tokens(text));
@@ -345,8 +353,8 @@ fn reindex(
     let index_path = index_path_for_db(db_path);
 
     if total == 0 {
-        if shard_mode {
-            println!("  shard {shard_idx}/{n_shards}: no pending nodes.");
+        if worker_mode {
+            println!("  {worker_label}: no pending nodes.");
             return Ok(());
         }
         if matches!(phase, Phase::Phase2(_)) {
@@ -373,7 +381,7 @@ fn reindex(
         return Ok(());
     }
 
-    let idx: Option<index::VecIndex> = if shard_mode || matches!(phase, Phase::Phase2(_)) {
+    let idx: Option<index::VecIndex> = if worker_mode || matches!(phase, Phase::Phase2(_)) {
         None
     } else {
         let idx = if index_path.exists() {
@@ -487,8 +495,8 @@ fn reindex(
     conn.execute_batch("PRAGMA edb.wal_checkpoint(TRUNCATE)")
         .context("checkpoint embed.db WAL")?;
 
-    if shard_mode {
-        println!("  shard {shard_idx}/{n_shards}: {inserted} nodes embedded.");
+    if worker_mode {
+        println!("  {worker_label}: {inserted} nodes embedded.");
     } else {
         drop(idx);
         let phase_label = if matches!(phase, Phase::Phase2(_)) {
@@ -503,7 +511,7 @@ fn reindex(
         rebuild_index(db_path, embed_db_path)?;
     }
 
-    tracing::info!(inserted, total, shard_idx, n_shards, "reindex complete");
+    tracing::info!(inserted, total, worker = %worker_label, "reindex complete");
     Ok(())
 }
 
@@ -575,6 +583,9 @@ fn main() {
     let mut rebuild_db: Option<PathBuf> = None;
     let mut embed_db: Option<PathBuf> = None;
     let mut shard: Option<(usize, usize)> = None;
+    let mut row_start: Option<i64> = None;
+    let mut row_end: Option<i64> = None;
+    let mut busy_timeout_ms: u64 = 120_000;
     let mut phase = Phase::All;
     let mut i = 1usize;
     while i < args.len() {
@@ -654,11 +665,46 @@ fn main() {
                 }
                 shard = Some((shard_idx, n_shards));
             }
+            "--row-start" => {
+                i += 1;
+                row_start = Some(
+                    args.get(i)
+                        .and_then(|s| s.parse::<i64>().ok())
+                        .unwrap_or_else(|| {
+                            eprintln!("usage: --row-start <i64>");
+                            std::process::exit(1);
+                        }),
+                );
+            }
+            "--row-end" => {
+                i += 1;
+                row_end = Some(
+                    args.get(i)
+                        .and_then(|s| s.parse::<i64>().ok())
+                        .unwrap_or_else(|| {
+                            eprintln!("usage: --row-end <i64>");
+                            std::process::exit(1);
+                        }),
+                );
+            }
+            "--busy-timeout-ms" => {
+                i += 1;
+                busy_timeout_ms = args
+                    .get(i)
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or_else(|| {
+                        eprintln!("usage: --busy-timeout-ms <ms>");
+                        std::process::exit(1);
+                    });
+            }
             other => {
                 eprintln!("unknown argument: {other}");
                 eprintln!(
                     "usage: travsr-embed-nomic \
-                     [--reindex <db> [--embed-db <embed.db>] [--phase1 <n>|--phase2 <n>] [--shard <i>/<n>]] \
+                     [--reindex <db> [--embed-db <embed.db>] \
+                      [--row-start <i64> --row-end <i64>] \
+                      [--phase1 <n>|--phase2 <n>] [--shard <i>/<n>] \
+                      [--busy-timeout-ms <ms>]] \
                      [--rebuild-index <db> [--embed-db <embed.db>]] \
                      [--db-path <db>]"
                 );
@@ -670,6 +716,25 @@ fn main() {
 
     if shard.is_some() && reindex_db.is_none() {
         eprintln!("--shard requires --reindex");
+        std::process::exit(1);
+    }
+    match (row_start, row_end) {
+        (Some(s), Some(e)) if s >= e => {
+            eprintln!("--row-start must be less than --row-end");
+            std::process::exit(1);
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            eprintln!("--row-start and --row-end must be used together");
+            std::process::exit(1);
+        }
+        _ => {}
+    }
+    if row_start.is_some() && reindex_db.is_none() {
+        eprintln!("--row-start/--row-end requires --reindex");
+        std::process::exit(1);
+    }
+    if row_start.is_some() && shard.is_some() {
+        eprintln!("--row-start/--row-end and --shard are mutually exclusive");
         std::process::exit(1);
     }
     if rebuild_db.is_some() && reindex_db.is_some() {
@@ -685,7 +750,8 @@ fn main() {
         }
     } else if let Some(db_path) = reindex_db {
         let embed_path = embed_db.unwrap_or_else(|| embed_db_path_for(&db_path));
-        if let Err(e) = reindex(&model_dir, &db_path, &embed_path, shard, phase) {
+        let row_range = row_start.zip(row_end);
+        if let Err(e) = reindex(&model_dir, &db_path, &embed_path, shard, row_range, busy_timeout_ms, phase) {
             eprintln!("reindex failed: {e:#}");
             std::process::exit(1);
         }

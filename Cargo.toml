@@ -2,7 +2,7 @@
 name = "travsr-embed-nomic"
 version = "0.1.0"
 edition = "2021"
-description = "Travsr embed sidecar — nomic-embed-text-v1.5 int8 ONNX, MRL-256, sqlite-vec HNSW (RFC-018)"
+description = "Travsr embed sidecar — nomic-embed-text-v1.5, candle fp32 backend, MRL-256 (RFC-018)"
 license = "MIT"
 rust-version = "1.80"
 
@@ -12,41 +12,47 @@ path = "src/main.rs"
 
 [dependencies]
 # Published crates.io versions — patched below to local path while RFC-018
-# changes (EmbedPlugin::max_batch, EmbedHandshakeResponse.max_batch) are
-# not yet in a crates.io release. Remove [patch.crates-io] once 0.7.1 ships.
+# changes are not yet in a crates.io release.
 travsr-plugin-protocol = "0.7"
 travsr-plugin-sdk      = "0.7"
 
-# ONNX Runtime — downloads ORT dylib at build time; copy-dylibs (in default
-# features) copies libonnxruntime.* next to the binary in target/{profile}/.
-# For ~/.travsr/bin/ install, copy both the binary AND the dylib.
-ort     = "2.0.0-rc.12"
-ndarray = "0.17"
+# candle ML framework — CPU on all platforms (macOS + Linux/OCI ARM64).
+# Metal GPU removed: macOS 26 (Tahoe) changed the Metal.framework ABI and
+# triggers a dylib-load-time crash when the metal feature is compiled in,
+# identical to the CoreML issue that killed ORT on Tahoe.  Re-enable once
+# candle-core ships Tahoe-compatible Metal bindings.
+candle-core         = { version = "0.10" }
+candle-nn           = "0.10"
+candle-transformers = "0.10"
+
+# JSON: parse ~/.travsr/models/<id>/config.json for NomicBertModel::load.
+serde_json = "1"
 
 # HuggingFace fast tokenizer — loads tokenizer.json from disk.
 tokenizers = "0.23"
 
-# SQLite (bundled amalgamation — no system SQLite required) for graph.db I/O.
-rusqlite   = { version = "0.32", features = ["bundled"] }
+# SQLite (bundled amalgamation — no system SQLite required).
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 # usearch HNSW index — disk-persistent, mmap-loadable, incremental inserts.
-# Replaces in-memory hnsw_rs (RFC-018, Option B).
 usearch = "2.25.3"
 
-dirs    = "5"
-anyhow  = "1"
-tracing = "0.1"
+dirs               = "5"
+anyhow             = "1"
+tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+[features]
+# Enable Apple Accelerate BLAS backend on macOS (M-series).
+# Build with: cargo build --release --features accelerate
+# OCI Linux ARM64 builds omit this flag (CPU-only BLAS is sufficient there).
+accelerate = [
+    "candle-core/accelerate",
+    "candle-nn/accelerate",
+    "candle-transformers/accelerate",
+]
+
 # ── Local development override ────────────────────────────────────────────────
-# Both Travsr-com/travsr and Travsr-com/travsr-embed must be checked out as
-# siblings (../travsr) for this patch to resolve.
-# Remove this section once RFC-018 changes ship in a crates.io release.
 [patch.crates-io]
 travsr-plugin-protocol = { path = "../travsr/crates/travsr-plugin-protocol" }
 travsr-plugin-sdk      = { path = "../travsr/crates/travsr-plugin-sdk" }
-
-# CoreML EP deferred: ORT 2.0.0-rc.12 loads CoreML.framework at binary startup
-# when the feature is compiled in, regardless of whether the EP is requested at
-# runtime.  macOS 26 (Tahoe) changed the CoreML ABI and triggers a load-time
-# crash.  Revisit when ORT ships a release that lazy-loads platform EPs.

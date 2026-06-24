@@ -298,12 +298,16 @@ impl NomicPlugin {
             .collect();
         words.sort_unstable_by_key(|w| std::cmp::Reverse(w.len()));
         words.dedup();
+        // OR between terms: any matching term is a lazy-embed candidate.
+        // AND would require every query word to appear in one signature — too
+        // strict for multi-word queries where words like "user" or "input" never
+        // co-occur with "validate" in the same function name.
         let fts_query: String = words
             .iter()
             .take(3)
             .map(|w| format!("\"{w}\""))
             .collect::<Vec<_>>()
-            .join(" ");
+            .join(" OR ");
 
         if fts_query.is_empty() {
             return Ok(vec![]);

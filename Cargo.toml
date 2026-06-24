@@ -2,7 +2,7 @@
 name = "travsr-embed-nomic"
 version = "0.1.0"
 edition = "2021"
-description = "Travsr embed sidecar — nomic-embed-text-v1.5, candle fp32 backend, MRL-256 (RFC-018)"
+description = "Travsr embed sidecar — BAAI/bge-small-en-v1.5, tract ONNX fp32, CLS-384"
 license = "MIT"
 rust-version = "1.80"
 
@@ -10,23 +10,21 @@ rust-version = "1.80"
 name = "travsr-embed-nomic"
 path = "src/main.rs"
 
+[[bin]]
+name = "bench-tract"
+path = "src/bin/bench_tract.rs"
+
 [dependencies]
 # Published crates.io versions — patched below to local path while RFC-018
 # changes are not yet in a crates.io release.
 travsr-plugin-protocol = "0.7"
 travsr-plugin-sdk      = "0.7"
 
-# candle ML framework — CPU on all platforms (macOS + Linux/OCI ARM64).
-# Metal GPU removed: macOS 26 (Tahoe) changed the Metal.framework ABI and
-# triggers a dylib-load-time crash when the metal feature is compiled in,
-# identical to the CoreML issue that killed ORT on Tahoe.  Re-enable once
-# candle-core ships Tahoe-compatible Metal bindings.
-candle-core         = { version = "0.10" }
-candle-nn           = "0.10"
-candle-transformers = "0.10"
-
-# JSON: parse ~/.travsr/models/<id>/config.json for NomicBertModel::load.
-serde_json = "1"
+# tract — pure-Rust ONNX inference (vectorized SIMD kernels for GeLU + matmul).
+# BGE-small uses standard BERT (no RoPE), so tract can fully optimize it.
+# Benchmark: ~140 nodes/sec single-thread, ~307 nodes/sec at 4 threads.
+# Works identically on macOS (Apple Silicon) and OCI ARM64 with no flags.
+tract-onnx = "0.23"
 
 # HuggingFace fast tokenizer — loads tokenizer.json from disk.
 tokenizers = "0.23"
@@ -41,16 +39,6 @@ dirs               = "5"
 anyhow             = "1"
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-[features]
-# Enable Apple Accelerate BLAS backend on macOS (M-series).
-# Build with: cargo build --release --features accelerate
-# OCI Linux ARM64 builds omit this flag (CPU-only BLAS is sufficient there).
-accelerate = [
-    "candle-core/accelerate",
-    "candle-nn/accelerate",
-    "candle-transformers/accelerate",
-]
 
 # ── Local development override ────────────────────────────────────────────────
 [patch.crates-io]

@@ -36,20 +36,20 @@ mod index;
 mod model;
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context as _, Result};
 use rusqlite::Connection;
 use travsr_plugin_protocol::{EmbedPlugin, EmbedRequest, EmbedResponse, KnnRequest, KnnResponse};
 use travsr_plugin_sdk::run_embed_plugin;
 
-const MODEL_ID: &str = "nomic-v1.5-int8";
-const BACKEND: &str = "nomic-embed-text-v1.5 int8 MRL-256";
-const EMBED_DIM: u32 = 256;
-// MAX_BATCH: hard cap on items per ONNX forward pass.
+const MODEL_ID: &str = "bge-small-en-v1.5";
+const BACKEND: &str = "bge-small-en-v1.5 fp32 CLS-384";
+const EMBED_DIM: u32 = model::DIM as u32;
+// MAX_BATCH: hard cap on items per forward pass.
 // TOKEN_BUDGET: soft cap on padded tensor cost (BatchLongest pads all items to
 // max_seq_in_batch; cost = max_seq × count). At TOKEN_BUDGET=4096 the hidden
-// state tensor is 4096×768×4B ≈ 12 MB regardless of batch count.
+// state tensor is 4096×384×4B ≈ 6 MB regardless of batch count.
 // For our workload (avg ~12 tokens/node), 4096 tokens ≈ 341 nodes — well under
 // MAX_BATCH=512, so the budget is the effective limit in practice.
 const MAX_BATCH: usize = 512;
@@ -73,7 +73,7 @@ enum Phase {
 // ── Plugin struct ─────────────────────────────────────────────────────────────
 
 struct NomicPlugin {
-    model: model::NomicModel,
+    model: model::BgeModel,
     /// HNSW index — None until first KNN call if not present at startup.
     index: Mutex<Option<index::VecIndex>>,
     index_path: PathBuf,
@@ -83,7 +83,7 @@ impl NomicPlugin {
     /// `model_dir`  — global model directory (ONNX + tokenizer files)
     /// `index_path` — per-repo HNSW file (derived from db_path by the caller)
     fn load(model_dir: &Path, index_path: PathBuf) -> Result<Self> {
-        let model = model::NomicModel::load(model_dir).context("loading model")?;
+        let model = model::BgeModel::load(model_dir).context("loading model")?;
         let index = index::VecIndex::try_load(&index_path).unwrap_or_else(|e| {
             tracing::warn!(
                 "could not load HNSW index: {e:#} — KNN disabled until `travsr embed reindex` runs"
@@ -251,9 +251,9 @@ fn reindex(
     );
 
     let model = if worker_mode {
-        model::NomicModel::load_for_shard(model_dir, 1).context("loading model (worker)")?
+        model::BgeModel::load_for_shard(model_dir, 1).context("loading model (worker)")?
     } else {
-        model::NomicModel::load(model_dir).context("loading model")?
+        model::BgeModel::load(model_dir).context("loading model")?
     };
 
     // graph.db: node source + tombstone log. synchronous=NORMAL is fine — we
@@ -515,6 +515,355 @@ fn reindex(
     Ok(())
 }
 
+// ── partition_ranges (i128 arithmetic) ───────────────────────────────────────
+
+/// Partition [min_id, max_id] into n non-overlapping half-open ranges.
+/// Uses i128 internally to avoid saturating_sub overflow when node IDs span
+/// nearly the full i64 range (hash-based IDs from kubernetes-scale repos).
+fn partition_ranges_i128(min_id: i64, max_id: i64, n: usize) -> Vec<(i64, i64)> {
+    assert!(n >= 1);
+    let min = min_id as i128;
+    let max = max_id as i128;
+    // span fits in u128 even for i64::MIN..i64::MAX (= 2^64, within u128 range).
+    let span = (max - min + 1) as u128;
+    let chunk = (span / n as u128).max(1) as i128;
+    (0..n)
+        .map(|i| {
+            let start = (min + i as i128 * chunk) as i64;
+            let end = if i + 1 == n {
+                i64::MAX
+            } else {
+                (min + (i as i128 + 1) * chunk) as i64
+            };
+            (start, end)
+        })
+        .collect()
+}
+
+// ── --parallel N mode ─────────────────────────────────────────────────────────
+
+/// Parallel reindex: load the model ONCE; N reader threads feed one inference loop.
+///
+/// Compared to the old multi-process design (RFC-020), this eliminates the
+/// N × 270 MB model-load memory cliff. RAM usage is ~constant regardless of N:
+/// 1 × model_weights (~270 MB) + 1 × per-connection SQLite caches.
+///
+/// Pipeline (RFC-022 multi-thread inference):
+///   N combined reader+inference+write threads, each owning one ID-range.
+///   All threads share one Arc<TypedRunnableModel> (BgeModel::clone() is cheap).
+///   Each thread holds its own SQLite connections → no shared mutable state.
+///   WAL serialises concurrent COMMITs; inference (300 ms/batch) dominates,
+///   so write contention between threads is negligible.
+fn reindex_parallel(
+    model_dir: &Path,
+    db_path: &Path,
+    embed_db_path: &Path,
+    parallel: usize,
+    busy_timeout_ms: u64,
+    phase: Phase,
+) -> Result<()> {
+    tracing::info!(
+        parallel,
+        db = %db_path.display(),
+        embed_db = %embed_db_path.display(),
+        "parallel reindex: {} reader thread(s), single model load",
+        parallel
+    );
+
+    // ── Step 1: CDC tombstones (main thread, needs write access to both dbs) ──
+    {
+        let conn = Connection::open(db_path).context("open graph.db for tombstones")?;
+        let embed_str = embed_db_path
+            .to_str()
+            .context("embed.db path is not valid UTF-8")?;
+        let escaped = embed_str.replace('\'', "''");
+        conn.execute_batch(&format!(
+            "PRAGMA busy_timeout = {busy_timeout_ms};
+             ATTACH DATABASE '{escaped}' AS edb;
+             PRAGMA edb.journal_mode = WAL;"
+        ))
+        .context("configure connections for tombstone pass")?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS edb.node_embeddings (
+                 node_id   INTEGER NOT NULL,
+                 model_id  TEXT    NOT NULL,
+                 embedding BLOB    NOT NULL,
+                 PRIMARY KEY (node_id, model_id)
+             ) WITHOUT ROWID;
+             CREATE INDEX IF NOT EXISTS edb.idx_node_embeddings_model
+                 ON node_embeddings(model_id);",
+        )
+        .context("create embed.db schema")?;
+        let tombstone_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM node_tombstones", [], |r| r.get(0))
+            .unwrap_or(0);
+        if tombstone_count > 0 {
+            conn.execute_batch(
+                "BEGIN;
+                 DELETE FROM edb.node_embeddings
+                     WHERE node_id IN (SELECT node_id FROM node_tombstones);
+                 DELETE FROM node_tombstones;
+                 COMMIT;",
+            )
+            .context("applying CDC tombstones")?;
+            tracing::info!(tombstone_count, "applied CDC tombstones to embed.db");
+        }
+    }
+
+    // ── Step 2: query pending bounds ──────────────────────────────────────────
+    let phase_clause = match phase {
+        Phase::All => String::new(),
+        Phase::Phase1(t) => format!("AND n.shell_number >= {t}"),
+        Phase::Phase2(t) => format!("AND n.shell_number < {t}"),
+    };
+
+    let (min_id, max_id) = {
+        let conn = Connection::open_with_flags(
+            db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .context("open graph.db for bounds query")?;
+        let embed_str = embed_db_path
+            .to_str()
+            .context("embed.db path is not valid UTF-8")?;
+        let escaped = embed_str.replace('\'', "''");
+        conn.execute_batch(&format!("ATTACH DATABASE '{escaped}' AS edb"))
+            .context("attach embed.db for bounds query")?;
+        let sql = format!(
+            "SELECT MIN(n.id), MAX(n.id) FROM nodes n \
+             WHERE n.kind NOT IN ('file','file-module','import','module','field','variable') \
+             AND NOT EXISTS (\
+                 SELECT 1 FROM edb.node_embeddings e \
+                 WHERE e.node_id = n.id AND e.model_id = ?1\
+             ) {phase_clause}"
+        );
+        let result: Option<(Option<i64>, Option<i64>)> = conn
+            .query_row(&sql, [MODEL_ID], |row| Ok((row.get(0)?, row.get(1)?)))
+            .ok();
+        match result.and_then(|(a, b)| a.zip(b)) {
+            Some(bounds) => bounds,
+            None => {
+                println!("All nodes already embedded — nothing to do.");
+                return Ok(());
+            }
+        }
+    };
+
+    // ── Step 3: partition ranges + load model ──────────────────────────────────
+    let ranges = partition_ranges_i128(min_id, max_id, parallel);
+    let n_ranges = ranges.len();
+
+    let model = model::BgeModel::load(model_dir).context("loading model")?;
+    tracing::info!(
+        parallel,
+        min_id,
+        max_id,
+        "model loaded; spawning {} inference threads",
+        n_ranges
+    );
+
+    // ── Steps 4-6: N combined reader+inference+write threads ──────────────────
+    // Each thread owns one ID-range and runs the full pipeline independently:
+    //   graph.db (RO) → batch → model.embed_documents() → embed.db (write)
+    // BgeModel::clone() is cheap (Arc<TypedRunnableModel> + Tokenizer clone).
+    // Each thread opens its own SQLite connections; WAL serialises COMMITs.
+    let db_arc  = Arc::new(db_path.to_path_buf());
+    let edb_arc = Arc::new(embed_db_path.to_path_buf());
+    let pc_arc  = Arc::new(phase_clause);
+
+    let worker_handles: Vec<_> = ranges
+        .into_iter()
+        .enumerate()
+        .map(|(i, (start, end))| {
+            let model_w  = model.clone();
+            let db_w     = Arc::clone(&db_arc);
+            let edb_w    = Arc::clone(&edb_arc);
+            let pc_w     = Arc::clone(&pc_arc);
+            let is_last  = i + 1 == n_ranges;
+
+            std::thread::Builder::new()
+                .name(format!("embed-{i}"))
+                .spawn(move || -> Result<usize> {
+                    // ── read: graph.db (RO) + embed.db (NOT EXISTS check) ──
+                    let read_conn = Connection::open_with_flags(
+                        &*db_w,
+                        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                    )
+                    .context("worker: open graph.db")?;
+                    let edb_str = edb_w.to_str().context("worker: embed.db path UTF-8")?;
+                    let escaped = edb_str.replace('\'', "''");
+                    read_conn
+                        .execute_batch(&format!("ATTACH DATABASE '{escaped}' AS edb"))
+                        .context("worker: attach embed.db")?;
+
+                    let range_clause = if is_last {
+                        format!("AND n.id >= {start}")
+                    } else {
+                        format!("AND n.id >= {start} AND n.id < {end}")
+                    };
+
+                    let sql = format!(
+                        "SELECT n.id, n.kind, n.signature \
+                         FROM nodes n \
+                         WHERE n.kind NOT IN \
+                             ('file','file-module','import','module','field','variable') \
+                         AND NOT EXISTS (\
+                             SELECT 1 FROM edb.node_embeddings e \
+                             WHERE e.node_id = n.id AND e.model_id = ?1\
+                         ) {pc_w} \
+                         {range_clause} \
+                         ORDER BY n.shell_number DESC"
+                    );
+                    let mut stmt = read_conn.prepare(&sql).context("worker: prepare")?;
+                    let mut pending: Vec<(i64, String)> = stmt
+                        .query_map([MODEL_ID], |row| {
+                            let id: i64   = row.get(0)?;
+                            let kind: String = row.get(1)?;
+                            let sig: String  = row.get(2)?;
+                            Ok((id, format!("{kind}: {sig}")))
+                        })
+                        .context("worker: query_map")?
+                        .filter_map(|r| r.ok())
+                        .collect();
+
+                    if pending.is_empty() {
+                        return Ok(0);
+                    }
+                    // Sort shortest-first so BatchLongest pads as little as possible.
+                    pending.sort_by_key(|(_, t)| estimate_tokens(t));
+
+                    // ── write: own connection, synchronous=OFF for bulk speed ──
+                    let write_conn = Connection::open(&*edb_w)
+                        .context("worker: open embed.db")?;
+                    write_conn
+                        .execute_batch(&format!(
+                            "PRAGMA journal_mode = WAL;
+                             PRAGMA synchronous = OFF;
+                             PRAGMA wal_autocheckpoint = 0;
+                             PRAGMA cache_size = -32768;
+                             PRAGMA busy_timeout = {busy_timeout_ms};"
+                        ))
+                        .context("worker: configure embed.db")?;
+                    write_conn
+                        .execute_batch(
+                            "CREATE TABLE IF NOT EXISTS node_embeddings (
+                                 node_id   INTEGER NOT NULL,
+                                 model_id  TEXT    NOT NULL,
+                                 embedding BLOB    NOT NULL,
+                                 PRIMARY KEY (node_id, model_id)
+                             ) WITHOUT ROWID;
+                             CREATE INDEX IF NOT EXISTS idx_node_embeddings_model
+                                 ON node_embeddings(model_id);",
+                        )
+                        .context("worker: ensure schema")?;
+                    let mut ins = write_conn
+                        .prepare(
+                            "INSERT OR REPLACE INTO node_embeddings \
+                             (node_id, model_id, embedding) VALUES (?1, ?2, ?3)",
+                        )
+                        .context("worker: prepare insert")?;
+
+                    // ── batch → inference → write ──────────────────────────
+                    let batch_ranges = build_batch_ranges(
+                        &pending.iter().map(|(_, t)| estimate_tokens(t)).collect::<Vec<_>>(),
+                    );
+                    let mut tx_buf: Vec<(i64, Vec<u8>)> = Vec::with_capacity(TX_BATCH + 512);
+                    let mut inserted = 0usize;
+
+                    for range in batch_ranges {
+                        let chunk = &pending[range];
+                        let texts: Vec<&str> = chunk.iter().map(|(_, t)| t.as_str()).collect();
+                        let blobs = model_w.embed_documents(&texts).context("worker: embed")?;
+                        for ((nid, _), blob) in chunk.iter().zip(blobs.iter()) {
+                            tx_buf.push((*nid, blob.clone()));
+                        }
+                        if tx_buf.len() >= TX_BATCH {
+                            write_conn.execute("BEGIN", []).context("worker: begin")?;
+                            for (nid, blob) in &tx_buf {
+                                ins.execute(rusqlite::params![nid, MODEL_ID, blob])
+                                    .context("worker: insert")?;
+                            }
+                            write_conn.execute("COMMIT", []).context("worker: commit")?;
+                            inserted += tx_buf.len();
+                            tx_buf.clear();
+                        }
+                    }
+                    if !tx_buf.is_empty() {
+                        write_conn.execute("BEGIN", []).context("worker: begin final")?;
+                        for (nid, blob) in &tx_buf {
+                            ins.execute(rusqlite::params![nid, MODEL_ID, blob])
+                                .context("worker: insert final")?;
+                        }
+                        write_conn.execute("COMMIT", []).context("worker: commit final")?;
+                        inserted += tx_buf.len();
+                    }
+
+                    tracing::debug!(thread = i, inserted, "inference worker complete");
+                    Ok(inserted)
+                })
+                .expect("spawn inference thread")
+        })
+        .collect();
+
+    let mut total_embedded = 0usize;
+    let worker_errors: Vec<String> = worker_handles
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, h)| match h.join() {
+            Ok(Ok(n))  => { total_embedded += n; None }
+            Ok(Err(e)) => Some(format!("worker {i}: {e:#}")),
+            Err(_)     => Some(format!("worker {i}: panicked")),
+        })
+        .collect();
+    if !worker_errors.is_empty() {
+        anyhow::bail!("inference worker errors:\n  {}", worker_errors.join("\n  "));
+    }
+
+    println!("  Embedded {total_embedded} nodes.");
+
+    // ── Step 7: single checkpoint across all workers' WAL writes ─────────────
+    let write_conn = Connection::open(embed_db_path).context("open embed.db for checkpoint")?;
+    write_conn
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .context("checkpoint embed.db WAL")?;
+    drop(write_conn);
+
+    if matches!(phase, Phase::Phase2(_)) {
+        println!("Phase 2 complete — {total_embedded} nodes embedded.");
+    } else {
+        println!("  Rebuilding HNSW index from all embeddings...");
+        rebuild_index(db_path, embed_db_path)?;
+    }
+
+    tracing::info!(total_embedded, parallel, "parallel reindex complete");
+    Ok(())
+}
+
+/// Partition a slice of per-item token estimates into token-budget batches.
+/// Items must be pre-sorted shortest-first so BatchLongest padding is minimised.
+fn build_batch_ranges(est_lens: &[usize]) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    let mut max_est = 0usize;
+    for (i, &est) in est_lens.iter().enumerate() {
+        let new_max = max_est.max(est);
+        let projected = new_max * (i - start + 1);
+        if i > start && (projected > TOKEN_BUDGET || (i - start) >= MAX_BATCH) {
+            ranges.push(start..i);
+            start   = i;
+            max_est = est;
+        } else {
+            max_est = new_max;
+        }
+    }
+    if start < est_lens.len() {
+        ranges.push(start..est_lens.len());
+    }
+    ranges
+}
+
 // ── --rebuild-index mode ──────────────────────────────────────────────────────
 
 /// Rebuild the per-repo HNSW index by streaming all rows from embed.db.node_embeddings.
@@ -585,6 +934,7 @@ fn main() {
     let mut shard: Option<(usize, usize)> = None;
     let mut row_start: Option<i64> = None;
     let mut row_end: Option<i64> = None;
+    let mut parallel: Option<usize> = None;
     let mut busy_timeout_ms: u64 = 120_000;
     let mut phase = Phase::All;
     let mut i = 1usize;
@@ -697,6 +1047,21 @@ fn main() {
                         std::process::exit(1);
                     });
             }
+            "--parallel" => {
+                i += 1;
+                let n = args
+                    .get(i)
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or_else(|| {
+                        eprintln!("usage: --parallel <N>  (N >= 1)");
+                        std::process::exit(1);
+                    });
+                if n == 0 {
+                    eprintln!("--parallel N must be >= 1");
+                    std::process::exit(1);
+                }
+                parallel = Some(n);
+            }
             other => {
                 eprintln!("unknown argument: {other}");
                 eprintln!(
@@ -737,6 +1102,14 @@ fn main() {
         eprintln!("--row-start/--row-end and --shard are mutually exclusive");
         std::process::exit(1);
     }
+    if parallel.is_some() && (shard.is_some() || row_start.is_some()) {
+        eprintln!("--parallel is mutually exclusive with --shard and --row-start/--row-end");
+        std::process::exit(1);
+    }
+    if parallel.is_some() && reindex_db.is_none() {
+        eprintln!("--parallel requires --reindex");
+        std::process::exit(1);
+    }
     if rebuild_db.is_some() && reindex_db.is_some() {
         eprintln!("--rebuild-index and --reindex are mutually exclusive");
         std::process::exit(1);
@@ -750,8 +1123,14 @@ fn main() {
         }
     } else if let Some(db_path) = reindex_db {
         let embed_path = embed_db.unwrap_or_else(|| embed_db_path_for(&db_path));
-        let row_range = row_start.zip(row_end);
-        if let Err(e) = reindex(&model_dir, &db_path, &embed_path, shard, row_range, busy_timeout_ms, phase) {
+        let result = if let Some(n) = parallel {
+            // RFC-021: single model loaded once; N reader threads inside the sidecar.
+            reindex_parallel(&model_dir, &db_path, &embed_path, n, busy_timeout_ms, phase)
+        } else {
+            let row_range = row_start.zip(row_end);
+            reindex(&model_dir, &db_path, &embed_path, shard, row_range, busy_timeout_ms, phase)
+        };
+        if let Err(e) = result {
             eprintln!("reindex failed: {e:#}");
             std::process::exit(1);
         }

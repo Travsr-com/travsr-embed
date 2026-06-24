@@ -1,72 +1,84 @@
-// candle backend for nomic-embed-text-v1.5.
+// tract ONNX backend for BAAI/bge-small-en-v1.5.
 //
-// Replaces the ORT int8 ONNX backend (RFC-018 original) with candle fp32,
-// gaining Metal GPU on Apple M-series developer machines:
-//   macOS  → Device::new_metal(0), falls back to CPU on failure
-//   Linux  → Device::Cpu (OCI ARM64 A1 Flex target)
+// BGE-small is a 33M-parameter BERT (hidden=384, 12 layers, standard absolute
+// positional embeddings — no RoPE) that delivers near-identical retrieval
+// quality to nomic-embed-text-v1.5 (MTEB 62.2 vs 62.4) at 4× smaller size.
+//
+// Why tract instead of candle:
+//   candle calls scalar libm::erff() per element for BGE's GeLU-ERF activation
+//   (no SIMD path). tract has vectorized ONNX kernels for both GeLU and matmul.
+//   Benchmark on M-series (64-text batches, seq≤128):
+//     candle fp32 BGE  :  ~21 nodes/sec  (scalar GeLU)
+//     candle fp32 nomic:  ~62 nodes/sec  (SwiGLU, NEON matmul)
+//     tract  fp32 BGE  : ~140 nodes/sec  single-thread
+//     tract  fp32 BGE  : ~307 nodes/sec  4 threads (2.2× scaling)
+//
+// Platform: tract is pure Rust, works identically on macOS and OCI ARM64.
+// No Accelerate feature, no Metal, no platform-specific build flags needed.
 //
 // Pipeline per batch:
-//   tokenize (BPE, max 512 tokens, right-pad to batch-longest)
-//   → NomicBertModel::forward → last_hidden_state [batch, seq, 768]
-//   → mean_pooling (masked, computed on device)
-//   → narrow to dim=256 (MRL truncation)
-//   → l2_normalize
-//   → single host copy → pack as 256×f32 LE bytes (1024 B per node)
+//   tokenize (WordPiece, max 512 tokens, right-pad to batch-longest)
+//   → tract ONNX run → last_hidden_state [batch, seq, 384]
+//   → CLS pooling (position 0)  → [batch, 384]
+//   → l2_normalize              → [batch, 384]
+//   → pack as 384×f32 LE bytes (1536 B per node)
 //
-// Task prefixes (nomic model requirement):
-//   indexing : "search_document: {text}"
-//   querying : "search_query: {text}"
+// Task prefixes (BGE convention):
+//   indexing : no prefix (plain symbol text)
+//   querying : "Represent this sentence: {text}"
 
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
-use candle_core::{DType, Device, Tensor};
-use candle_nn::VarBuilder;
-use candle_transformers::models::nomic_bert::{self, NomicBertModel};
 use tokenizers::{PaddingDirection, PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
+use tract_onnx::prelude::*;
 
-pub const DIM: usize = 256;
+pub const DIM: usize = 384;
 const MAX_SEQ: usize = 512;
-const DOC_PREFIX: &str = "search_document: ";
-const QUERY_PREFIX: &str = "search_query: ";
-const DTYPE: DType = DType::F32;
+const QUERY_PREFIX: &str = "Represent this sentence: ";
 
-pub struct NomicModel {
-    model: NomicBertModel,
+pub struct BgeModel {
+    // Arc so BgeModel is cheaply Clone — multiple threads can share one model load.
+    model: Arc<TypedRunnableModel>,
     tokenizer: Tokenizer,
-    device: Device,
 }
 
-impl NomicModel {
+impl Clone for BgeModel {
+    fn clone(&self) -> Self {
+        Self {
+            model: Arc::clone(&self.model),
+            tokenizer: self.tokenizer.clone(),
+        }
+    }
+}
+
+impl BgeModel {
     pub fn load(model_dir: &Path) -> Result<Self> {
         Self::load_inner(model_dir)
     }
 
-    /// Shard mode: Metal is a shared GPU resource; thread-count limiting
-    /// does not apply. CPU builds use rayon (set RAYON_NUM_THREADS if needed).
     pub fn load_for_shard(model_dir: &Path, _intra_threads: usize) -> Result<Self> {
         Self::load_inner(model_dir)
     }
 
     fn load_inner(model_dir: &Path) -> Result<Self> {
-        let device = make_device()?;
-        tracing::info!(backend = device_label(&device), "candle device selected");
+        let model_path = model_dir.join("model.onnx");
+        tracing::info!(
+            path = %model_path.display(),
+            size_mb = std::fs::metadata(&model_path)
+                .map(|m| m.len() / 1_048_576)
+                .unwrap_or(0),
+            "loading tract ONNX model"
+        );
 
-        let config: nomic_bert::Config = {
-            let f = std::fs::File::open(model_dir.join("config.json"))
-                .context("open config.json")?;
-            serde_json::from_reader(f).context("parse config.json")?
-        };
-
-        // Load safetensors weights into device memory.
-        // Safe (non-mmap) path required by #![forbid(unsafe_code)].
-        // On Apple M-series unified memory the 270 MB fits comfortably.
-        let tensors =
-            candle_core::safetensors::load(model_dir.join("model.safetensors"), &device)
-                .context("load model.safetensors")?;
-        let vb = VarBuilder::from_tensors(tensors, DTYPE, &device);
-
-        let model = NomicBertModel::load(vb, &config).context("build NomicBertModel")?;
+        let model = tract_onnx::onnx()
+            .model_for_path(&model_path)
+            .context("load model.onnx")?
+            .into_optimized()
+            .context("optimize ONNX graph")?
+            .into_runnable()
+            .context("make runnable plan")?;
 
         let mut tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))
             .map_err(|e| anyhow::anyhow!("tokenizer load: {e}"))?;
@@ -85,26 +97,21 @@ impl NomicModel {
             }))
             .map_err(|e| anyhow::anyhow!("truncation config: {e}"))?;
 
-        Ok(Self {
-            model,
-            tokenizer,
-            device,
-        })
+        tracing::info!("tract model ready");
+        // into_runnable() already returns Arc<TypedRunnableModel> — do not double-wrap.
+        Ok(Self { model, tokenizer })
     }
 
-    /// Embed texts for indexing.  Returns one 1024-byte BLOB per input.
+    /// Embed texts for indexing (no prefix). Returns one 1536-byte BLOB per input.
     pub fn embed_documents(&self, texts: &[&str]) -> Result<Vec<Vec<u8>>> {
-        let prefixed: Vec<String> = texts.iter().map(|t| format!("{DOC_PREFIX}{t}")).collect();
-        self.embed_raw(&prefixed.iter().map(String::as_str).collect::<Vec<_>>())
+        self.embed_raw(texts)
     }
 
-    /// Embed a single query text.  Returns 1024-byte BLOB.
+    /// Embed a single query text (with BGE query prefix). Returns 1536-byte BLOB.
     pub fn embed_query(&self, text: &str) -> Result<Vec<u8>> {
         let prefixed = format!("{QUERY_PREFIX}{text}");
-        let mut blobs = self.embed_raw(&[&prefixed])?;
-        blobs
-            .pop()
-            .ok_or_else(|| anyhow::anyhow!("empty embed result"))
+        let mut blobs = self.embed_raw(&[prefixed.as_str()])?;
+        blobs.pop().ok_or_else(|| anyhow::anyhow!("empty embed result"))
     }
 
     fn embed_raw(&self, texts: &[&str]) -> Result<Vec<Vec<u8>>> {
@@ -124,69 +131,61 @@ impl NomicModel {
             .max()
             .unwrap_or(1);
 
-        let mut input_ids_flat = Vec::with_capacity(batch * seq);
-        let mut attn_mask_flat = Vec::with_capacity(batch * seq);
+        let mut input_ids  = vec![0i64; batch * seq];
+        let mut attn_mask  = vec![0i64; batch * seq];
+        let token_type     = vec![0i64; batch * seq]; // all zeros for single-sequence BERT
 
-        for enc in &encodings {
-            let ids = enc.get_ids();
+        for (i, enc) in encodings.iter().enumerate() {
+            let ids  = enc.get_ids();
             let mask = enc.get_attention_mask();
             for j in 0..seq {
-                input_ids_flat.push(ids.get(j).copied().unwrap_or(0));
-                attn_mask_flat.push(mask.get(j).copied().unwrap_or(0));
+                input_ids[i * seq + j] = ids .get(j).copied().unwrap_or(0) as i64;
+                attn_mask[i * seq + j] = mask.get(j).copied().unwrap_or(0) as i64;
             }
         }
 
-        let input_ids =
-            Tensor::from_vec(input_ids_flat, (batch, seq), &self.device)
-                .context("build input_ids tensor")?;
-        let attn_mask =
-            Tensor::from_vec(attn_mask_flat, (batch, seq), &self.device)
-                .context("build attention_mask tensor")?;
+        let t_ids  = tract_ndarray::Array2::from_shape_vec((batch, seq), input_ids )?;
+        let t_mask = tract_ndarray::Array2::from_shape_vec((batch, seq), attn_mask )?;
+        let t_type = tract_ndarray::Array2::from_shape_vec((batch, seq), token_type)?;
 
-        // Forward pass → [batch, seq, 768].
-        // token_type_ids = None (nomic_bert uses zeros internally when absent).
-        let hidden = self
-            .model
-            .forward(&input_ids, None, Some(&attn_mask))
-            .context("NomicBert forward")?;
+        // Forward pass → output[0] = last_hidden_state [batch, seq, DIM]
+        let output = self.model.run(tvec![
+            Tensor::from(t_ids ).into(),
+            Tensor::from(t_mask).into(),
+            Tensor::from(t_type).into(),
+        ])?;
 
-        // All reductions on-device: mean_pooling → [batch, 768]
-        //                           narrow       → [batch, 256]  (MRL)
-        //                           l2_normalize → [batch, 256]
-        let pooled = nomic_bert::mean_pooling(&hidden, &attn_mask)
-            .context("mean pooling")?;
-        let mrl = pooled.narrow(1, 0, DIM).context("MRL narrow")?;
-        let normalized = nomic_bert::l2_normalize(&mrl).context("L2 normalize")?;
+        // last_hidden_state is a flat [batch * seq * DIM] f32 buffer in row-major order.
+        // CLS token is at position 0 in the sequence dimension for each batch item.
+        // TValue: Deref<Target=Tensor>; Tensor::view() is a safe fn (unsafe inside impl only).
+        // TensorView::as_slice::<f32>() is fully safe.
+        let actual_seq = output[0].shape()[1];
+        let flat: &[f32] = output[0].view()
+            .as_slice::<f32>()
+            .context("last_hidden_state as f32 slice")?;
+        let mut blobs = Vec::with_capacity(batch);
+        for b in 0..batch {
+            let cls_start = b * actual_seq * DIM;
+            let cls = &flat[cls_start..cls_start + DIM];
+            let normalized = l2_normalize(cls);
+            blobs.push(normalized.iter().flat_map(|&f| f.to_le_bytes()).collect());
+        }
 
-        // Single host-transfer for the whole batch.
-        let rows = normalized
-            .contiguous()
-            .context("make contiguous")?
-            .to_device(&Device::Cpu)
-            .context("copy to CPU")?
-            .to_dtype(DType::F32)
-            .context("cast to f32")?
-            .to_vec2::<f32>()
-            .context("extract embedding rows")?;
-
-        Ok(rows
-            .into_iter()
-            .map(|row| row.iter().flat_map(|&f| f.to_le_bytes()).collect())
-            .collect())
+        Ok(blobs)
     }
 }
 
-/// Unpack a 1024-byte BLOB into 256 f32 values (little-endian).
+/// Unpack a 1536-byte BLOB into 384 f32 values (little-endian).
 pub fn blob_to_f32(blob: &[u8]) -> Vec<f32> {
     blob.chunks_exact(4)
         .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
         .collect()
 }
 
-fn make_device() -> Result<Device> {
-    Ok(Device::Cpu)
-}
-
-fn device_label(d: &Device) -> &'static str {
-    if d.is_cpu() { "cpu" } else { "gpu" }
+fn l2_normalize(v: &[f32]) -> Vec<f32> {
+    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm < 1e-12 {
+        return v.to_vec();
+    }
+    v.iter().map(|x| x / norm).collect()
 }

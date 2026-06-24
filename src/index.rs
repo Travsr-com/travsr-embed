@@ -7,7 +7,7 @@
 //   • Staleness detection: one stat() syscall per KNN call instead of
 //     Connection::open() + SELECT COUNT(*) + drop(conn) (~5 ms → ~200 ns).
 //
-// BLOB format: 256 × f32 little-endian = 1024 bytes (matches model.rs output).
+// BLOB format: 384 × f32 little-endian = 1536 bytes (BGE-small CLS-384 output).
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -68,7 +68,7 @@ impl VecIndex {
     }
 
     /// Full rebuild by streaming node_embeddings from embed.db.
-    /// Peak RAM: one BLOB (1024 bytes) at a time — no full materialisation.
+    /// Peak RAM: one BLOB (1536 bytes) at a time — no full materialisation.
     /// Used as a recovery path when hnsw.usearch is missing but node_embeddings
     /// is already populated (e.g., after accidental index deletion).
     ///
@@ -176,7 +176,7 @@ impl VecIndex {
     /// reindex completed), reloads the index. One stat() syscall per call (~200 ns)
     /// replaces the old Connection::open() + COUNT(*) + drop(conn) (~5 ms).
     ///
-    /// `query_blob`: 1024-byte LE f32 blob (dim=256).
+    /// `query_blob`: 1536-byte LE f32 blob (dim=384).
     /// Returns up to `k` (node_id, cosine_distance) pairs.
     pub fn knn(&mut self, query_blob: &[u8], k: u32) -> Result<Vec<(i64, f32)>> {
         let mtime = std::fs::metadata(&self.index_path)
@@ -228,7 +228,7 @@ impl VecIndex {
 
 fn make_options() -> IndexOptions {
     IndexOptions {
-        dimensions: 256,
+        dimensions: crate::model::DIM,
         metric: MetricKind::Cos,
         quantization: ScalarKind::F32,
         connectivity: 16,
@@ -243,7 +243,7 @@ mod tests {
     use super::*;
 
     fn unit_vec(seed: u32) -> Vec<f32> {
-        let mut v: Vec<f32> = (0u32..256)
+        let mut v: Vec<f32> = (0u32..crate::model::DIM as u32)
             .map(|i| {
                 let x = seed
                     .wrapping_mul(1664525)

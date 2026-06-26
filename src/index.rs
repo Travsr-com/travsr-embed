@@ -30,7 +30,8 @@ impl VecIndex {
         if !index_path.exists() {
             return Ok(None);
         }
-        let inner = Index::new(&make_options()).context("create usearch Index")?;
+        // dim is read from the file by usearch on load() — pass 1 as a placeholder.
+        let inner = Index::new(&make_options(1)).context("create usearch Index")?;
         let path_str = index_path
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("index path is not valid UTF-8"))?;
@@ -55,8 +56,8 @@ impl VecIndex {
 
     /// Create an empty writable index. Used for the first reindex run when
     /// no hnsw.usearch file exists yet. Reserves `capacity` slots upfront.
-    pub fn new_empty(index_path: &Path, capacity: usize) -> Result<Self> {
-        let inner = Index::new(&make_options()).context("create usearch Index")?;
+    pub fn new_empty(index_path: &Path, capacity: usize, dim: usize) -> Result<Self> {
+        let inner = Index::new(&make_options(dim)).context("create usearch Index")?;
         inner
             .reserve(capacity)
             .context("reserve initial capacity")?;
@@ -81,6 +82,7 @@ impl VecIndex {
         model_id: &str,
         index_path: &Path,
         expected_count: usize,
+        dim: usize,
     ) -> Result<Self> {
         let conn = Connection::open(db_path).context("open graph.db")?;
         let embed_db_str = embed_db_path
@@ -89,29 +91,50 @@ impl VecIndex {
         conn.execute_batch(&format!("ATTACH DATABASE '{embed_db_str}' AS edb"))
             .context("attach embed.db")?;
 
+        // Seed eligibility: a node must have at least one real incoming call edge
+        // (ref/call or ffi/call) to be indexed in HNSW for KNN seed selection.
+        //
+        // Nodes with zero call-callers have zero blast radius — nothing in the
+        // graph depends on them. This includes:
+        //   • Test functions (called by the test runner, no graph edge)
+        //   • Entry points (main, daemon run loops, HTTP handlers — called by the OS/framework)
+        //   • Dead code
+        //
+        // Entry points are still reachable in PPR results via reverse traversal
+        // from their callees which ARE seeds. Only their ability to be initial
+        // seeds is removed, which is the correct behaviour.
+        //
+        // Nodes where Phase B has not yet run (no ref/call edges in the graph at
+        // all) fall through to the unwrap_or(expected_count) fallback so a
+        // pre-Phase-B manual reindex still builds a usable index.
+        const SEED_FILTER: &str =
+            "n.kind NOT IN ('file', 'file-module', 'import', 'module', 'field', 'variable') \
+             AND EXISTS ( \
+                 SELECT 1 FROM edges ce \
+                 WHERE ce.dst = n.id AND ce.kind IN ('ref/call', 'ffi/call') \
+             )";
+
         let n: usize = conn
             .query_row(
-                "SELECT COUNT(*) FROM edb.node_embeddings e \
-                 JOIN nodes n ON n.id = e.node_id \
-                 WHERE e.model_id = ?1 \
-                 AND n.kind NOT IN ('file', 'file-module', 'import', 'module', 'field', 'variable')",
+                &format!(
+                    "SELECT COUNT(*) FROM edb.node_embeddings e \
+                     JOIN nodes n ON n.id = e.node_id \
+                     WHERE e.model_id = ?1 AND {SEED_FILTER}"
+                ),
                 [model_id],
                 |r| r.get(0),
             )
             .unwrap_or(expected_count);
 
-        let inner = Index::new(&make_options()).context("create usearch Index")?;
+        let inner = Index::new(&make_options(dim)).context("create usearch Index")?;
         inner.reserve(n).context("reserve capacity")?;
 
-        // Join edb.node_embeddings with nodes to exclude structural-noise kinds —
-        // same exclusion list as reindex().
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             "SELECT e.node_id, e.embedding \
              FROM edb.node_embeddings e \
              JOIN nodes n ON n.id = e.node_id \
-             WHERE e.model_id = ?1 \
-             AND n.kind NOT IN ('file', 'file-module', 'import', 'module', 'field', 'variable')",
-        )?;
+             WHERE e.model_id = ?1 AND {SEED_FILTER}",
+        ))?;
         let mut rows = stmt.query([model_id])?;
         let mut count = 0usize;
         while let Some(row) = rows.next()? {
@@ -226,9 +249,9 @@ impl VecIndex {
     }
 }
 
-fn make_options() -> IndexOptions {
+fn make_options(dim: usize) -> IndexOptions {
     IndexOptions {
-        dimensions: crate::model::DIM,
+        dimensions: dim,
         metric: MetricKind::Cos,
         quantization: ScalarKind::F32,
         connectivity: 16,
@@ -242,8 +265,10 @@ fn make_options() -> IndexOptions {
 mod tests {
     use super::*;
 
+    const TEST_DIM: usize = 384;
+
     fn unit_vec(seed: u32) -> Vec<f32> {
-        let mut v: Vec<f32> = (0u32..crate::model::DIM as u32)
+        let mut v: Vec<f32> = (0u32..TEST_DIM as u32)
             .map(|i| {
                 let x = seed
                     .wrapping_mul(1664525)
@@ -264,7 +289,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("test.usearch");
 
-        let idx = VecIndex::new_empty(&path, 100).unwrap();
+        let idx = VecIndex::new_empty(&path, 100, TEST_DIM).unwrap();
         for i in 0u32..100 {
             idx.add(i as i64, &unit_vec(i)).unwrap();
         }

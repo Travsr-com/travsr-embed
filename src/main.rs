@@ -47,9 +47,20 @@ use rusqlite::Connection;
 use travsr_plugin_protocol::{EmbedPlugin, EmbedRequest, EmbedResponse, KnnRequest, KnnResponse};
 use travsr_plugin_sdk::run_embed_plugin;
 
-const MODEL_ID: &str = "bge-small-en-v1.5";
-const BACKEND: &str = "bge-small-en-v1.5 fp32 CLS-384";
-const EMBED_DIM: u32 = model::DIM as u32;
+/// Embedding dimension for each supported BGE model variant.
+fn dim_for_model(model_id: &str) -> usize {
+    match model_id {
+        "bge-base-en-v1.5"  => 768,
+        "bge-large-en-v1.5" => 1024,
+        _                   => 384, // bge-small-en-v1.5 and any future 384-dim model
+    }
+}
+
+/// Human-readable backend label shown in `travsr embed status` and sidecar logs.
+fn backend_label(model_id: &str) -> String {
+    let dim = dim_for_model(model_id);
+    format!("{model_id} fp32 CLS-{dim}")
+}
 // MAX_BATCH: hard cap on items per forward pass.
 // TOKEN_BUDGET: soft cap on padded tensor cost (BatchLongest pads all items to
 // max_seq_in_batch; cost = max_seq × count). At TOKEN_BUDGET=4096 the hidden
@@ -78,6 +89,8 @@ enum Phase {
 
 struct NomicPlugin {
     model: model::BgeModel,
+    model_id: String,
+    backend: String,
     /// HNSW index — None until first KNN call if not present at startup.
     index: Mutex<Option<index::VecIndex>>,
     index_path: PathBuf,
@@ -91,9 +104,11 @@ impl NomicPlugin {
     /// `model_dir`  — global model directory (ONNX + tokenizer files)
     /// `index_path` — per-repo HNSW file (co-located with graph.db)
     /// `db_path`    — graph.db (for FTS candidate lookup in lazy embed path)
-    fn load(model_dir: &Path, index_path: PathBuf, db_path: PathBuf) -> Result<Self> {
+    /// `model_id`   — catalog ID, e.g. "bge-small-en-v1.5"
+    fn load(model_dir: &Path, index_path: PathBuf, db_path: PathBuf, model_id: &str) -> Result<Self> {
         let embed_db_path = embed_db_path_for(&db_path);
-        let model = model::BgeModel::load(model_dir).context("loading model")?;
+        let dim = dim_for_model(model_id);
+        let model = model::BgeModel::load(model_dir, dim).context("loading model")?;
         let index = index::VecIndex::try_load(&index_path).unwrap_or_else(|e| {
             tracing::warn!(
                 "could not load HNSW index: {e:#} — KNN disabled until `travsr embed reindex` runs"
@@ -102,6 +117,8 @@ impl NomicPlugin {
         });
         Ok(Self {
             model,
+            model_id: model_id.to_owned(),
+            backend: backend_label(model_id),
             index: Mutex::new(index),
             index_path,
             db_path,
@@ -112,13 +129,13 @@ impl NomicPlugin {
 
 impl EmbedPlugin for NomicPlugin {
     fn model_id(&self) -> &str {
-        MODEL_ID
+        &self.model_id
     }
     fn embedding_dim(&self) -> u32 {
-        EMBED_DIM
+        self.model.dim as u32
     }
     fn backend(&self) -> &str {
-        BACKEND
+        &self.backend
     }
     fn max_batch(&self) -> u32 {
         MAX_BATCH as u32
@@ -264,6 +281,7 @@ impl NomicPlugin {
         // Persist to embed.db in a background thread so the hot query path
         // is not blocked by SQLite I/O. INSERT OR IGNORE is safe under races.
         let edb = self.embed_db_path.clone();
+        let mid = self.model_id.clone();
         let pairs: Vec<(i64, Vec<u8>)> = candidates
             .iter()
             .map(|(nid, _)| *nid)
@@ -272,7 +290,7 @@ impl NomicPlugin {
         std::thread::Builder::new()
             .name("lazy-embed-persist".into())
             .spawn(move || {
-                if let Err(e) = persist_lazy_embeddings(&edb, &pairs) {
+                if let Err(e) = persist_lazy_embeddings(&edb, &pairs, &mid) {
                     tracing::warn!("lazy embed persist failed (non-fatal): {e:#}");
                 }
             })
@@ -330,7 +348,26 @@ impl NomicPlugin {
 
         let mut stmt = conn
             .prepare(
-                "SELECT f.rowid AS node_id, n.kind || ': ' || n.signature AS text \
+                "SELECT f.rowid AS node_id, \
+                 COALESCE(n.embed_text, \
+                     n.kind || ': ' || n.signature \
+                     || COALESCE(' | module: ' || NULLIF(n.path, ''), '') \
+                     || COALESCE(' | callers: ' || ( \
+                         SELECT GROUP_CONCAT(sub.sig, ', ') FROM ( \
+                             SELECT SUBSTR(src_n.signature, 1, 60) AS sig \
+                             FROM edges e JOIN nodes src_n ON src_n.id = e.src \
+                             WHERE e.dst = n.id \
+                             AND src_n.kind NOT IN \
+                                 ('file','file-module','import','module','field','variable') \
+                             LIMIT 5) AS sub), '') \
+                     || COALESCE(' | callees: ' || ( \
+                         SELECT GROUP_CONCAT(sub.sig, ', ') FROM ( \
+                             SELECT SUBSTR(dst_n.signature, 1, 60) AS sig \
+                             FROM edges e JOIN nodes dst_n ON dst_n.id = e.dst \
+                             WHERE e.src = n.id \
+                             AND dst_n.kind NOT IN \
+                                 ('file','file-module','import','module','field','variable') \
+                             LIMIT 5) AS sub), '')) AS text \
                  FROM nodes_fts f \
                  JOIN nodes n ON n.id = f.rowid \
                  WHERE nodes_fts MATCH ?1 \
@@ -347,7 +384,7 @@ impl NomicPlugin {
 
         let candidates: Vec<(i64, String)> = stmt
             .query_map(
-                rusqlite::params![fts_query, MODEL_ID, limit as i64],
+                rusqlite::params![fts_query, self.model_id.as_str(), limit as i64],
                 |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
             )
             .context("lazy embed: execute FTS query")?
@@ -362,7 +399,7 @@ impl NomicPlugin {
 
 /// Persist a batch of (node_id, blob) pairs to embed.db after lazy on-the-fly
 /// embedding. Called from a background thread — all errors are non-fatal.
-fn persist_lazy_embeddings(embed_db_path: &Path, pairs: &[(i64, Vec<u8>)]) -> Result<()> {
+fn persist_lazy_embeddings(embed_db_path: &Path, pairs: &[(i64, Vec<u8>)], model_id: &str) -> Result<()> {
     let conn = Connection::open(embed_db_path).context("lazy persist: open embed.db")?;
     conn.execute_batch(
         "PRAGMA journal_mode = WAL;
@@ -378,17 +415,17 @@ fn persist_lazy_embeddings(embed_db_path: &Path, pairs: &[(i64, Vec<u8>)]) -> Re
         )
         .context("lazy persist: prepare insert")?;
     for (nid, blob) in pairs {
-        ins.execute(rusqlite::params![nid, MODEL_ID, blob])
+        ins.execute(rusqlite::params![nid, model_id, blob])
             .context("lazy persist: insert")?;
     }
     conn.execute("COMMIT", []).context("lazy persist: commit")?;
     Ok(())
 }
 
-fn write_current_embed_model_meta(conn: &rusqlite::Connection) -> Result<()> {
+fn write_current_embed_model_meta(conn: &rusqlite::Connection, model_id: &str) -> Result<()> {
     conn.execute(
         "INSERT OR REPLACE INTO meta (key, value) VALUES ('current_embed_model', ?1)",
-        [MODEL_ID],
+        [model_id],
     )
     .context("writing current_embed_model meta")?;
     Ok(())
@@ -399,6 +436,42 @@ fn write_current_embed_model_meta(conn: &rusqlite::Connection) -> Result<()> {
 /// Accurate enough to bound padded tensor cost; actual count differs by <20%.
 fn estimate_tokens(text: &str) -> usize {
     text.len() / 4 + 4
+}
+
+/// Build the text string fed to the embedding model for one node.
+///
+/// Enriches the base `kind: signature` with module path and immediate caller /
+/// callee names so that private/internal symbols are discoverable via the
+/// concepts of their neighbours — not just their own name.
+///
+/// Caller and callee strings are already comma-joined by the SQL layer (up to 5
+/// each, truncated to 60 chars per signature). Either may be `None` when the
+/// node has no graph neighbours of the included kinds.
+fn build_node_text(
+    kind: &str,
+    sig: &str,
+    path: &str,
+    callers: Option<&str>,
+    callees: Option<&str>,
+) -> String {
+    let mut text = format!("{kind}: {sig}");
+    if !path.is_empty() {
+        text.push_str(" | module: ");
+        text.push_str(path);
+    }
+    if let Some(c) = callers {
+        if !c.is_empty() {
+            text.push_str(" | callers: ");
+            text.push_str(c);
+        }
+    }
+    if let Some(d) = callees {
+        if !d.is_empty() {
+            text.push_str(" | callees: ");
+            text.push_str(d);
+        }
+    }
+    text
 }
 
 /// Derive the embed.db path as a sibling of graph.db.
@@ -434,6 +507,7 @@ fn reindex(
     row_range: Option<(i64, i64)>,
     busy_timeout_ms: u64,
     phase: Phase,
+    model_id: &str,
 ) -> Result<()> {
     // worker_mode: either shard or range partitioning — skip HNSW per-worker
     let worker_mode = shard.is_some() || row_range.is_some();
@@ -460,10 +534,11 @@ fn reindex(
         "starting reindex"
     );
 
+    let dim = dim_for_model(model_id);
     let model = if worker_mode {
-        model::BgeModel::load_for_shard(model_dir, 1).context("loading model (worker)")?
+        model::BgeModel::load_for_shard(model_dir, 1, dim).context("loading model (worker)")?
     } else {
-        model::BgeModel::load(model_dir).context("loading model")?
+        model::BgeModel::load(model_dir, dim).context("loading model")?
     };
 
     // graph.db: node source + tombstone log. synchronous=NORMAL is fine — we
@@ -530,10 +605,29 @@ fn reindex(
 
     // NOT EXISTS checks edb.node_embeddings so graph.db WAL is never touched
     // by embedding writes.
+    //
+    // Columns 3-5 (path, callers, callees) enrich the embedding text so that
+    // private/internal functions are reachable via their neighbours' names.
+    // Correlated subqueries use the covering indices idx_edges_dst_kind_cov and
+    // idx_edges_src_kind_cov — no table scan needed per node.
+    // Correlated subqueries use the covering indices idx_edges_dst_kind_cov and
+    // idx_edges_src_kind_cov — no table scan needed per node.
+    let kind_exclude = "'file','file-module','import','module','field','variable'";
     let sql = format!(
-        "SELECT n.id, n.kind, n.signature \
+        "SELECT n.id, n.kind, n.signature, n.path, \
+         n.embed_text, \
+         (SELECT GROUP_CONCAT(sub.sig, ', ') FROM \
+             (SELECT SUBSTR(src_n.signature, 1, 60) AS sig \
+              FROM edges e JOIN nodes src_n ON src_n.id = e.src \
+              WHERE e.dst = n.id \
+              AND src_n.kind NOT IN ({kind_exclude}) LIMIT 5) AS sub) AS callers, \
+         (SELECT GROUP_CONCAT(sub.sig, ', ') FROM \
+             (SELECT SUBSTR(dst_n.signature, 1, 60) AS sig \
+              FROM edges e JOIN nodes dst_n ON dst_n.id = e.dst \
+              WHERE e.src = n.id \
+              AND dst_n.kind NOT IN ({kind_exclude}) LIMIT 5) AS sub) AS callees \
          FROM nodes n \
-         WHERE n.kind NOT IN ('file', 'file-module', 'import', 'module', 'field', 'variable') \
+         WHERE n.kind NOT IN ({kind_exclude}) \
          AND NOT EXISTS ( \
              SELECT 1 FROM edb.node_embeddings e \
              WHERE e.node_id = n.id AND e.model_id = ?1 \
@@ -545,11 +639,18 @@ fn reindex(
     );
     let mut stmt = conn.prepare(&sql)?;
     let pending: Vec<(i64, String)> = stmt
-        .query_map([MODEL_ID], |row| {
+        .query_map([model_id], |row| {
             let id: i64 = row.get(0)?;
             let kind: String = row.get(1)?;
             let sig: String = row.get(2)?;
-            Ok((id, format!("{kind}: {sig}")))
+            let path: String = row.get(3)?;
+            let embed_text: Option<String> = row.get(4)?;
+            let callers: Option<String> = row.get(5)?;
+            let callees: Option<String> = row.get(6)?;
+            let text = embed_text.unwrap_or_else(|| {
+                build_node_text(&kind, &sig, &path, callers.as_deref(), callees.as_deref())
+            });
+            Ok((id, text))
         })?
         .filter_map(|r| r.ok())
         .collect();
@@ -560,7 +661,7 @@ fn reindex(
     let mut texts = pending;
     texts.sort_by_key(|(_, text)| estimate_tokens(text));
 
-    let index_path = index_path_for_db(db_path);
+    let index_path = index_path_for_db(db_path, model_id);
 
     if total == 0 {
         if worker_mode {
@@ -572,21 +673,21 @@ fn reindex(
             return Ok(());
         }
         if index_path.exists() {
-            write_current_embed_model_meta(&conn)?;
-            println!("All nodes already have embeddings for {MODEL_ID}. Index up to date.");
+            write_current_embed_model_meta(&conn, model_id)?;
+            println!("All nodes already have embeddings for {model_id}. Index up to date.");
             return Ok(());
         }
         let existing: usize = conn
             .query_row(
                 "SELECT COUNT(*) FROM edb.node_embeddings WHERE model_id = ?1",
-                [MODEL_ID],
+                [model_id],
                 |r| r.get(0),
             )
             .unwrap_or(0);
         println!("All nodes already embedded ({existing} rows). Building missing HNSW index...");
-        index::VecIndex::build_from_db(db_path, embed_db_path, MODEL_ID, &index_path, existing)
+        index::VecIndex::build_from_db(db_path, embed_db_path, model_id, &index_path, existing, dim_for_model(model_id))
             .context("build_from_db")?;
-        write_current_embed_model_meta(&conn)?;
+        write_current_embed_model_meta(&conn, model_id)?;
         println!("Done — index saved to {}.", index_path.display());
         return Ok(());
     }
@@ -602,18 +703,18 @@ fn reindex(
             let existing: usize = conn
                 .query_row(
                     "SELECT COUNT(*) FROM edb.node_embeddings WHERE model_id = ?1",
-                    [MODEL_ID],
+                    [model_id],
                     |r| r.get(0),
                 )
                 .unwrap_or(0);
             if existing > 0 {
-                index::VecIndex::build_from_db(db_path, embed_db_path, MODEL_ID, &index_path, existing)
+                index::VecIndex::build_from_db(db_path, embed_db_path, model_id, &index_path, existing, dim_for_model(model_id))
                     .context("rebuild HNSW from existing embeddings before adding pending")?;
                 index::VecIndex::try_load(&index_path)
                     .context("load freshly-rebuilt HNSW")?
                     .expect("just-rebuilt index must be loadable")
             } else {
-                index::VecIndex::new_empty(&index_path, total).context("create new HNSW index")?
+                index::VecIndex::new_empty(&index_path, total, dim_for_model(model_id)).context("create new HNSW index")?
             }
         };
         idx.reserve(idx.size() + total)
@@ -664,7 +765,7 @@ fn reindex(
      -> Result<()> {
         conn.execute("BEGIN", [])?;
         for (node_id, blob) in tx_buffer {
-            ins.execute(rusqlite::params![node_id, MODEL_ID, blob])?;
+            ins.execute(rusqlite::params![node_id, model_id, blob])?;
             if let Some(ref idx_inner) = idx {
                 let vec = model::blob_to_f32(blob);
                 idx_inner.add(*node_id, &vec)?;
@@ -718,7 +819,7 @@ fn reindex(
         println!("  Rebuilding HNSW index from all embeddings...");
         // Drop the prepared statement before rebuild_index opens its own connection.
         drop(ins);
-        rebuild_index(db_path, embed_db_path)?;
+        rebuild_index(db_path, embed_db_path, model_id)?;
     }
 
     tracing::info!(inserted, total, worker = %worker_label, "reindex complete");
@@ -749,6 +850,7 @@ fn reindex_parallel(
     parallel: usize,
     busy_timeout_ms: u64,
     phase: Phase,
+    model_id: &str,
 ) -> Result<()> {
     tracing::info!(
         parallel,
@@ -820,10 +922,22 @@ fn reindex_parallel(
         let escaped = embed_str.replace('\'', "''");
         conn.execute_batch(&format!("ATTACH DATABASE '{escaped}' AS edb"))
             .context("attach embed.db for pending query")?;
+        let kind_exclude = "'file','file-module','import','module','field','variable'";
         let sql = format!(
-            "SELECT n.id, n.kind, n.signature \
+            "SELECT n.id, n.kind, n.signature, n.path, \
+             n.embed_text, \
+             (SELECT GROUP_CONCAT(sub.sig, ', ') FROM \
+                 (SELECT SUBSTR(src_n.signature, 1, 60) AS sig \
+                  FROM edges e JOIN nodes src_n ON src_n.id = e.src \
+                  WHERE e.dst = n.id \
+                  AND src_n.kind NOT IN ({kind_exclude}) LIMIT 5) AS sub) AS callers, \
+             (SELECT GROUP_CONCAT(sub.sig, ', ') FROM \
+                 (SELECT SUBSTR(dst_n.signature, 1, 60) AS sig \
+                  FROM edges e JOIN nodes dst_n ON dst_n.id = e.dst \
+                  WHERE e.src = n.id \
+                  AND dst_n.kind NOT IN ({kind_exclude}) LIMIT 5) AS sub) AS callees \
              FROM nodes n \
-             WHERE n.kind NOT IN ('file','file-module','import','module','field','variable') \
+             WHERE n.kind NOT IN ({kind_exclude}) \
              AND NOT EXISTS (\
                  SELECT 1 FROM edb.node_embeddings e \
                  WHERE e.node_id = n.id AND e.model_id = ?1\
@@ -832,11 +946,18 @@ fn reindex_parallel(
         );
         let mut stmt = conn.prepare(&sql).context("prepare pending query")?;
         let rows: Vec<(i64, String)> = stmt
-            .query_map([MODEL_ID], |row| {
+            .query_map([model_id], |row| {
                 let id: i64 = row.get(0)?;
                 let kind: String = row.get(1)?;
                 let sig: String = row.get(2)?;
-                Ok((id, format!("{kind}: {sig}")))
+                let path: String = row.get(3)?;
+                let embed_text: Option<String> = row.get(4)?;
+                let callers: Option<String> = row.get(5)?;
+                let callees: Option<String> = row.get(6)?;
+                let text = embed_text.unwrap_or_else(|| {
+                    build_node_text(&kind, &sig, &path, callers.as_deref(), callees.as_deref())
+                });
+                Ok((id, text))
             })
             .context("query pending nodes")?
             .filter_map(|r| r.ok())
@@ -868,7 +989,7 @@ fn reindex_parallel(
     let next_batch = Arc::new(AtomicUsize::new(0));
 
     let n_workers = parallel.min(n_batches).max(1);
-    let model = model::BgeModel::load(model_dir).context("loading model")?;
+    let model = model::BgeModel::load(model_dir, dim_for_model(model_id)).context("loading model")?;
     tracing::info!(
         total,
         n_batches,
@@ -882,11 +1003,13 @@ fn reindex_parallel(
     // BgeModel::clone() is cheap (Arc<TypedRunnableModel> + Tokenizer clone).
     // Each worker opens its own write connection to embed.db; WAL serialises COMMITs.
     let edb_arc = Arc::new(embed_db_path.to_path_buf());
+    let mid_arc = Arc::new(model_id.to_owned());
 
     let worker_handles: Vec<_> = (0..n_workers)
         .map(|i| {
             let model_w   = model.clone();
             let edb_w     = Arc::clone(&edb_arc);
+            let mid_w     = Arc::clone(&mid_arc);
             let items_w   = Arc::clone(&items);
             let batches_w = Arc::clone(&batches);
             let next_w    = Arc::clone(&next_batch);
@@ -944,7 +1067,7 @@ fn reindex_parallel(
                         if tx_buf.len() >= TX_BATCH {
                             wconn.execute("BEGIN", []).context("worker: begin")?;
                             for (nid, blob) in &tx_buf {
-                                ins.execute(rusqlite::params![nid, MODEL_ID, blob])
+                                ins.execute(rusqlite::params![nid, mid_w.as_str(), blob])
                                     .context("worker: insert")?;
                             }
                             wconn.execute("COMMIT", []).context("worker: commit")?;
@@ -956,7 +1079,7 @@ fn reindex_parallel(
                     if !tx_buf.is_empty() {
                         wconn.execute("BEGIN", []).context("worker: begin final")?;
                         for (nid, blob) in &tx_buf {
-                            ins.execute(rusqlite::params![nid, MODEL_ID, blob])
+                            ins.execute(rusqlite::params![nid, mid_w.as_str(), blob])
                                 .context("worker: insert final")?;
                         }
                         wconn.execute("COMMIT", []).context("worker: commit final")?;
@@ -999,7 +1122,7 @@ fn reindex_parallel(
     // Always rebuild after Phase 2 so HNSW covers Phase 1 + Phase 2 nodes.
     // Phase 1 rebuilds unconditionally too (same branch).
     println!("  Rebuilding HNSW index from all embeddings...");
-    rebuild_index(db_path, embed_db_path)?;
+    rebuild_index(db_path, embed_db_path, model_id)?;
 
     tracing::info!(total_embedded, parallel, "parallel reindex complete");
     Ok(())
@@ -1033,7 +1156,7 @@ fn build_batch_ranges(est_lens: &[usize]) -> Vec<std::ops::Range<usize>> {
 /// Rebuild the per-repo HNSW index by streaming all rows from embed.db.node_embeddings.
 /// No ONNX inference — pure SQLite I/O.  Used as the final step by the CLI
 /// orchestrator after parallel shard embedding completes.
-fn rebuild_index(db_path: &Path, embed_db_path: &Path) -> Result<()> {
+fn rebuild_index(db_path: &Path, embed_db_path: &Path, model_id: &str) -> Result<()> {
     tracing::info!(
         db = %db_path.display(),
         embed_db = %embed_db_path.display(),
@@ -1052,7 +1175,7 @@ fn rebuild_index(db_path: &Path, embed_db_path: &Path) -> Result<()> {
              JOIN nodes n ON n.id = e.node_id \
              WHERE e.model_id = ?1 \
              AND n.kind NOT IN ('file', 'file-module', 'import', 'module', 'field', 'variable')",
-            [MODEL_ID],
+            [model_id],
             |r| r.get(0),
         )
         .context("counting existing meaningful embeddings")?;
@@ -1060,11 +1183,11 @@ fn rebuild_index(db_path: &Path, embed_db_path: &Path) -> Result<()> {
         existing > 0,
         "no embeddings in embed.db — run `travsr embed reindex` first"
     );
-    let index_path = index_path_for_db(db_path);
+    let index_path = index_path_for_db(db_path, model_id);
     println!("Building HNSW index from {existing} embeddings...");
-    index::VecIndex::build_from_db(db_path, embed_db_path, MODEL_ID, &index_path, existing)
+    index::VecIndex::build_from_db(db_path, embed_db_path, model_id, &index_path, existing, dim_for_model(model_id))
         .context("build_from_db")?;
-    write_current_embed_model_meta(&conn)?;
+    write_current_embed_model_meta(&conn, model_id)?;
     println!("Done — index saved to {}.", index_path.display());
     tracing::info!(existing, "HNSW index rebuilt");
     Ok(())
@@ -1081,15 +1204,6 @@ fn main() {
         )
         .init();
 
-    let model_dir = match model_dir() {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("travsr-embed: cannot find model dir: {e:#}");
-            eprintln!("  Run: travsr embed init");
-            std::process::exit(1);
-        }
-    };
-
     let args: Vec<String> = std::env::args().collect();
     let mut reindex_db: Option<PathBuf> = None;
     let mut daemon_db: Option<PathBuf> = None;
@@ -1101,6 +1215,7 @@ fn main() {
     let mut parallel: Option<usize> = None;
     let mut busy_timeout_ms: u64 = 120_000;
     let mut phase = Phase::All;
+    let mut model_id_arg: Option<String> = None;
     let mut i = 1usize;
     while i < args.len() {
         match args[i].as_str() {
@@ -1226,10 +1341,18 @@ fn main() {
                 }
                 parallel = Some(n);
             }
+            "--model-id" => {
+                i += 1;
+                model_id_arg = Some(args.get(i).cloned().unwrap_or_else(|| {
+                    eprintln!("usage: --model-id <id>");
+                    std::process::exit(1);
+                }));
+            }
             other => {
                 eprintln!("unknown argument: {other}");
                 eprintln!(
                     "usage: travsr-embed-nomic \
+                     [--model-id <id>] \
                      [--reindex <db> [--embed-db <embed.db>] \
                       [--row-start <i64> --row-end <i64>] \
                       [--phase1 <n>|--phase2 <n>] [--shard <i>/<n>] \
@@ -1279,9 +1402,20 @@ fn main() {
         std::process::exit(1);
     }
 
+    // Resolve model ID: CLI arg → default.
+    let model_id = model_id_arg.as_deref().unwrap_or("bge-small-en-v1.5");
+
+    let model_dir = match model_dir(model_id) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("travsr-embed: cannot find model dir: {e:#}");
+            std::process::exit(1);
+        }
+    };
+
     if let Some(db_path) = rebuild_db {
         let embed_path = embed_db.unwrap_or_else(|| embed_db_path_for(&db_path));
-        if let Err(e) = rebuild_index(&db_path, &embed_path) {
+        if let Err(e) = rebuild_index(&db_path, &embed_path, model_id) {
             eprintln!("rebuild-index failed: {e:#}");
             std::process::exit(1);
         }
@@ -1289,10 +1423,10 @@ fn main() {
         let embed_path = embed_db.unwrap_or_else(|| embed_db_path_for(&db_path));
         let result = if let Some(n) = parallel {
             // RFC-021: single model loaded once; N reader threads inside the sidecar.
-            reindex_parallel(&model_dir, &db_path, &embed_path, n, busy_timeout_ms, phase)
+            reindex_parallel(&model_dir, &db_path, &embed_path, n, busy_timeout_ms, phase, model_id)
         } else {
             let row_range = row_start.zip(row_end);
-            reindex(&model_dir, &db_path, &embed_path, shard, row_range, busy_timeout_ms, phase)
+            reindex(&model_dir, &db_path, &embed_path, shard, row_range, busy_timeout_ms, phase, model_id)
         };
         if let Err(e) = result {
             eprintln!("reindex failed: {e:#}");
@@ -1307,12 +1441,12 @@ fn main() {
             eprintln!("  (the travsr daemon passes this automatically)");
             std::process::exit(1);
         });
-        let index_path = index_path_for_db(&db_path);
-        match NomicPlugin::load(&model_dir, index_path, db_path.clone()) {
+        let index_path = index_path_for_db(&db_path, model_id);
+        match NomicPlugin::load(&model_dir, index_path, db_path.clone(), model_id) {
             Ok(plugin) => {
                 tracing::info!(
                     model_dir = %model_dir.display(),
-                    model_id  = MODEL_ID,
+                    model_id  = model_id,
                     db        = %db_path.display(),
                     "embed sidecar ready"
                 );
@@ -1326,19 +1460,18 @@ fn main() {
     }
 }
 
-/// Per-repo HNSW index path, co-located with graph.db.
-/// Node IDs are SQLite rowids scoped to one db, so each repo needs its own index.
-fn index_path_for_db(db_path: &Path) -> PathBuf {
+/// Per-repo HNSW index path, co-located with graph.db, keyed by model_id.
+fn index_path_for_db(db_path: &Path, model_id: &str) -> PathBuf {
     let dir = db_path.parent().unwrap_or(db_path);
-    dir.join(format!("{MODEL_ID}.hnsw.usearch"))
+    dir.join(format!("{model_id}.hnsw.usearch"))
 }
 
-fn model_dir() -> Result<PathBuf> {
+fn model_dir(model_id: &str) -> Result<PathBuf> {
     let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("HOME not set"))?;
-    let dir = home.join(".travsr").join("models").join(MODEL_ID);
+    let dir = home.join(".travsr").join("models").join(model_id);
     anyhow::ensure!(
         dir.exists(),
-        "model directory not found: {}\n  Run: travsr embed init",
+        "model directory not found: {}\n  Run: travsr embed init --backend {model_id}",
         dir.display()
     );
     Ok(dir)

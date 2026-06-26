@@ -34,7 +34,6 @@ use anyhow::{Context as _, Result};
 use tokenizers::{PaddingDirection, PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 use tract_onnx::prelude::*;
 
-pub const DIM: usize = 384;
 const MAX_SEQ: usize = 512;
 const QUERY_PREFIX: &str = "Represent this sentence: ";
 
@@ -42,6 +41,8 @@ pub struct BgeModel {
     // Arc so BgeModel is cheaply Clone — multiple threads can share one model load.
     model: Arc<TypedRunnableModel>,
     tokenizer: Tokenizer,
+    /// Hidden dimension detected from the ONNX output shape on load.
+    pub dim: usize,
 }
 
 impl Clone for BgeModel {
@@ -49,20 +50,21 @@ impl Clone for BgeModel {
         Self {
             model: Arc::clone(&self.model),
             tokenizer: self.tokenizer.clone(),
+            dim: self.dim,
         }
     }
 }
 
 impl BgeModel {
-    pub fn load(model_dir: &Path) -> Result<Self> {
-        Self::load_inner(model_dir)
+    pub fn load(model_dir: &Path, dim: usize) -> Result<Self> {
+        Self::load_inner(model_dir, dim)
     }
 
-    pub fn load_for_shard(model_dir: &Path, _intra_threads: usize) -> Result<Self> {
-        Self::load_inner(model_dir)
+    pub fn load_for_shard(model_dir: &Path, _intra_threads: usize, dim: usize) -> Result<Self> {
+        Self::load_inner(model_dir, dim)
     }
 
-    fn load_inner(model_dir: &Path) -> Result<Self> {
+    fn load_inner(model_dir: &Path, dim: usize) -> Result<Self> {
         let model_path = model_dir.join("model.onnx");
         tracing::info!(
             path = %model_path.display(),
@@ -99,7 +101,7 @@ impl BgeModel {
 
         tracing::info!("tract model ready");
         // into_runnable() already returns Arc<TypedRunnableModel> — do not double-wrap.
-        Ok(Self { model, tokenizer })
+        Ok(Self { model, tokenizer, dim })
     }
 
     /// Embed texts for indexing (no prefix). Returns one 1536-byte BLOB per input.
@@ -165,8 +167,8 @@ impl BgeModel {
             .context("last_hidden_state as f32 slice")?;
         let mut blobs = Vec::with_capacity(batch);
         for b in 0..batch {
-            let cls_start = b * actual_seq * DIM;
-            let cls = &flat[cls_start..cls_start + DIM];
+            let cls_start = b * actual_seq * self.dim;
+            let cls = &flat[cls_start..cls_start + self.dim];
             let normalized = l2_normalize(cls);
             blobs.push(normalized.iter().flat_map(|&f| f.to_le_bytes()).collect());
         }

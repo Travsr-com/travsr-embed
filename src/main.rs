@@ -35,8 +35,8 @@
 mod index;
 mod model;
 
-use std::path::{Path, PathBuf};
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc, Mutex,
@@ -50,9 +50,9 @@ use travsr_plugin_sdk::run_embed_plugin;
 /// Embedding dimension for each supported BGE model variant.
 fn dim_for_model(model_id: &str) -> usize {
     match model_id {
-        "bge-base-en-v1.5"  => 768,
+        "bge-base-en-v1.5" => 768,
         "bge-large-en-v1.5" => 1024,
-        _                   => 384, // bge-small-en-v1.5 and any future 384-dim model
+        _ => 384, // bge-small-en-v1.5 and any future 384-dim model
     }
 }
 
@@ -105,7 +105,12 @@ impl NomicPlugin {
     /// `index_path` — per-repo HNSW file (co-located with graph.db)
     /// `db_path`    — graph.db (for FTS candidate lookup in lazy embed path)
     /// `model_id`   — catalog ID, e.g. "bge-small-en-v1.5"
-    fn load(model_dir: &Path, index_path: PathBuf, db_path: PathBuf, model_id: &str) -> Result<Self> {
+    fn load(
+        model_dir: &Path,
+        index_path: PathBuf,
+        db_path: PathBuf,
+        model_id: &str,
+    ) -> Result<Self> {
         let embed_db_path = embed_db_path_for(&db_path);
         let dim = dim_for_model(model_id);
         let model = model::BgeModel::load(model_dir, dim).context("loading model")?;
@@ -172,7 +177,7 @@ impl EmbedPlugin for NomicPlugin {
 impl NomicPlugin {
     fn knn_impl(&self, req: &KnnRequest) -> Result<(Vec<i64>, Vec<f32>)> {
         let query_blob = self.model.embed_query(&req.query_text)?;
-        let query_vec  = model::blob_to_f32(&query_blob);
+        let query_vec = model::blob_to_f32(&query_blob);
 
         // ── KNN against HNSW (Phase 1 nodes) ─────────────────────────────
         // Hold the mutex only for the index operation; release before the
@@ -210,8 +215,8 @@ impl NomicPlugin {
 
         // ── Merge: KNN first (higher confidence), then lazy, dedup ───────
         let mut seen: HashSet<i64> = HashSet::new();
-        let mut ids:    Vec<i64>  = Vec::with_capacity(req.k as usize);
-        let mut scores: Vec<f32>  = Vec::with_capacity(req.k as usize);
+        let mut ids: Vec<i64> = Vec::with_capacity(req.k as usize);
+        let mut scores: Vec<f32> = Vec::with_capacity(req.k as usize);
 
         for (id, dist) in knn_raw {
             if seen.insert(id) {
@@ -282,11 +287,8 @@ impl NomicPlugin {
         // is not blocked by SQLite I/O. INSERT OR IGNORE is safe under races.
         let edb = self.embed_db_path.clone();
         let mid = self.model_id.clone();
-        let pairs: Vec<(i64, Vec<u8>)> = candidates
-            .iter()
-            .map(|(nid, _)| *nid)
-            .zip(blobs.into_iter())
-            .collect();
+        let pairs: Vec<(i64, Vec<u8>)> =
+            candidates.iter().map(|(nid, _)| *nid).zip(blobs).collect();
         std::thread::Builder::new()
             .name("lazy-embed-persist".into())
             .spawn(move || {
@@ -333,8 +335,7 @@ impl NomicPlugin {
 
         let conn = Connection::open_with_flags(
             &self.db_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .context("lazy embed: open graph.db")?;
 
@@ -399,7 +400,11 @@ impl NomicPlugin {
 
 /// Persist a batch of (node_id, blob) pairs to embed.db after lazy on-the-fly
 /// embedding. Called from a background thread — all errors are non-fatal.
-fn persist_lazy_embeddings(embed_db_path: &Path, pairs: &[(i64, Vec<u8>)], model_id: &str) -> Result<()> {
+fn persist_lazy_embeddings(
+    embed_db_path: &Path,
+    pairs: &[(i64, Vec<u8>)],
+    model_id: &str,
+) -> Result<()> {
     let conn = Connection::open(embed_db_path).context("lazy persist: open embed.db")?;
     conn.execute_batch(
         "PRAGMA journal_mode = WAL;
@@ -499,6 +504,7 @@ fn embed_db_path_for(db_path: &Path) -> PathBuf {
 /// When `shard = Some((i, n))`, only processes nodes where `id % n = i` and
 /// skips all HNSW operations — the CLI orchestrator calls rebuild_index() when
 /// all n shards have finished.
+#[allow(clippy::too_many_arguments)]
 fn reindex(
     model_dir: &Path,
     db_path: &Path,
@@ -685,8 +691,15 @@ fn reindex(
             )
             .unwrap_or(0);
         println!("All nodes already embedded ({existing} rows). Building missing HNSW index...");
-        index::VecIndex::build_from_db(db_path, embed_db_path, model_id, &index_path, existing, dim_for_model(model_id))
-            .context("build_from_db")?;
+        index::VecIndex::build_from_db(
+            db_path,
+            embed_db_path,
+            model_id,
+            &index_path,
+            existing,
+            dim_for_model(model_id),
+        )
+        .context("build_from_db")?;
         write_current_embed_model_meta(&conn, model_id)?;
         println!("Done — index saved to {}.", index_path.display());
         return Ok(());
@@ -708,13 +721,21 @@ fn reindex(
                 )
                 .unwrap_or(0);
             if existing > 0 {
-                index::VecIndex::build_from_db(db_path, embed_db_path, model_id, &index_path, existing, dim_for_model(model_id))
-                    .context("rebuild HNSW from existing embeddings before adding pending")?;
+                index::VecIndex::build_from_db(
+                    db_path,
+                    embed_db_path,
+                    model_id,
+                    &index_path,
+                    existing,
+                    dim_for_model(model_id),
+                )
+                .context("rebuild HNSW from existing embeddings before adding pending")?;
                 index::VecIndex::try_load(&index_path)
                     .context("load freshly-rebuilt HNSW")?
                     .expect("just-rebuilt index must be loadable")
             } else {
-                index::VecIndex::new_empty(&index_path, total, dim_for_model(model_id)).context("create new HNSW index")?
+                index::VecIndex::new_empty(&index_path, total, dim_for_model(model_id))
+                    .context("create new HNSW index")?
             }
         };
         idx.reserve(idx.size() + total)
@@ -912,8 +933,7 @@ fn reindex_parallel(
     let all_pending: Vec<(i64, String)> = {
         let conn = Connection::open_with_flags(
             db_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .context("open graph.db for pending query")?;
         let embed_str = embed_db_path
@@ -984,12 +1004,13 @@ fn reindex_parallel(
     let batch_ranges = build_batch_ranges(&est_lens);
     let n_batches = batch_ranges.len();
 
-    let items      = Arc::new(sorted);
-    let batches    = Arc::new(batch_ranges);
+    let items = Arc::new(sorted);
+    let batches = Arc::new(batch_ranges);
     let next_batch = Arc::new(AtomicUsize::new(0));
 
     let n_workers = parallel.min(n_batches).max(1);
-    let model = model::BgeModel::load(model_dir, dim_for_model(model_id)).context("loading model")?;
+    let model =
+        model::BgeModel::load(model_dir, dim_for_model(model_id)).context("loading model")?;
     tracing::info!(
         total,
         n_batches,
@@ -1007,19 +1028,18 @@ fn reindex_parallel(
 
     let worker_handles: Vec<_> = (0..n_workers)
         .map(|i| {
-            let model_w   = model.clone();
-            let edb_w     = Arc::clone(&edb_arc);
-            let mid_w     = Arc::clone(&mid_arc);
-            let items_w   = Arc::clone(&items);
+            let model_w = model.clone();
+            let edb_w = Arc::clone(&edb_arc);
+            let mid_w = Arc::clone(&mid_arc);
+            let items_w = Arc::clone(&items);
             let batches_w = Arc::clone(&batches);
-            let next_w    = Arc::clone(&next_batch);
+            let next_w = Arc::clone(&next_batch);
 
             std::thread::Builder::new()
                 .name(format!("embed-{i}"))
                 .spawn(move || -> Result<usize> {
                     // ── write: own connection, synchronous=OFF for bulk speed ──
-                    let wconn = Connection::open(&*edb_w)
-                        .context("worker: open embed.db")?;
+                    let wconn = Connection::open(&*edb_w).context("worker: open embed.db")?;
                     wconn
                         .execute_batch(&format!(
                             "PRAGMA journal_mode = WAL;
@@ -1082,7 +1102,9 @@ fn reindex_parallel(
                             ins.execute(rusqlite::params![nid, mid_w.as_str(), blob])
                                 .context("worker: insert final")?;
                         }
-                        wconn.execute("COMMIT", []).context("worker: commit final")?;
+                        wconn
+                            .execute("COMMIT", [])
+                            .context("worker: commit final")?;
                         inserted += tx_buf.len();
                     }
 
@@ -1098,9 +1120,12 @@ fn reindex_parallel(
         .into_iter()
         .enumerate()
         .filter_map(|(i, h)| match h.join() {
-            Ok(Ok(n))  => { total_embedded += n; None }
+            Ok(Ok(n)) => {
+                total_embedded += n;
+                None
+            }
             Ok(Err(e)) => Some(format!("worker {i}: {e:#}")),
-            Err(_)     => Some(format!("worker {i}: panicked")),
+            Err(_) => Some(format!("worker {i}: panicked")),
         })
         .collect();
     if !worker_errors.is_empty() {
@@ -1139,7 +1164,7 @@ fn build_batch_ranges(est_lens: &[usize]) -> Vec<std::ops::Range<usize>> {
         let projected = new_max * (i - start + 1);
         if i > start && (projected > TOKEN_BUDGET || (i - start) >= MAX_BATCH) {
             ranges.push(start..i);
-            start   = i;
+            start = i;
             max_est = est;
         } else {
             max_est = new_max;
@@ -1185,8 +1210,15 @@ fn rebuild_index(db_path: &Path, embed_db_path: &Path, model_id: &str) -> Result
     );
     let index_path = index_path_for_db(db_path, model_id);
     println!("Building HNSW index from {existing} embeddings...");
-    index::VecIndex::build_from_db(db_path, embed_db_path, model_id, &index_path, existing, dim_for_model(model_id))
-        .context("build_from_db")?;
+    index::VecIndex::build_from_db(
+        db_path,
+        embed_db_path,
+        model_id,
+        &index_path,
+        existing,
+        dim_for_model(model_id),
+    )
+    .context("build_from_db")?;
     write_current_embed_model_meta(&conn, model_id)?;
     println!("Done — index saved to {}.", index_path.display());
     tracing::info!(existing, "HNSW index rebuilt");
@@ -1423,10 +1455,27 @@ fn main() {
         let embed_path = embed_db.unwrap_or_else(|| embed_db_path_for(&db_path));
         let result = if let Some(n) = parallel {
             // RFC-021: single model loaded once; N reader threads inside the sidecar.
-            reindex_parallel(&model_dir, &db_path, &embed_path, n, busy_timeout_ms, phase, model_id)
+            reindex_parallel(
+                &model_dir,
+                &db_path,
+                &embed_path,
+                n,
+                busy_timeout_ms,
+                phase,
+                model_id,
+            )
         } else {
             let row_range = row_start.zip(row_end);
-            reindex(&model_dir, &db_path, &embed_path, shard, row_range, busy_timeout_ms, phase, model_id)
+            reindex(
+                &model_dir,
+                &db_path,
+                &embed_path,
+                shard,
+                row_range,
+                busy_timeout_ms,
+                phase,
+                model_id,
+            )
         };
         if let Err(e) = result {
             eprintln!("reindex failed: {e:#}");

@@ -1,13 +1,13 @@
 [package]
-name = "travsr-embed-nomic"
+name = "travsr-embed"
 version = "0.1.0"
 edition = "2021"
-description = "Travsr embed sidecar — BAAI/bge-small-en-v1.5, tract ONNX fp32, CLS-384"
+description = "Travsr embed sidecar — BGE family ONNX fp32, runtime model selection via --model-id"
 license = "MIT"
 rust-version = "1.80"
 
 [[bin]]
-name = "travsr-embed-nomic"
+name = "travsr-embed"
 path = "src/main.rs"
 
 [[bin]]

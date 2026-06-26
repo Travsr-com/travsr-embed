@@ -1951,7 +1951,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "travsr-embed-nomic"
+name = "travsr-embed"
 version = "0.1.0"
 dependencies = [
  "anyhow",

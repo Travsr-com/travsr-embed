@@ -101,7 +101,11 @@ impl BgeModel {
 
         tracing::info!("tract model ready");
         // into_runnable() already returns Arc<TypedRunnableModel> — do not double-wrap.
-        Ok(Self { model, tokenizer, dim })
+        Ok(Self {
+            model,
+            tokenizer,
+            dim,
+        })
     }
 
     /// Embed texts for indexing (no prefix). Returns one 1536-byte BLOB per input.
@@ -113,7 +117,9 @@ impl BgeModel {
     pub fn embed_query(&self, text: &str) -> Result<Vec<u8>> {
         let prefixed = format!("{QUERY_PREFIX}{text}");
         let mut blobs = self.embed_raw(&[prefixed.as_str()])?;
-        blobs.pop().ok_or_else(|| anyhow::anyhow!("empty embed result"))
+        blobs
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("empty embed result"))
     }
 
     fn embed_raw(&self, texts: &[&str]) -> Result<Vec<Vec<u8>>> {
@@ -133,26 +139,26 @@ impl BgeModel {
             .max()
             .unwrap_or(1);
 
-        let mut input_ids  = vec![0i64; batch * seq];
-        let mut attn_mask  = vec![0i64; batch * seq];
-        let token_type     = vec![0i64; batch * seq]; // all zeros for single-sequence BERT
+        let mut input_ids = vec![0i64; batch * seq];
+        let mut attn_mask = vec![0i64; batch * seq];
+        let token_type = vec![0i64; batch * seq]; // all zeros for single-sequence BERT
 
         for (i, enc) in encodings.iter().enumerate() {
-            let ids  = enc.get_ids();
+            let ids = enc.get_ids();
             let mask = enc.get_attention_mask();
             for j in 0..seq {
-                input_ids[i * seq + j] = ids .get(j).copied().unwrap_or(0) as i64;
+                input_ids[i * seq + j] = ids.get(j).copied().unwrap_or(0) as i64;
                 attn_mask[i * seq + j] = mask.get(j).copied().unwrap_or(0) as i64;
             }
         }
 
-        let t_ids  = tract_ndarray::Array2::from_shape_vec((batch, seq), input_ids )?;
-        let t_mask = tract_ndarray::Array2::from_shape_vec((batch, seq), attn_mask )?;
+        let t_ids = tract_ndarray::Array2::from_shape_vec((batch, seq), input_ids)?;
+        let t_mask = tract_ndarray::Array2::from_shape_vec((batch, seq), attn_mask)?;
         let t_type = tract_ndarray::Array2::from_shape_vec((batch, seq), token_type)?;
 
         // Forward pass → output[0] = last_hidden_state [batch, seq, DIM]
         let output = self.model.run(tvec![
-            Tensor::from(t_ids ).into(),
+            Tensor::from(t_ids).into(),
             Tensor::from(t_mask).into(),
             Tensor::from(t_type).into(),
         ])?;
@@ -162,7 +168,8 @@ impl BgeModel {
         // TValue: Deref<Target=Tensor>; Tensor::view() is a safe fn (unsafe inside impl only).
         // TensorView::as_slice::<f32>() is fully safe.
         let actual_seq = output[0].shape()[1];
-        let flat: &[f32] = output[0].view()
+        let flat: &[f32] = output[0]
+            .view()
             .as_slice::<f32>()
             .context("last_hidden_state as f32 slice")?;
         let mut blobs = Vec::with_capacity(batch);

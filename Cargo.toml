@@ -3,7 +3,7 @@ name = "travsr-embed"
 version = "0.1.0"
 edition = "2021"
 description = "Travsr embed sidecar — BGE family ONNX fp32, runtime model selection via --model-id"
-license = "MIT"
+license = "Apache-2.0"
 rust-version = "1.80"
 
 [[bin]]

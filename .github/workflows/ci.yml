@@ -59,7 +59,7 @@ jobs:
         run: cargo test --all-targets
 
   msrv:
-    name: MSRV (1.80)
+    name: MSRV (1.91)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -70,6 +70,6 @@ jobs:
           ref: master
       - name: Symlink travsr sibling for Cargo patch paths
         run: ln -s "$GITHUB_WORKSPACE/_travsr" "$GITHUB_WORKSPACE/../travsr"
-      - uses: dtolnay/rust-toolchain@1.80
+      - uses: dtolnay/rust-toolchain@1.91
       - name: build (MSRV)
         run: cargo build --all-targets

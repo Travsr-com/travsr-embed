@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Travsr embed sidecar — BGE family ONNX fp32, runtime model selection via --model-id"
 license = "Apache-2.0"
-rust-version = "1.80"
+rust-version = "1.91"
 
 [[bin]]
 name = "travsr-embed"

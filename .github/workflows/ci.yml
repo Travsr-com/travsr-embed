@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  ci:
+    name: CI (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # travsr sibling repo required for [patch.crates-io] path deps.
+      # actions/checkout@v4 requires path to be inside $GITHUB_WORKSPACE, so
+      # we check out into _travsr (inside workspace) then symlink ../travsr so
+      # Cargo's `path = "../travsr/crates/..."` patches resolve correctly.
+      - uses: actions/checkout@v4
+        with:
+          repository: Travsr-com/travsr
+          path: _travsr
+          ref: master
+
+      - name: Symlink travsr sibling for Cargo patch paths
+        run: ln -s "$GITHUB_WORKSPACE/_travsr" "$GITHUB_WORKSPACE/../travsr"
+
+      - name: Install Rust (stable + MSRV)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: fmt
+        run: cargo fmt --all -- --check
+
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test --all-targets
+
+  msrv:
+    name: MSRV (1.91)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: Travsr-com/travsr
+          path: _travsr
+          ref: master
+      - name: Symlink travsr sibling for Cargo patch paths
+        run: ln -s "$GITHUB_WORKSPACE/_travsr" "$GITHUB_WORKSPACE/../travsr"
+      - uses: dtolnay/rust-toolchain@1.91
+      - name: build (MSRV)
+        run: cargo build --all-targets

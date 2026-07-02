@@ -91,28 +91,24 @@ impl VecIndex {
         conn.execute_batch(&format!("ATTACH DATABASE '{embed_db_str}' AS edb"))
             .context("attach embed.db")?;
 
-        // Seed eligibility: a node must have at least one real incoming call edge
-        // (ref/call or ffi/call) to be indexed in HNSW for KNN seed selection.
+        // Index eligibility: exclude only structural/noise kinds. Every remaining
+        // embedded node is indexed so KNN can surface it as a seed.
         //
-        // Nodes with zero call-callers have zero blast radius — nothing in the
-        // graph depends on them. This includes:
-        //   • Test functions (called by the test runner, no graph edge)
-        //   • Entry points (main, daemon run loops, HTTP handlers — called by the OS/framework)
-        //   • Dead code
+        // NOTE (regression fix): an earlier version additionally required an
+        // incoming ref/call edge ("zero blast radius → skip"). On a real repo that
+        // silently dropped ~76% of embedded nodes from the HNSW — any function with
+        // no *recorded* caller: entry points, trait/impl methods, dead code, and
+        // crucially any newly-edited symbol whose Phase B call edges haven't been
+        // re-resolved yet (e.g. right after an edit + reindex). Excluded nodes can
+        // never be returned by KNN, so get_context seeded on unrelated nodes and
+        // returned garbage even for exact-name queries.
         //
-        // Entry points are still reachable in PPR results via reverse traversal
-        // from their callees which ARE seeds. Only their ability to be initial
-        // seeds is removed, which is the correct behaviour.
-        //
-        // Nodes where Phase B has not yet run (no ref/call edges in the graph at
-        // all) fall through to the unwrap_or(expected_count) fallback so a
-        // pre-Phase-B manual reindex still builds a usable index.
+        // Recall must not be filtered at index-build time. The blast-radius /
+        // PPR-expandability preference belongs in seed *ranking* downstream, not in
+        // what the index contains. Dropping the clause also makes a full rebuild
+        // consistent with the incremental add() path, which never filtered.
         const SEED_FILTER: &str =
-            "n.kind NOT IN ('file', 'file-module', 'import', 'module', 'field', 'variable') \
-             AND EXISTS ( \
-                 SELECT 1 FROM edges ce \
-                 WHERE ce.dst = n.id AND ce.kind IN ('ref/call', 'ffi/call') \
-             )";
+            "n.kind NOT IN ('file', 'file-module', 'import', 'module', 'field', 'variable')";
 
         let n: usize = conn
             .query_row(

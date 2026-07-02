@@ -206,12 +206,31 @@ impl NomicPlugin {
         // Find nodes that matched the FTS index but haven't been embedded yet,
         // embed them on-the-fly (~20-50ms for 10-20 nodes), add to the
         // in-memory HNSW, and persist to embed.db asynchronously.
-        let lazy_scored = self
-            .lazy_embed_candidates(&req.query_text, &query_vec)
-            .unwrap_or_else(|e| {
-                tracing::debug!("lazy embed skipped (non-fatal): {e:#}");
-                vec![]
-            });
+        //
+        // PERF (measured on kubernetes, 261k nodes, 131k embeddings @ 100%):
+        // the FTS candidate query (`fts_candidates_unembedded`) costs ~15 s on a
+        // large, fully-embedded repo and returns *nothing* — every node already
+        // has an embedding, so the only result of running it is latency. That
+        // synchronous cost on the hot KNN path was the root cause of:
+        //   • daemon queries taking ~15 s (the 600 ms host hook timeout returns
+        //     empty while this query still runs, holding the sidecar lock → the
+        //     "wedge"),
+        //   • embed_used == false (the host circuit-breaker discards any KNN that
+        //     overruns its budget),
+        //   • slow cold-path `travsr ask`.
+        //
+        // Gate: lazy embed only adds value when HNSW under-delivers (a sparse or
+        // partially-built index). When HNSW already returned the full `k` set we
+        // skip it entirely — the seeds are already the strongest available.
+        let lazy_scored = if knn_raw.len() >= req.k as usize {
+            vec![]
+        } else {
+            self.lazy_embed_candidates(&req.query_text, &query_vec)
+                .unwrap_or_else(|e| {
+                    tracing::debug!("lazy embed skipped (non-fatal): {e:#}");
+                    vec![]
+                })
+        };
 
         // ── Merge: KNN first (higher confidence), then lazy, dedup ───────
         let mut seen: HashSet<i64> = HashSet::new();

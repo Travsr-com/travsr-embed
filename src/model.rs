@@ -1,31 +1,17 @@
-// tract ONNX backend for BAAI/bge-small-en-v1.5.
+// tract ONNX encoder backend — fully descriptor-driven (no hardcoded model params).
 //
-// BGE-small is a 33M-parameter BERT (hidden=384, 12 layers, standard absolute
-// positional embeddings — no RoPE) that delivers near-identical retrieval
-// quality to nomic-embed-text-v1.5 (MTEB 62.2 vs 62.4) at 4× smaller size.
-//
-// Why tract instead of candle:
-//   candle calls scalar libm::erff() per element for BGE's GeLU-ERF activation
-//   (no SIMD path). tract has vectorized ONNX kernels for both GeLU and matmul.
-//   Benchmark on M-series (64-text batches, seq≤128):
-//     candle fp32 BGE  :  ~21 nodes/sec  (scalar GeLU)
-//     candle fp32 nomic:  ~62 nodes/sec  (SwiGLU, NEON matmul)
-//     tract  fp32 BGE  : ~140 nodes/sec  single-thread
-//     tract  fp32 BGE  : ~307 nodes/sec  4 threads (2.2× scaling)
-//
-// Platform: tract is pure Rust, works identically on macOS and OCI ARM64.
-// No Accelerate feature, no Metal, no platform-specific build flags needed.
+// Every model-specific value (embedding dim, pooling mode, query prefix, number of
+// ONNX input tensors) is read from `<model_dir>/model.toml`, which the travsr CLI
+// writes from the catalog at `travsr embed init`. This file contains NO per-model
+// constants: the same code path runs BGE (standard BERT, 3 inputs, CLS, its own
+// prefix) and arctic-embed-m (BERT, 2 inputs, CLS, a different prefix) purely by
+// swapping the descriptor.
 //
 // Pipeline per batch:
-//   tokenize (WordPiece, max 512 tokens, right-pad to batch-longest)
-//   → tract ONNX run → last_hidden_state [batch, seq, 384]
-//   → CLS pooling (position 0)  → [batch, 384]
-//   → l2_normalize              → [batch, 384]
-//   → pack as 384×f32 LE bytes (1536 B per node)
-//
-// Task prefixes (BGE convention):
-//   indexing : no prefix (plain symbol text)
-//   querying : "Represent this sentence: {text}"
+//   tokenize (WordPiece/BPE, max 512, right-pad to batch-longest)
+//   → tract ONNX run (2 or 3 inputs per descriptor.n_inputs)
+//   → pooling (CLS = position 0, or masked MEAN) → [batch, dim]
+//   → l2_normalize → pack as dim×f32 LE bytes
 
 use std::path::Path;
 use std::sync::Arc;
@@ -35,39 +21,123 @@ use tokenizers::{PaddingDirection, PaddingParams, PaddingStrategy, Tokenizer, Tr
 use tract_onnx::prelude::*;
 
 const MAX_SEQ: usize = 512;
-const QUERY_PREFIX: &str = "Represent this sentence: ";
 
-pub struct BgeModel {
-    // Arc so BgeModel is cheaply Clone — multiple threads can share one model load.
+/// How the per-token hidden states are reduced to one vector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Pooling {
+    /// Representation of the first token (position 0).
+    Cls,
+    /// Attention-mask-weighted average over tokens.
+    Mean,
+}
+
+/// Per-model runtime descriptor, deserialized from `<model_dir>/model.toml`.
+///
+/// This is the single source of truth for model-specific behaviour — the sidecar
+/// holds no hardcoded model table. The CLI writes it from the catalog entry.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ModelDescriptor {
+    /// Output embedding dimension (e.g. 384, 768, 1024).
+    pub dim: usize,
+    /// Pooling mode.
+    pub pooling: Pooling,
+    /// Text prepended to queries only (documents get no prefix). May be empty.
+    #[serde(default)]
+    pub query_prefix: String,
+    /// Number of ONNX input tensors: 2 = `input_ids, attention_mask`;
+    /// 3 = classic BERT with `token_type_ids`.
+    pub n_inputs: usize,
+    /// Matryoshka truncation: if > 0, the native `dim`-length vector is sliced to its
+    /// first `truncate_dim` values and re-normalized, and that shorter vector is what
+    /// gets stored. 0 (default) = no truncation, store the full native vector.
+    #[serde(default)]
+    pub truncate_dim: usize,
+}
+
+impl ModelDescriptor {
+    /// The stored embedding dimension: `truncate_dim` when truncating, else native `dim`.
+    /// This is what the HNSW index, blob size, and reported `embedding_dim` all use.
+    pub fn output_dim(&self) -> usize {
+        if self.truncate_dim > 0 {
+            self.truncate_dim
+        } else {
+            self.dim
+        }
+    }
+
+    /// Read `<model_dir>/model.toml`. Errors (no hardcoded fallback) so a missing
+    /// descriptor is a loud, actionable failure rather than silent wrong output.
+    pub fn load(model_dir: &Path) -> Result<Self> {
+        let path = model_dir.join("model.toml");
+        let text = std::fs::read_to_string(&path).with_context(|| {
+            format!(
+                "model descriptor not found: {}\n  Run `travsr embed init` to (re)write it.",
+                path.display()
+            )
+        })?;
+        let desc: ModelDescriptor =
+            toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        anyhow::ensure!(desc.dim > 0, "model.toml: dim must be > 0");
+        anyhow::ensure!(
+            desc.n_inputs == 2 || desc.n_inputs == 3,
+            "model.toml: n_inputs must be 2 or 3 (got {})",
+            desc.n_inputs
+        );
+        anyhow::ensure!(
+            desc.truncate_dim <= desc.dim,
+            "model.toml: truncate_dim ({}) must be <= dim ({})",
+            desc.truncate_dim,
+            desc.dim
+        );
+        Ok(desc)
+    }
+}
+
+pub struct EncoderModel {
+    // Arc so EncoderModel is cheaply Clone — multiple threads share one model load.
     model: Arc<TypedRunnableModel>,
     tokenizer: Tokenizer,
-    /// Hidden dimension detected from the ONNX output shape on load.
+    desc: ModelDescriptor,
+    /// Native hidden dim of the ONNX output (used to slice last_hidden_state rows).
+    native_dim: usize,
+    /// Stored/output dimension = `desc.output_dim()` (native, or truncated). This is
+    /// what callers, the HNSW index, and blob sizes use.
     pub dim: usize,
 }
 
-impl Clone for BgeModel {
+impl Clone for EncoderModel {
     fn clone(&self) -> Self {
         Self {
             model: Arc::clone(&self.model),
             tokenizer: self.tokenizer.clone(),
+            desc: self.desc.clone(),
+            native_dim: self.native_dim,
             dim: self.dim,
         }
     }
 }
 
-impl BgeModel {
-    pub fn load(model_dir: &Path, dim: usize) -> Result<Self> {
-        Self::load_inner(model_dir, dim)
+impl EncoderModel {
+    pub fn load(model_dir: &Path, desc: ModelDescriptor) -> Result<Self> {
+        Self::load_inner(model_dir, desc)
     }
 
-    pub fn load_for_shard(model_dir: &Path, _intra_threads: usize, dim: usize) -> Result<Self> {
-        Self::load_inner(model_dir, dim)
+    pub fn load_for_shard(
+        model_dir: &Path,
+        _intra_threads: usize,
+        desc: ModelDescriptor,
+    ) -> Result<Self> {
+        Self::load_inner(model_dir, desc)
     }
 
-    fn load_inner(model_dir: &Path, dim: usize) -> Result<Self> {
+    fn load_inner(model_dir: &Path, desc: ModelDescriptor) -> Result<Self> {
         let model_path = model_dir.join("model.onnx");
         tracing::info!(
             path = %model_path.display(),
+            dim = desc.dim,
+            pooling = ?desc.pooling,
+            n_inputs = desc.n_inputs,
             size_mb = std::fs::metadata(&model_path)
                 .map(|m| m.len() / 1_048_576)
                 .unwrap_or(0),
@@ -100,22 +170,26 @@ impl BgeModel {
             .map_err(|e| anyhow::anyhow!("truncation config: {e}"))?;
 
         tracing::info!("tract model ready");
+        let native_dim = desc.dim;
+        let dim = desc.output_dim();
         // into_runnable() already returns Arc<TypedRunnableModel> — do not double-wrap.
         Ok(Self {
             model,
             tokenizer,
+            desc,
+            native_dim,
             dim,
         })
     }
 
-    /// Embed texts for indexing (no prefix). Returns one 1536-byte BLOB per input.
+    /// Embed texts for indexing (no prefix). Returns one `dim`×4-byte BLOB per input.
     pub fn embed_documents(&self, texts: &[&str]) -> Result<Vec<Vec<u8>>> {
         self.embed_raw(texts)
     }
 
-    /// Embed a single query text (with BGE query prefix). Returns 1536-byte BLOB.
+    /// Embed a single query (with the descriptor's query prefix). Returns one BLOB.
     pub fn embed_query(&self, text: &str) -> Result<Vec<u8>> {
-        let prefixed = format!("{QUERY_PREFIX}{text}");
+        let prefixed = format!("{}{}", self.desc.query_prefix, text);
         let mut blobs = self.embed_raw(&[prefixed.as_str()])?;
         blobs
             .pop()
@@ -141,7 +215,6 @@ impl BgeModel {
 
         let mut input_ids = vec![0i64; batch * seq];
         let mut attn_mask = vec![0i64; batch * seq];
-        let token_type = vec![0i64; batch * seq]; // all zeros for single-sequence BERT
 
         for (i, enc) in encodings.iter().enumerate() {
             let ids = enc.get_ids();
@@ -153,30 +226,65 @@ impl BgeModel {
         }
 
         let t_ids = tract_ndarray::Array2::from_shape_vec((batch, seq), input_ids)?;
-        let t_mask = tract_ndarray::Array2::from_shape_vec((batch, seq), attn_mask)?;
-        let t_type = tract_ndarray::Array2::from_shape_vec((batch, seq), token_type)?;
+        let t_mask = tract_ndarray::Array2::from_shape_vec((batch, seq), attn_mask.clone())?;
 
-        // Forward pass → output[0] = last_hidden_state [batch, seq, DIM]
-        let output = self.model.run(tvec![
-            Tensor::from(t_ids).into(),
-            Tensor::from(t_mask).into(),
-            Tensor::from(t_type).into(),
-        ])?;
+        // Build the input tuple per descriptor.n_inputs. Classic BERT (bge) takes a
+        // 3rd all-zero token_type_ids; 2-input exports (arctic-embed-m) must NOT be
+        // handed a 3rd tensor or tract rejects the run.
+        let mut inputs: TVec<TValue> =
+            tvec![Tensor::from(t_ids).into(), Tensor::from(t_mask).into()];
+        if self.desc.n_inputs == 3 {
+            let token_type =
+                tract_ndarray::Array2::from_shape_vec((batch, seq), vec![0i64; batch * seq])?;
+            inputs.push(Tensor::from(token_type).into());
+        }
 
-        // last_hidden_state is a flat [batch * seq * DIM] f32 buffer in row-major order.
-        // CLS token is at position 0 in the sequence dimension for each batch item.
-        // TValue: Deref<Target=Tensor>; Tensor::view() is a safe fn (unsafe inside impl only).
-        // TensorView::as_slice::<f32>() is fully safe.
+        // Forward pass → output[0] = last_hidden_state [batch, seq, dim]
+        let output = self.model.run(inputs)?;
+
         let actual_seq = output[0].shape()[1];
-        let flat: &[f32] = output[0]
-            .view()
+        let view = output[0].view();
+        let flat: &[f32] = view
             .as_slice::<f32>()
             .context("last_hidden_state as f32 slice")?;
+
+        // Slice the ONNX output at the NATIVE hidden dim; truncate to the output dim
+        // (Matryoshka) only after pooling, then re-normalize.
+        let native = self.native_dim;
         let mut blobs = Vec::with_capacity(batch);
         for b in 0..batch {
-            let cls_start = b * actual_seq * self.dim;
-            let cls = &flat[cls_start..cls_start + self.dim];
-            let normalized = l2_normalize(cls);
+            let pooled = match self.desc.pooling {
+                Pooling::Cls => {
+                    // CLS token at position 0.
+                    let start = b * actual_seq * native;
+                    flat[start..start + native].to_vec()
+                }
+                Pooling::Mean => {
+                    // Attention-mask-weighted mean over tokens.
+                    let mut acc = vec![0f32; native];
+                    let mut count = 0f32;
+                    for t in 0..actual_seq {
+                        let m = attn_mask[b * seq + t];
+                        if m == 0 {
+                            continue;
+                        }
+                        let start = (b * actual_seq + t) * native;
+                        let row = &flat[start..start + native];
+                        for (a, &v) in acc.iter_mut().zip(row) {
+                            *a += v;
+                        }
+                        count += 1.0;
+                    }
+                    if count > 0.0 {
+                        for a in acc.iter_mut() {
+                            *a /= count;
+                        }
+                    }
+                    acc
+                }
+            };
+            // Matryoshka: keep the first `self.dim` values (<= native), then l2-normalize.
+            let normalized = l2_normalize(&pooled[..self.dim]);
             blobs.push(normalized.iter().flat_map(|&f| f.to_le_bytes()).collect());
         }
 
@@ -184,7 +292,7 @@ impl BgeModel {
     }
 }
 
-/// Unpack a 1536-byte BLOB into 384 f32 values (little-endian).
+/// Unpack a `dim`×4-byte BLOB into f32 values (little-endian).
 pub fn blob_to_f32(blob: &[u8]) -> Vec<f32> {
     blob.chunks_exact(4)
         .map(|b| f32::from_le_bytes(b.try_into().unwrap()))

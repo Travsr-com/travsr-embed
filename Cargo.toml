@@ -40,6 +40,11 @@ anyhow             = "1"
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# Per-model descriptor (model.toml) parsing — dim/pooling/prefix/inputs are
+# config, never hardcoded. Written by the CLI from the catalog, read here.
+serde = { version = "1", features = ["derive"] }
+toml  = "0.8"
+
 # ── Local development override ────────────────────────────────────────────────
 [patch.crates-io]
 travsr-plugin-protocol = { path = "../travsr/crates/travsr-plugin-protocol" }

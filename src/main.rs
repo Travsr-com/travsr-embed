@@ -47,19 +47,10 @@ use rusqlite::Connection;
 use travsr_plugin_protocol::{EmbedPlugin, EmbedRequest, EmbedResponse, KnnRequest, KnnResponse};
 use travsr_plugin_sdk::run_embed_plugin;
 
-/// Embedding dimension for each supported BGE model variant.
-fn dim_for_model(model_id: &str) -> usize {
-    match model_id {
-        "bge-base-en-v1.5" => 768,
-        "bge-large-en-v1.5" => 1024,
-        _ => 384, // bge-small-en-v1.5 and any future 384-dim model
-    }
-}
-
 /// Human-readable backend label shown in `travsr embed status` and sidecar logs.
-fn backend_label(model_id: &str) -> String {
-    let dim = dim_for_model(model_id);
-    format!("{model_id} fp32 CLS-{dim}")
+/// `dim` comes from the model descriptor — never hardcoded per model id.
+fn backend_label(model_id: &str, dim: usize) -> String {
+    format!("{model_id} fp32 dim-{dim}")
 }
 // MAX_BATCH: hard cap on items per forward pass.
 // TOKEN_BUDGET: soft cap on padded tensor cost (BatchLongest pads all items to
@@ -69,8 +60,11 @@ fn backend_label(model_id: &str) -> String {
 // MAX_BATCH=512, so the budget is the effective limit in practice.
 const MAX_BATCH: usize = 512;
 const TOKEN_BUDGET: usize = 4_096;
-// Commit to embed.db every TX_BATCH rows.
-const TX_BATCH: usize = 5_000;
+// Commit to embed.db every TX_BATCH rows. Kept small so embed.db reflects
+// progress in near-real-time (the CLI progress bar and `embed status` poll it).
+// Cheap: embed.db uses synchronous=OFF, so a commit is a WAL append, not an
+// fsync — the single fsync happens once at the end via wal_checkpoint(TRUNCATE).
+const TX_BATCH: usize = 500;
 
 /// Which nodes to embed in a reindex run.
 #[derive(Clone, Copy)]
@@ -88,7 +82,7 @@ enum Phase {
 // ── Plugin struct ─────────────────────────────────────────────────────────────
 
 struct NomicPlugin {
-    model: model::BgeModel,
+    model: model::EncoderModel,
     model_id: String,
     backend: String,
     /// HNSW index — None until first KNN call if not present at startup.
@@ -112,8 +106,9 @@ impl NomicPlugin {
         model_id: &str,
     ) -> Result<Self> {
         let embed_db_path = embed_db_path_for(&db_path);
-        let dim = dim_for_model(model_id);
-        let model = model::BgeModel::load(model_dir, dim).context("loading model")?;
+        let desc = model::ModelDescriptor::load(model_dir).context("loading model descriptor")?;
+        let dim = desc.output_dim();
+        let model = model::EncoderModel::load(model_dir, desc).context("loading model")?;
         let index = index::VecIndex::try_load(&index_path).unwrap_or_else(|e| {
             tracing::warn!(
                 "could not load HNSW index: {e:#} — KNN disabled until `travsr embed reindex` runs"
@@ -123,7 +118,7 @@ impl NomicPlugin {
         Ok(Self {
             model,
             model_id: model_id.to_owned(),
-            backend: backend_label(model_id),
+            backend: backend_label(model_id, dim),
             index: Mutex::new(index),
             index_path,
             db_path,
@@ -559,11 +554,13 @@ fn reindex(
         "starting reindex"
     );
 
-    let dim = dim_for_model(model_id);
+    let desc = model::ModelDescriptor::load(model_dir).context("loading model descriptor")?;
+    let dim = desc.output_dim();
     let model = if worker_mode {
-        model::BgeModel::load_for_shard(model_dir, 1, dim).context("loading model (worker)")?
+        model::EncoderModel::load_for_shard(model_dir, 1, desc.clone())
+            .context("loading model (worker)")?
     } else {
-        model::BgeModel::load(model_dir, dim).context("loading model")?
+        model::EncoderModel::load(model_dir, desc.clone()).context("loading model")?
     };
 
     // graph.db: node source + tombstone log. synchronous=NORMAL is fine — we
@@ -716,7 +713,7 @@ fn reindex(
             model_id,
             &index_path,
             existing,
-            dim_for_model(model_id),
+            dim,
         )
         .context("build_from_db")?;
         write_current_embed_model_meta(&conn, model_id)?;
@@ -746,14 +743,14 @@ fn reindex(
                     model_id,
                     &index_path,
                     existing,
-                    dim_for_model(model_id),
+                    dim,
                 )
                 .context("rebuild HNSW from existing embeddings before adding pending")?;
                 index::VecIndex::try_load(&index_path)
                     .context("load freshly-rebuilt HNSW")?
                     .expect("just-rebuilt index must be loadable")
             } else {
-                index::VecIndex::new_empty(&index_path, total, dim_for_model(model_id))
+                index::VecIndex::new_empty(&index_path, total, dim)
                     .context("create new HNSW index")?
             }
         };
@@ -1028,8 +1025,8 @@ fn reindex_parallel(
     let next_batch = Arc::new(AtomicUsize::new(0));
 
     let n_workers = parallel.min(n_batches).max(1);
-    let model =
-        model::BgeModel::load(model_dir, dim_for_model(model_id)).context("loading model")?;
+    let desc = model::ModelDescriptor::load(model_dir).context("loading model descriptor")?;
+    let model = model::EncoderModel::load(model_dir, desc).context("loading model")?;
     tracing::info!(
         total,
         n_batches,
@@ -1040,7 +1037,7 @@ fn reindex_parallel(
 
     // ── Steps 4-6: N consumer threads ────────────────────────────────────────
     // Workers share Arc<Vec<items>>, Arc<Vec<ranges>>, Arc<AtomicUsize>.
-    // BgeModel::clone() is cheap (Arc<TypedRunnableModel> + Tokenizer clone).
+    // EncoderModel::clone() is cheap (Arc<TypedRunnableModel> + Tokenizer clone).
     // Each worker opens its own write connection to embed.db; WAL serialises COMMITs.
     let edb_arc = Arc::new(embed_db_path.to_path_buf());
     let mid_arc = Arc::new(model_id.to_owned());
@@ -1206,6 +1203,9 @@ fn rebuild_index(db_path: &Path, embed_db_path: &Path, model_id: &str) -> Result
         embed_db = %embed_db_path.display(),
         "rebuilding HNSW index"
     );
+    // Dim comes from the model descriptor (resolved from the model dir) — never
+    // hardcoded. rebuild_index has no model_dir arg, so resolve it from model_id.
+    let dim = model::ModelDescriptor::load(&model_dir(model_id)?)?.output_dim();
     let conn = Connection::open(db_path).context("open graph.db")?;
     let embed_db_str = embed_db_path
         .to_str()
@@ -1229,15 +1229,8 @@ fn rebuild_index(db_path: &Path, embed_db_path: &Path, model_id: &str) -> Result
     );
     let index_path = index_path_for_db(db_path, model_id);
     println!("Building HNSW index from {existing} embeddings...");
-    index::VecIndex::build_from_db(
-        db_path,
-        embed_db_path,
-        model_id,
-        &index_path,
-        existing,
-        dim_for_model(model_id),
-    )
-    .context("build_from_db")?;
+    index::VecIndex::build_from_db(db_path, embed_db_path, model_id, &index_path, existing, dim)
+        .context("build_from_db")?;
     write_current_embed_model_meta(&conn, model_id)?;
     println!("Done — index saved to {}.", index_path.display());
     tracing::info!(existing, "HNSW index rebuilt");

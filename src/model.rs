@@ -243,6 +243,14 @@ impl EncoderModel {
         let output = self.model.run(inputs)?;
 
         let actual_seq = output[0].shape()[1];
+        // The tokenized inputs and `attn_mask` are laid out at width `seq`; the pooling
+        // loops index hidden-state rows at width `actual_seq`. A standard encoder always
+        // preserves the sequence length, so these are equal — assert it so a model that
+        // ever reshapes the sequence fails loudly instead of silently misaligning the mask.
+        anyhow::ensure!(
+            actual_seq == seq,
+            "model returned sequence length {actual_seq}, expected input length {seq}"
+        );
         let view = output[0].view();
         let flat: &[f32] = view
             .as_slice::<f32>()
@@ -251,6 +259,14 @@ impl EncoderModel {
         // Slice the ONNX output at the NATIVE hidden dim; truncate to the output dim
         // (Matryoshka) only after pooling, then re-normalize.
         let native = self.native_dim;
+        // Guard the descriptor's `dim` against the model's real output width: a wrong
+        // `dim` in model.toml would otherwise silently mis-slice every row.
+        anyhow::ensure!(
+            flat.len() == batch * actual_seq * native,
+            "hidden-state size {} != batch {batch} × seq {actual_seq} × dim {native}: \
+             check model.toml `dim`",
+            flat.len()
+        );
         let mut blobs = Vec::with_capacity(batch);
         for b in 0..batch {
             let pooled = match self.desc.pooling {
@@ -264,7 +280,7 @@ impl EncoderModel {
                     let mut acc = vec![0f32; native];
                     let mut count = 0f32;
                     for t in 0..actual_seq {
-                        let m = attn_mask[b * seq + t];
+                        let m = attn_mask[b * actual_seq + t];
                         if m == 0 {
                             continue;
                         }

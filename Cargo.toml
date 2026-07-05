@@ -1,6 +1,6 @@
 [package]
 name = "travsr-embed"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 description = "Travsr embed sidecar — BGE family ONNX fp32, runtime model selection via --model-id"
 license = "Apache-2.0"
@@ -33,7 +33,12 @@ tokenizers = "0.23"
 rusqlite = { version = "0.32", features = ["bundled"] }
 
 # usearch HNSW index — disk-persistent, mmap-loadable, incremental inserts.
-usearch = "2.25.3"
+# Pinned to 2.24.0 (the last release that uses the portable `simsimd` backend).
+# usearch 2.25+ switched to `numkong`, whose AVX512-FP16 / AMX kernels require
+# gcc 12+; the release runners use gcc 11 (ubuntu-22.04). With 2.24.0 the build
+# only needs SIMSIMD_TARGET_SAPPHIRE=0 (set in CI) to skip the one fp16 x86
+# kernel. See .github/workflows/release.yml and Cross.toml.
+usearch = "=2.24.0"
 
 dirs               = "5"
 anyhow             = "1"

@@ -1,0 +1,7 @@
+# cross runs the build inside a Docker container that does not inherit the host
+# environment by default. Pass through the CFLAGS/CXXFLAGS set in release.yml so
+# the aarch64-unknown-linux-gnu build sees the same SIMSIMD_TARGET_SAPPHIRE=0
+# define as the native builds. (The macro is x86-only, so it is a harmless no-op
+# on aarch64, but passing it keeps every target's build flags identical.)
+[build.env]
+passthrough = ["CFLAGS", "CXXFLAGS"]

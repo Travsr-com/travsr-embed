@@ -5,7 +5,15 @@ on:
     tags: ["v*"]
 
 env:
-  BINARY: travsr-embed-nomic
+  # Must match the Cargo [[bin]] name and the asset name the travsr CLI expects
+  # (embed_catalog.toml binary_name = "travsr-embed").
+  BINARY: travsr-embed
+  # usearch 2.24.0 / simsimd compiles an AVX512-FP16 (Sapphire Rapids) x86 kernel
+  # that needs gcc 12+; the ubuntu-22.04 runners ship gcc 11. Disable that one
+  # target. f16 math is already software-pathed (SIMSIMD_NATIVE_F16=0), so there
+  # is no functional loss. Harmless on aarch64 / macOS (the macro is x86-only).
+  CFLAGS: "-DSIMSIMD_TARGET_SAPPHIRE=0"
+  CXXFLAGS: "-DSIMSIMD_TARGET_SAPPHIRE=0"
 
 jobs:
   build:

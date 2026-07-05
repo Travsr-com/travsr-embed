@@ -49,7 +49,8 @@ jobs:
 
       - name: Rewrite Cargo.toml patch paths for CI
         shell: bash
-        run: sed -i 's|path = "\.\./travsr/|path = "travsr-sibling/|g' Cargo.toml
+        # sed -i requires a backup suffix on BSD/macOS sed; .bak works on both GNU and BSD.
+        run: sed -i.bak 's|path = "\.\./travsr/|path = "travsr-sibling/|g' Cargo.toml && rm -f Cargo.toml.bak
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

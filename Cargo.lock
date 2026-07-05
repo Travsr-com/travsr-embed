@@ -1030,15 +1030,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "numkong"
-version = "7.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b58d4bb97df102ebdde66a352a20c0bc65c7c407ee9bef12ebe317edc2458a55"
-dependencies = [
- "cc",
-]
-
-[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1952,7 +1943,7 @@ dependencies = [
 
 [[package]]
 name = "travsr-embed"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "dirs",
@@ -2042,13 +2033,12 @@ checksum = "81e544489bf3d8ef66c953931f56617f423cd4b5494be343d9b9d3dda037b9a3"
 
 [[package]]
 name = "usearch"
-version = "2.25.3"
+version = "2.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c08f764417012cf6aea6d1380ef9ea8712c5795a938b726fc67b9bf7ea8824b"
+checksum = "09657b7d3d88992d7475be6f345d3cb3b388d13c152dbd4742e0b955e3a2b632"
 dependencies = [
  "cxx",
  "cxx-build",
- "numkong",
 ]
 
 [[package]]

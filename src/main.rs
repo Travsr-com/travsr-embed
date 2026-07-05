@@ -361,40 +361,44 @@ impl NomicPlugin {
         conn.execute_batch(&format!("ATTACH DATABASE '{escaped}' AS edb"))
             .context("lazy embed: attach embed.db")?;
 
+        // #391: outer eligibility uses the shared NODE_ELIGIBLE predicate so the
+        // lazy-embed path can never diverge from the batch/index paths. The bare
+        // exclusion list stays inline in the caller/callee sub-queries only.
+        let sql = format!(
+            "SELECT f.rowid AS node_id, \
+             COALESCE(n.embed_text, \
+                 n.kind || ': ' || n.signature \
+                 || COALESCE(' | module: ' || NULLIF(n.path, ''), '') \
+                 || COALESCE(' | callers: ' || ( \
+                     SELECT GROUP_CONCAT(sub.sig, ', ') FROM ( \
+                         SELECT SUBSTR(src_n.signature, 1, 60) AS sig \
+                         FROM edges e JOIN nodes src_n ON src_n.id = e.src \
+                         WHERE e.dst = n.id \
+                         AND src_n.kind NOT IN \
+                             ('file','file-module','import','module','field','variable') \
+                         LIMIT 5) AS sub), '') \
+                 || COALESCE(' | callees: ' || ( \
+                     SELECT GROUP_CONCAT(sub.sig, ', ') FROM ( \
+                         SELECT SUBSTR(dst_n.signature, 1, 60) AS sig \
+                         FROM edges e JOIN nodes dst_n ON dst_n.id = e.dst \
+                         WHERE e.src = n.id \
+                         AND dst_n.kind NOT IN \
+                             ('file','file-module','import','module','field','variable') \
+                         LIMIT 5) AS sub), '')) AS text \
+             FROM nodes_fts f \
+             JOIN nodes n ON n.id = f.rowid \
+             WHERE nodes_fts MATCH ?1 \
+             AND {node_eligible} \
+             AND NOT EXISTS ( \
+                 SELECT 1 FROM edb.node_embeddings e \
+                 WHERE e.node_id = n.id AND e.model_id = ?2 \
+             ) \
+             ORDER BY rank \
+             LIMIT ?3",
+            node_eligible = crate::index::NODE_ELIGIBLE,
+        );
         let mut stmt = conn
-            .prepare(
-                "SELECT f.rowid AS node_id, \
-                 COALESCE(n.embed_text, \
-                     n.kind || ': ' || n.signature \
-                     || COALESCE(' | module: ' || NULLIF(n.path, ''), '') \
-                     || COALESCE(' | callers: ' || ( \
-                         SELECT GROUP_CONCAT(sub.sig, ', ') FROM ( \
-                             SELECT SUBSTR(src_n.signature, 1, 60) AS sig \
-                             FROM edges e JOIN nodes src_n ON src_n.id = e.src \
-                             WHERE e.dst = n.id \
-                             AND src_n.kind NOT IN \
-                                 ('file','file-module','import','module','field','variable') \
-                             LIMIT 5) AS sub), '') \
-                     || COALESCE(' | callees: ' || ( \
-                         SELECT GROUP_CONCAT(sub.sig, ', ') FROM ( \
-                             SELECT SUBSTR(dst_n.signature, 1, 60) AS sig \
-                             FROM edges e JOIN nodes dst_n ON dst_n.id = e.dst \
-                             WHERE e.src = n.id \
-                             AND dst_n.kind NOT IN \
-                                 ('file','file-module','import','module','field','variable') \
-                             LIMIT 5) AS sub), '')) AS text \
-                 FROM nodes_fts f \
-                 JOIN nodes n ON n.id = f.rowid \
-                 WHERE nodes_fts MATCH ?1 \
-                 AND n.kind NOT IN \
-                     ('file','file-module','import','module','field','variable') \
-                 AND NOT EXISTS ( \
-                     SELECT 1 FROM edb.node_embeddings e \
-                     WHERE e.node_id = n.id AND e.model_id = ?2 \
-                 ) \
-                 ORDER BY rank \
-                 LIMIT ?3",
-            )
+            .prepare(&sql)
             .context("lazy embed: prepare FTS query")?;
 
         let candidates: Vec<(i64, String)> = stmt
@@ -634,7 +638,10 @@ fn reindex(
     // idx_edges_src_kind_cov — no table scan needed per node.
     // Correlated subqueries use the covering indices idx_edges_dst_kind_cov and
     // idx_edges_src_kind_cov — no table scan needed per node.
+    // #391: `node_eligible` is the shared write/index eligibility predicate; the
+    // bare `kind_exclude` list stays for the caller/callee sub-queries only.
     let kind_exclude = "'file','file-module','import','module','field','variable'";
+    let node_eligible = crate::index::NODE_ELIGIBLE;
     let sql = format!(
         "SELECT n.id, n.kind, n.signature, n.path, \
          n.embed_text, \
@@ -649,7 +656,7 @@ fn reindex(
               WHERE e.src = n.id \
               AND dst_n.kind NOT IN ({kind_exclude}) LIMIT 5) AS sub) AS callees \
          FROM nodes n \
-         WHERE n.kind NOT IN ({kind_exclude}) \
+         WHERE {node_eligible} \
          AND NOT EXISTS ( \
              SELECT 1 FROM edb.node_embeddings e \
              WHERE e.node_id = n.id AND e.model_id = ?1 \
@@ -958,7 +965,10 @@ fn reindex_parallel(
         let escaped = embed_str.replace('\'', "''");
         conn.execute_batch(&format!("ATTACH DATABASE '{escaped}' AS edb"))
             .context("attach embed.db for pending query")?;
+        // #391: shared eligibility predicate (see NODE_ELIGIBLE); the bare
+        // `kind_exclude` list remains for the caller/callee sub-queries only.
         let kind_exclude = "'file','file-module','import','module','field','variable'";
+        let node_eligible = crate::index::NODE_ELIGIBLE;
         let sql = format!(
             "SELECT n.id, n.kind, n.signature, n.path, \
              n.embed_text, \
@@ -973,7 +983,7 @@ fn reindex_parallel(
                   WHERE e.src = n.id \
                   AND dst_n.kind NOT IN ({kind_exclude}) LIMIT 5) AS sub) AS callees \
              FROM nodes n \
-             WHERE n.kind NOT IN ({kind_exclude}) \
+             WHERE {node_eligible} \
              AND NOT EXISTS (\
                  SELECT 1 FROM edb.node_embeddings e \
                  WHERE e.node_id = n.id AND e.model_id = ?1\
@@ -1215,10 +1225,13 @@ fn rebuild_index(db_path: &Path, embed_db_path: &Path, model_id: &str) -> Result
 
     let existing: usize = conn
         .query_row(
-            "SELECT COUNT(*) FROM edb.node_embeddings e \
-             JOIN nodes n ON n.id = e.node_id \
-             WHERE e.model_id = ?1 \
-             AND n.kind NOT IN ('file', 'file-module', 'import', 'module', 'field', 'variable')",
+            // #391: same eligibility predicate as the index build (NODE_ELIGIBLE).
+            &format!(
+                "SELECT COUNT(*) FROM edb.node_embeddings e \
+                 JOIN nodes n ON n.id = e.node_id \
+                 WHERE e.model_id = ?1 AND {}",
+                crate::index::NODE_ELIGIBLE
+            ),
             [model_id],
             |r| r.get(0),
         )

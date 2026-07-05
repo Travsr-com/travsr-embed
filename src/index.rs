@@ -16,6 +16,24 @@ use anyhow::{Context as _, Result};
 use rusqlite::Connection;
 use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 
+/// #391: single source of truth for "should this node be embedded / indexed?".
+///
+/// The daemon's `embed_text IS NOT NULL` is the authoritative eligibility signal.
+/// Structural/noise kinds are still excluded, but a node the daemon explicitly
+/// opted in (embed_text populated) is admitted regardless of kind — this is how
+/// data-format file nodes (yaml/toml/json/xml, `kind='file'`) reach the HNSW
+/// without also pulling in source-file nodes (`kind='file'`, `embed_text` NULL)
+/// via the `build_node_text` fallback.
+///
+/// Every node-*selection* query (index build here, pending-node selection and the
+/// lazy-embed FTS path in `main.rs`) references this one predicate so the policy
+/// can never drift between the write path and the index-build path. Assumes the
+/// `nodes` table is aliased `n`. Caller/callee sub-queries keep the bare
+/// exclusion list — a file must never be listed as a caller.
+pub(crate) const NODE_ELIGIBLE: &str =
+    "(n.kind NOT IN ('file', 'file-module', 'import', 'module', 'field', 'variable') \
+      OR n.embed_text IS NOT NULL)";
+
 pub struct VecIndex {
     inner: Index,
     index_path: PathBuf,
@@ -107,8 +125,8 @@ impl VecIndex {
         // PPR-expandability preference belongs in seed *ranking* downstream, not in
         // what the index contains. Dropping the clause also makes a full rebuild
         // consistent with the incremental add() path, which never filtered.
-        const SEED_FILTER: &str =
-            "n.kind NOT IN ('file', 'file-module', 'import', 'module', 'field', 'variable')";
+        // #391: shared eligibility predicate — see NODE_ELIGIBLE for rationale.
+        const SEED_FILTER: &str = NODE_ELIGIBLE;
 
         let n: usize = conn
             .query_row(
@@ -305,5 +323,38 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #391: the shared NODE_ELIGIBLE predicate must admit a data-format file node
+    /// the daemon opted in (embed_text set), keep out a source-file node
+    /// (kind='file', embed_text NULL), keep out structural noise (import), and
+    /// still admit ordinary symbol kinds regardless of embed_text.
+    #[test]
+    fn node_eligible_admits_file_with_embed_text_only() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE nodes (id INTEGER PRIMARY KEY, kind TEXT, embed_text TEXT);
+             INSERT INTO nodes (id, kind, embed_text) VALUES
+                 (1, 'file',     'workflow: ci.yml'),  -- data-format file → IN
+                 (2, 'file',     NULL),                -- source file      → OUT
+                 (3, 'function', NULL),                -- symbol           → IN
+                 (4, 'import',   NULL),                -- structural noise → OUT
+                 (5, 'package',  'crate: travsr');     -- opted-in         → IN",
+        )
+        .unwrap();
+
+        let sql = format!("SELECT id FROM nodes n WHERE {NODE_ELIGIBLE} ORDER BY id");
+        let mut stmt = conn.prepare(&sql).unwrap();
+        let ids: Vec<i64> = stmt
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+
+        assert_eq!(
+            ids,
+            vec![1, 3, 5],
+            "eligible set must be {{file+embed_text, symbol, package+embed_text}}"
+        );
     }
 }

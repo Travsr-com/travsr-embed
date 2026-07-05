@@ -36,11 +36,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       # travsr (sibling repo) is required for [patch.crates-io] path deps.
+      # actions/checkout v4 enforces that path must be inside the workspace root,
+      # so we check out into travsr-sibling/ then symlink to ../travsr where
+      # Cargo.toml expects it. Cargo follows symlinks for patch resolution.
       - uses: actions/checkout@v4
         with:
           repository: Travsr-com/travsr
-          path: ../travsr
+          path: travsr-sibling
           ref: master
+
+      - name: Symlink travsr sibling for Cargo patch resolution
+        run: ln -sf "${{ github.workspace }}/travsr-sibling" "${{ github.workspace }}/../travsr"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

@@ -887,6 +887,7 @@ fn reindex(
 ///   Bottleneck is AMX saturation (4 threads share one AMX unit), so scheduling
 ///   gains are marginal; this form is kept for correctness and code clarity.
 ///   WAL serialises concurrent COMMITs; inference dominates write contention.
+#[allow(clippy::too_many_arguments)]
 fn reindex_parallel(
     model_dir: &Path,
     db_path: &Path,
@@ -895,6 +896,13 @@ fn reindex_parallel(
     busy_timeout_ms: u64,
     phase: Phase,
     model_id: &str,
+    // WS3: when set, a watcher thread polls this path; on appearance it drains all
+    // workers (finishing their in-flight batch) so the daemon/CLI can cancel a
+    // running reindex within one batch. Embedded rows are preserved incrementally.
+    cancel_sentinel: Option<&Path>,
+    // WS3 §4.3: on cancel, skip the end-of-run HNSW rebuild by default (fast stop).
+    // `--rebuild-on-cancel` forces the atomic rebuild so the partial set is queryable.
+    rebuild_on_cancel: bool,
 ) -> Result<()> {
     tracing::info!(
         parallel,
@@ -1034,6 +1042,34 @@ fn reindex_parallel(
     let batches = Arc::new(batch_ranges);
     let next_batch = Arc::new(AtomicUsize::new(0));
 
+    // WS3: cancel watcher. Polls the sentinel every 250ms; on appearance it stores
+    // `next_batch = n_batches` so every worker's next `fetch_add` exceeds the queue
+    // length → each finishes its in-flight batch, commits, and breaks. Portable
+    // (no signals), works with or without the daemon. `watcher_done` stops the
+    // thread once the workers finish normally.
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watcher_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watcher = cancel_sentinel.map(|sentinel| {
+        let sentinel = sentinel.to_path_buf();
+        let next_c = Arc::clone(&next_batch);
+        let cancelled_c = Arc::clone(&cancelled);
+        let done_c = Arc::clone(&watcher_done);
+        std::thread::Builder::new()
+            .name("embed-cancel-watch".into())
+            .spawn(move || {
+                while !done_c.load(Ordering::Relaxed) {
+                    if sentinel.exists() {
+                        tracing::info!("cancel sentinel detected — draining workers");
+                        next_c.store(n_batches, Ordering::Relaxed);
+                        cancelled_c.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+            })
+            .expect("spawn cancel watcher")
+    });
+
     let n_workers = parallel.min(n_batches).max(1);
     let desc = model::ModelDescriptor::load(model_dir).context("loading model descriptor")?;
     let model = model::EncoderModel::load(model_dir, desc).context("loading model")?;
@@ -1154,6 +1190,12 @@ fn reindex_parallel(
             Err(_) => Some(format!("worker {i}: panicked")),
         })
         .collect();
+    // Stop the cancel watcher and observe whether a cancel fired.
+    watcher_done.store(true, Ordering::Relaxed);
+    if let Some(w) = watcher {
+        let _ = w.join();
+    }
+    let was_cancelled = cancelled.load(Ordering::SeqCst);
     if !worker_errors.is_empty() {
         anyhow::bail!("inference worker errors:\n  {}", worker_errors.join("\n  "));
     }
@@ -1166,6 +1208,30 @@ fn reindex_parallel(
         .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
         .context("checkpoint embed.db WAL")?;
     drop(write_conn);
+
+    // WS3 §4.3: on graceful cancel, fast-stop by default — the embedded rows are
+    // durable (per-batch commits) but the live HNSW stays the pre-cancel index
+    // until the next *completed* reindex, unless the user opted into rebuild.
+    if was_cancelled {
+        // Best-effort remove the sentinel so a later `reindex` isn't cancelled on
+        // sight. The daemon/CLI polls process exit, not the sentinel, so removing
+        // it here does not race the terminate path.
+        if let Some(s) = cancel_sentinel {
+            let _ = std::fs::remove_file(s);
+        }
+        if rebuild_on_cancel {
+            println!("  Cancelled — rebuilding HNSW over {total_embedded} partial embeddings...");
+            rebuild_index(db_path, embed_db_path, model_id)?;
+            tracing::info!(total_embedded, "parallel reindex cancelled (rebuilt)");
+        } else {
+            println!(
+                "  Cancelled — {total_embedded} partial embeddings preserved. \
+                 Run `travsr embed reindex` to resume and make them searchable."
+            );
+            tracing::info!(total_embedded, "parallel reindex cancelled (fast-stop)");
+        }
+        return Ok(());
+    }
 
     if matches!(phase, Phase::Phase2(_)) {
         println!("Phase 2 complete — {total_embedded} nodes embedded.");
@@ -1262,6 +1328,16 @@ fn main() {
         .init();
 
     let args: Vec<String> = std::env::args().collect();
+
+    // WS3 capability probe: `travsr-embed --version` prints the crate version and
+    // exits 0. The travsr daemon runs this once to decide whether the sidecar
+    // understands `--cancel-sentinel`; an old sidecar without this flag exits
+    // non-zero on the unknown arg, so travsr falls back to force-kill on cancel.
+    if args.iter().skip(1).any(|a| a == "--version" || a == "-V") {
+        println!("travsr-embed {}", env!("CARGO_PKG_VERSION"));
+        std::process::exit(0);
+    }
+
     let mut reindex_db: Option<PathBuf> = None;
     let mut daemon_db: Option<PathBuf> = None;
     let mut rebuild_db: Option<PathBuf> = None;
@@ -1273,6 +1349,8 @@ fn main() {
     let mut busy_timeout_ms: u64 = 120_000;
     let mut phase = Phase::All;
     let mut model_id_arg: Option<String> = None;
+    let mut cancel_sentinel: Option<PathBuf> = None;
+    let mut rebuild_on_cancel = false;
     let mut i = 1usize;
     while i < args.len() {
         match args[i].as_str() {
@@ -1405,6 +1483,16 @@ fn main() {
                     std::process::exit(1);
                 }));
             }
+            "--cancel-sentinel" => {
+                i += 1;
+                cancel_sentinel = Some(args.get(i).map(PathBuf::from).unwrap_or_else(|| {
+                    eprintln!("usage: --cancel-sentinel <path>");
+                    std::process::exit(1);
+                }));
+            }
+            "--rebuild-on-cancel" => {
+                rebuild_on_cancel = true;
+            }
             other => {
                 eprintln!("unknown argument: {other}");
                 eprintln!(
@@ -1413,6 +1501,7 @@ fn main() {
                      [--reindex <db> [--embed-db <embed.db>] \
                       [--row-start <i64> --row-end <i64>] \
                       [--phase1 <n>|--phase2 <n>] [--shard <i>/<n>] \
+                      [--parallel <N> [--cancel-sentinel <path>] [--rebuild-on-cancel]] \
                       [--busy-timeout-ms <ms>]] \
                      [--rebuild-index <db> [--embed-db <embed.db>]] \
                      [--db-path <db>]"
@@ -1454,6 +1543,15 @@ fn main() {
         eprintln!("--parallel requires --reindex");
         std::process::exit(1);
     }
+    // WS3: cancel is only wired into the parallel worker loop (shared batch queue).
+    if (cancel_sentinel.is_some() || rebuild_on_cancel) && parallel.is_none() {
+        eprintln!("--cancel-sentinel/--rebuild-on-cancel require --parallel");
+        std::process::exit(1);
+    }
+    if rebuild_on_cancel && cancel_sentinel.is_none() {
+        eprintln!("--rebuild-on-cancel requires --cancel-sentinel");
+        std::process::exit(1);
+    }
     if rebuild_db.is_some() && reindex_db.is_some() {
         eprintln!("--rebuild-index and --reindex are mutually exclusive");
         std::process::exit(1);
@@ -1488,6 +1586,8 @@ fn main() {
                 busy_timeout_ms,
                 phase,
                 model_id,
+                cancel_sentinel.as_deref(),
+                rebuild_on_cancel,
             )
         } else {
             let row_range = row_start.zip(row_end);

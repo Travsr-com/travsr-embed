@@ -1,6 +1,6 @@
 [package]
 name = "travsr-embed"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 description = "Travsr embed sidecar — BGE family ONNX fp32, runtime model selection via --model-id"
 license = "Apache-2.0"

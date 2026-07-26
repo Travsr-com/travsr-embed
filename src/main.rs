@@ -32,6 +32,8 @@
 
 #![forbid(unsafe_code)]
 
+mod backend;
+mod encode;
 mod index;
 mod model;
 
@@ -82,7 +84,7 @@ enum Phase {
 // ── Plugin struct ─────────────────────────────────────────────────────────────
 
 struct NomicPlugin {
-    model: model::EncoderModel,
+    model: Arc<dyn backend::EmbedBackend>,
     model_id: String,
     backend: String,
     /// HNSW index — None until first KNN call if not present at startup.
@@ -108,7 +110,20 @@ impl NomicPlugin {
         let embed_db_path = embed_db_path_for(&db_path);
         let desc = model::ModelDescriptor::load(model_dir).context("loading model descriptor")?;
         let dim = desc.output_dim();
-        let model = model::EncoderModel::load(model_dir, desc).context("loading model")?;
+        let model = backend::create_backend(model_dir, &desc).context("loading model")?;
+        // Issue #6: GPU fp32 and tract fp32 are not bit-identical. If embed.db
+        // was produced by a different engine, lazy embeds from this one would be
+        // mixed-provenance — warn and recommend a rebuild.
+        if let Some(prev) = read_backend_provenance(&embed_db_path) {
+            if prev != model.backend_name() {
+                tracing::warn!(
+                    previous = %prev,
+                    current = model.backend_name(),
+                    "embed.db was built by a different backend — run \
+                     `travsr embed reindex --rebuild` for consistent embeddings"
+                );
+            }
+        }
         let index = index::VecIndex::try_load(&index_path).unwrap_or_else(|e| {
             tracing::warn!(
                 "could not load HNSW index: {e:#} — KNN disabled until `travsr embed reindex` runs"
@@ -132,7 +147,7 @@ impl EmbedPlugin for NomicPlugin {
         &self.model_id
     }
     fn embedding_dim(&self) -> u32 {
-        self.model.dim as u32
+        self.model.dim() as u32
     }
     fn backend(&self) -> &str {
         &self.backend
@@ -445,6 +460,66 @@ fn persist_lazy_embeddings(
     Ok(())
 }
 
+/// Read the backend provenance recorded in embed.db meta. None when embed.db,
+/// the meta table, or the key don't exist yet (pre-issue-#6 embed.db files).
+fn read_backend_provenance(embed_db_path: &Path) -> Option<String> {
+    if !embed_db_path.exists() {
+        return None;
+    }
+    let conn = Connection::open_with_flags(
+        embed_db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    conn.query_row(
+        "SELECT value FROM meta WHERE key = 'embed_backend'",
+        [],
+        |r| r.get(0),
+    )
+    .ok()
+}
+
+/// Record which engine produced this reindex run's vectors in embed.db meta.
+///
+/// Issue #6: GPU fp32 and tract fp32 matmul are not bit-identical (accumulation
+/// order). Negligible for cosine similarity, but a backend change on an
+/// incremental reindex makes embed.db mixed-provenance — WARN and recommend a
+/// full rebuild instead of silently mixing engines.
+fn record_backend_provenance(embed_db_path: &Path, backend_name: &str) -> Result<()> {
+    let conn = Connection::open(embed_db_path).context("provenance: open embed.db")?;
+    conn.execute_batch(
+        "PRAGMA journal_mode = WAL;
+         PRAGMA busy_timeout = 30000;
+         CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+    )
+    .context("provenance: ensure meta table")?;
+    let prev: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'embed_backend'",
+            [],
+            |r| r.get(0),
+        )
+        .ok();
+    if let Some(prev) = prev.filter(|p| p != backend_name) {
+        tracing::warn!(
+            previous = %prev,
+            current = backend_name,
+            "embedding backend changed — existing vectors are from a different engine"
+        );
+        println!(
+            "  WARNING: embedding backend changed ({prev} → {backend_name}). Existing \
+             vectors were produced by a different engine; run \
+             `travsr embed reindex --rebuild` for consistent embeddings."
+        );
+    }
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES ('embed_backend', ?1)",
+        [backend_name],
+    )
+    .context("provenance: write embed_backend")?;
+    Ok(())
+}
+
 fn write_current_embed_model_meta(conn: &rusqlite::Connection, model_id: &str) -> Result<()> {
     conn.execute(
         "INSERT OR REPLACE INTO meta (key, value) VALUES ('current_embed_model', ?1)",
@@ -560,12 +635,8 @@ fn reindex(
 
     let desc = model::ModelDescriptor::load(model_dir).context("loading model descriptor")?;
     let dim = desc.output_dim();
-    let model = if worker_mode {
-        model::EncoderModel::load_for_shard(model_dir, 1, desc.clone())
-            .context("loading model (worker)")?
-    } else {
-        model::EncoderModel::load(model_dir, desc.clone()).context("loading model")?
-    };
+    let model = backend::create_backend(model_dir, &desc).context("loading model")?;
+    record_backend_provenance(embed_db_path, model.backend_name())?;
 
     // graph.db: node source + tombstone log. synchronous=NORMAL is fine — we
     // only write the tombstone ack and meta, not the bulk embedding BLOBs.
@@ -1070,9 +1141,26 @@ fn reindex_parallel(
             .expect("spawn cancel watcher")
     });
 
-    let n_workers = parallel.min(n_batches).max(1);
     let desc = model::ModelDescriptor::load(model_dir).context("loading model descriptor")?;
-    let model = model::EncoderModel::load(model_dir, desc).context("loading model")?;
+    let model = backend::create_backend(model_dir, &desc).context("loading model")?;
+    record_backend_provenance(embed_db_path, model.backend_name())?;
+    // Issue #6: N CPU worker threads do not map onto one GPU. When the backend
+    // is accelerated, run a single submit loop — the backend pads each batch to
+    // fixed shape buckets (avoids CUDA/TensorRT per-shape re-optimisation) and
+    // `--parallel` stays a CPU-only hint. WS3 cancel-sentinel is unaffected:
+    // it drains via the shared batch counter either way.
+    let n_workers = if model.is_accelerated() {
+        if parallel > 1 {
+            tracing::info!(
+                requested = parallel,
+                backend = model.backend_name(),
+                "accelerated backend — --parallel is a CPU-only hint; using a single submit loop"
+            );
+        }
+        1
+    } else {
+        parallel.min(n_batches).max(1)
+    };
     tracing::info!(
         total,
         n_batches,
@@ -1083,7 +1171,7 @@ fn reindex_parallel(
 
     // ── Steps 4-6: N consumer threads ────────────────────────────────────────
     // Workers share Arc<Vec<items>>, Arc<Vec<ranges>>, Arc<AtomicUsize>.
-    // EncoderModel::clone() is cheap (Arc<TypedRunnableModel> + Tokenizer clone).
+    // The backend is shared via Arc<dyn EmbedBackend> — one model load total.
     // Each worker opens its own write connection to embed.db; WAL serialises COMMITs.
     let edb_arc = Arc::new(embed_db_path.to_path_buf());
     let mid_arc = Arc::new(model_id.to_owned());

@@ -44,7 +44,9 @@ use std::sync::{
 
 use anyhow::{Context as _, Result};
 use rusqlite::Connection;
-use travsr_plugin_protocol::{EmbedPlugin, EmbedRequest, EmbedResponse, KnnRequest, KnnResponse};
+use travsr_plugin_protocol::{
+    EmbedPlugin, EmbedRequest, EmbedResponse, KnnRequest, KnnResponse, Space,
+};
 use travsr_plugin_sdk::run_embed_plugin;
 
 /// Human-readable backend label shown in `travsr embed status` and sidecar logs.
@@ -81,17 +83,71 @@ enum Phase {
 
 // ── Plugin struct ─────────────────────────────────────────────────────────────
 
+/// #376 Phase 2: single-slot memo of the last query's embedding. The host
+/// issues one round trip per space (Space::Code, then Space::Docs) for the
+/// same `query_text` within milliseconds of each other (§4.4's latency goal,
+/// achieved here instead of by fusing both spaces into one wire request — see
+/// `Space`'s doc comment in travsr-plugin-protocol). A short TTL bounds staleness
+/// risk to nothing (the model is stateless per call) while still skipping
+/// re-inference for the second, immediately-following request.
+struct QueryEmbedCache {
+    text: String,
+    blob: Vec<u8>,
+    at: std::time::Instant,
+}
+
+const QUERY_EMBED_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// #376 Phase 2: set to a **file path** to record per-KNN memo hit/miss events.
+///
+/// The memo is what makes the plan's §4.4 "one inference, two searches"
+/// guarantee true after the wire protocol dropped `KnnRequest.spaces` fusion in
+/// favour of one round trip per space. Wall-clock latency cannot verify that
+/// guarantee: it is dominated by the cross-encoder passes downstream, so a
+/// silently-missing memo (a full 200-270ms re-embed against a 600ms circuit
+/// breaker) is invisible in a timing measurement. That is not hypothetical —
+/// the host sent the raw query on the docs lane and the normalized one on the
+/// code lane, so every punctuated query missed, undetected, until inference
+/// count was made observable. This makes it observable.
+///
+/// A file rather than stderr because the plugin host captures sidecar stderr
+/// into a bounded ring buffer for error surfacing (`StderrRing`,
+/// `travsr-plugin-host/src/embed_sidecar.rs`) — it never reaches the host
+/// process's own stderr, so a bench harness cannot read it there.
+///
+/// Off unless the variable is set, and then costs one `OnceLock` read per KNN.
+/// Consumed by `bench/run-phase2-gate.mjs`'s single-inference gate.
+const QUERY_CACHE_DEBUG_ENV: &str = "TRAVSR_EMBED_QUERY_CACHE_DEBUG";
+
+/// Resolved once — the sidecar is long-lived and the env cannot change under it.
+/// An empty value counts as unset so `FOO=` behaves like absence.
+fn query_cache_debug_path() -> Option<&'static Path> {
+    static PATH: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        std::env::var(QUERY_CACHE_DEBUG_ENV)
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .map(PathBuf::from)
+    })
+    .as_deref()
+}
+
 struct NomicPlugin {
     model: model::EncoderModel,
     model_id: String,
     backend: String,
-    /// HNSW index — None until first KNN call if not present at startup.
+    /// Code-space HNSW index — None until first KNN call if not present at startup.
     index: Mutex<Option<index::VecIndex>>,
     index_path: PathBuf,
+    /// #376 Phase 2: doc-space HNSW index, mirrors `index`/`index_path`. None
+    /// both before the first reindex and on every repo with no markdown.
+    doc_index: Mutex<Option<index::VecIndex>>,
+    doc_index_path: PathBuf,
     /// graph.db path — for FTS candidate lookup in lazy embed path.
     db_path: PathBuf,
     /// embed.db path — for NOT-EXISTS filter + async persist of lazy embeds.
     embed_db_path: PathBuf,
+    query_embed_cache: Mutex<Option<QueryEmbedCache>>,
 }
 
 impl NomicPlugin {
@@ -115,15 +171,82 @@ impl NomicPlugin {
             );
             None
         });
+        let doc_index_path = doc_index_path_for_db(&db_path, model_id);
+        let doc_index = index::VecIndex::try_load(&doc_index_path).unwrap_or_else(|e| {
+            tracing::debug!("no doc-space HNSW index yet: {e:#}");
+            None
+        });
         Ok(Self {
             model,
             model_id: model_id.to_owned(),
             backend: backend_label(model_id, dim),
             index: Mutex::new(index),
             index_path,
+            doc_index: Mutex::new(doc_index),
+            doc_index_path,
             db_path,
             embed_db_path,
+            query_embed_cache: Mutex::new(None),
         })
+    }
+
+    /// Embed `query_text`, reusing the single-slot memo when the immediately
+    /// preceding call embedded the same text within `QUERY_EMBED_CACHE_TTL`.
+    ///
+    /// `space` is used only for the [`QUERY_CACHE_DEBUG_ENV`] trace line; the
+    /// memo itself is space-agnostic on purpose, since sharing one query
+    /// embedding across both spaces is the entire point (§4.4).
+    fn embed_query_cached(&self, query_text: &str, space: Space) -> Result<Vec<u8>> {
+        if let Ok(guard) = self.query_embed_cache.lock() {
+            if let Some(entry) = guard.as_ref() {
+                if entry.text == query_text && entry.at.elapsed() < QUERY_EMBED_CACHE_TTL {
+                    self.trace_query_cache(space, "hit", query_text);
+                    return Ok(entry.blob.clone());
+                }
+            }
+        }
+        self.trace_query_cache(space, "miss", query_text);
+        let blob = self.model.embed_query(query_text)?;
+        if let Ok(mut guard) = self.query_embed_cache.lock() {
+            *guard = Some(QueryEmbedCache {
+                text: query_text.to_string(),
+                blob: blob.clone(),
+                at: std::time::Instant::now(),
+            });
+        }
+        Ok(blob)
+    }
+
+    /// One tab-separated line per KNN when [`QUERY_CACHE_DEBUG_ENV`] is set.
+    /// A `miss` is one real query-embedding inference; the §4.4 contract is
+    /// exactly one `miss` per distinct query regardless of how many spaces are
+    /// searched. Tabs (not spaces) so a query containing spaces stays one
+    /// field, and the query goes last so a query containing a tab cannot shift
+    /// the fields the gate parses.
+    ///
+    /// Diagnostics only: every failure is swallowed, since a bench trace must
+    /// never be able to fail a real KNN. Opened in append mode per call rather
+    /// than held open — this path runs at most twice per query and a held
+    /// handle would outlive the harness's own truncation of the file.
+    fn trace_query_cache(&self, space: Space, outcome: &str, query_text: &str) {
+        let Some(path) = query_cache_debug_path() else {
+            return;
+        };
+        let space = match space {
+            Space::Code => "code",
+            Space::Docs => "docs",
+        };
+        // Single newline-terminated write; O_APPEND keeps concurrent sidecars
+        // from interleaving partial lines.
+        let line = format!("QUERY_EMBED_CACHE\t{space}\t{outcome}\t{query_text}\n");
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            use std::io::Write as _;
+            let _ = f.write_all(line.as_bytes());
+        }
     }
 }
 
@@ -136,6 +259,14 @@ impl EmbedPlugin for NomicPlugin {
     }
     fn backend(&self) -> &str {
         &self.backend
+    }
+    // #376 Phase 2: must be evaluated here, in travsr-embed's own source, not
+    // in the shared trait default or the SDK runner — env! expands against the
+    // lexically containing crate's Cargo.toml, so only this crate's own
+    // CARGO_PKG_VERSION reports travsr-embed's real release version (see
+    // EmbedPlugin::plugin_version's doc comment for the bug this avoids).
+    fn plugin_version(&self) -> &str {
+        env!("CARGO_PKG_VERSION")
     }
     fn max_batch(&self) -> u32 {
         MAX_BATCH as u32
@@ -170,8 +301,50 @@ impl EmbedPlugin for NomicPlugin {
 }
 
 impl NomicPlugin {
+    /// #376 Phase 2: dispatch on which index this request searches.
     fn knn_impl(&self, req: &KnnRequest) -> Result<(Vec<i64>, Vec<f32>)> {
-        let query_blob = self.model.embed_query(&req.query_text)?;
+        match req.space {
+            Space::Code => self.knn_impl_code(req),
+            Space::Docs => self.knn_impl_docs(req),
+        }
+    }
+
+    /// #376 Phase 2: doc-space KNN. No lazy-embed fallback (plan §4.4: "Never
+    /// lazy-embed the doc space") — a doc corpus is 2-4 orders of magnitude
+    /// smaller than the code corpus (§8.7), so `knn_raw.len() < req.k` is the
+    /// routine case here, not the rare one the code path's gate protects
+    /// against; running the ~15s FTS wedge (`fts_candidates_unembedded`) on
+    /// nearly every doc query would reintroduce the exact daemon stall #391
+    /// fixed on the code path.
+    fn knn_impl_docs(&self, req: &KnnRequest) -> Result<(Vec<i64>, Vec<f32>)> {
+        let query_blob = self.embed_query_cached(&req.query_text, Space::Docs)?;
+        let mut guard = self
+            .doc_index
+            .lock()
+            .map_err(|_| anyhow::anyhow!("doc index mutex poisoned"))?;
+
+        if guard.is_none() && self.doc_index_path.exists() {
+            *guard = index::VecIndex::try_load(&self.doc_index_path)?;
+        }
+
+        let raw: Vec<(i64, f32)> = match guard.as_mut() {
+            None => {
+                tracing::debug!("no doc-space HNSW index — run `travsr embed reindex`");
+                vec![]
+            }
+            Some(idx) => idx.knn(&query_blob, req.k)?,
+        };
+
+        let ids = raw.iter().map(|(id, _)| *id).collect();
+        let scores = raw
+            .iter()
+            .map(|(_, dist)| (1.0 - dist).clamp(0.0, 1.0))
+            .collect();
+        Ok((ids, scores))
+    }
+
+    fn knn_impl_code(&self, req: &KnnRequest) -> Result<(Vec<i64>, Vec<f32>)> {
+        let query_blob = self.embed_query_cached(&req.query_text, Space::Code)?;
         let query_vec = model::blob_to_f32(&query_blob);
 
         // ── KNN against HNSW (Phase 1 nodes) ─────────────────────────────
@@ -714,17 +887,11 @@ fn reindex(
             )
             .unwrap_or(0);
         println!("All nodes already embedded ({existing} rows). Building missing HNSW index...");
-        index::VecIndex::build_from_db(
-            db_path,
-            embed_db_path,
-            model_id,
-            &index_path,
-            existing,
-            dim,
-        )
-        .context("build_from_db")?;
-        write_current_embed_model_meta(&conn, model_id)?;
-        println!("Done — index saved to {}.", index_path.display());
+        // #376 Phase 2: rebuild_index() builds both the code index (missing here)
+        // and, when any exist, the doc-space index — a plain build_from_db call
+        // would silently skip doc-chunk vectors. It opens its own connection to
+        // db_path; SQLite's WAL mode allows this alongside the still-live `conn`.
+        rebuild_index(db_path, embed_db_path, model_id)?;
         return Ok(());
     }
 
@@ -751,6 +918,7 @@ fn reindex(
                     &index_path,
                     existing,
                     dim,
+                    crate::index::CODE_SPACE_ELIGIBLE,
                 )
                 .context("rebuild HNSW from existing embeddings before adding pending")?;
                 index::VecIndex::try_load(&index_path)
@@ -1289,30 +1457,72 @@ fn rebuild_index(db_path: &Path, embed_db_path: &Path, model_id: &str) -> Result
     conn.execute_batch(&format!("ATTACH DATABASE '{embed_db_str}' AS edb"))
         .context("attach embed.db")?;
 
-    let existing: usize = conn
+    // #376 Phase 2: code and doc spaces are counted and built independently —
+    // CODE_SPACE_ELIGIBLE and DOC_SPACE_ELIGIBLE partition the corpus, and a
+    // repo may legitimately have embeddings in only one (no markdown, or
+    // `docs.enabled` never turned on at index time).
+    let code_existing: usize = conn
         .query_row(
-            // #391: same eligibility predicate as the index build (NODE_ELIGIBLE).
             &format!(
                 "SELECT COUNT(*) FROM edb.node_embeddings e \
                  JOIN nodes n ON n.id = e.node_id \
                  WHERE e.model_id = ?1 AND {}",
-                crate::index::NODE_ELIGIBLE
+                crate::index::CODE_SPACE_ELIGIBLE
             ),
             [model_id],
             |r| r.get(0),
         )
-        .context("counting existing meaningful embeddings")?;
+        .context("counting existing code embeddings")?;
+    let doc_existing: usize = conn
+        .query_row(
+            &format!(
+                "SELECT COUNT(*) FROM edb.node_embeddings e \
+                 JOIN nodes n ON n.id = e.node_id \
+                 WHERE e.model_id = ?1 AND {}",
+                crate::index::DOC_SPACE_ELIGIBLE
+            ),
+            [model_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
     anyhow::ensure!(
-        existing > 0,
+        code_existing > 0 || doc_existing > 0,
         "no embeddings in embed.db — run `travsr embed reindex` first"
     );
-    let index_path = index_path_for_db(db_path, model_id);
-    println!("Building HNSW index from {existing} embeddings...");
-    index::VecIndex::build_from_db(db_path, embed_db_path, model_id, &index_path, existing, dim)
-        .context("build_from_db")?;
+
+    if code_existing > 0 {
+        let index_path = index_path_for_db(db_path, model_id);
+        println!("Building code HNSW index from {code_existing} embeddings...");
+        index::VecIndex::build_from_db(
+            db_path,
+            embed_db_path,
+            model_id,
+            &index_path,
+            code_existing,
+            dim,
+            crate::index::CODE_SPACE_ELIGIBLE,
+        )
+        .context("build_from_db (code space)")?;
+        println!("Done — code index saved to {}.", index_path.display());
+    }
+    if doc_existing > 0 {
+        let doc_index_path = doc_index_path_for_db(db_path, model_id);
+        println!("Building doc-space HNSW index from {doc_existing} embeddings...");
+        index::VecIndex::build_from_db(
+            db_path,
+            embed_db_path,
+            model_id,
+            &doc_index_path,
+            doc_existing,
+            dim,
+            crate::index::DOC_SPACE_ELIGIBLE,
+        )
+        .context("build_from_db (doc space)")?;
+        println!("Done — doc index saved to {}.", doc_index_path.display());
+    }
+
     write_current_embed_model_meta(&conn, model_id)?;
-    println!("Done — index saved to {}.", index_path.display());
-    tracing::info!(existing, "HNSW index rebuilt");
+    tracing::info!(code_existing, doc_existing, "HNSW index rebuilt");
     Ok(())
 }
 
@@ -1638,6 +1848,16 @@ fn main() {
 fn index_path_for_db(db_path: &Path, model_id: &str) -> PathBuf {
     let dir = db_path.parent().unwrap_or(db_path);
     dir.join(format!("{model_id}.hnsw.usearch"))
+}
+
+/// #376 Phase 2: per-repo doc-space HNSW index path, co-located with graph.db,
+/// keyed by model_id like [`index_path_for_db`]. Named `-docs.hnsw.usearch`
+/// rather than the plan's flat `hnsw-docs.usearch` so it stays keyed per
+/// model_id the same way the code index is — a flat name would collide or go
+/// stale across a model switch.
+fn doc_index_path_for_db(db_path: &Path, model_id: &str) -> PathBuf {
+    let dir = db_path.parent().unwrap_or(db_path);
+    dir.join(format!("{model_id}-docs.hnsw.usearch"))
 }
 
 fn model_dir(model_id: &str) -> Result<PathBuf> {

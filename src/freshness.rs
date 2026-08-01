@@ -177,6 +177,12 @@ pub(crate) fn apply_invalidation(
             .context("orphan embedding sweep")?;
 
         // ── 2. CDC verification ──────────────────────────────────────────────
+        // The digest is computed inside the row mapper rather than collected as
+        // text: a repo-wide re-index tombstones every node, so materialising
+        // `embed_text` for the whole backlog would hold the repo's entire corpus
+        // (~150 MB on kubernetes) in memory inside a write transaction. A
+        // 32-char digest per row bounds this at ~kilobytes regardless of repo
+        // size. `None` still means "text not knowable yet" — see step 2's match.
         let pending: Vec<(i64, Option<String>, bool)> = {
             let mut stmt = conn
                 .prepare(
@@ -191,7 +197,7 @@ pub(crate) fn apply_invalidation(
                 .query_map([], |r| {
                     Ok((
                         r.get::<_, i64>(0)?,
-                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, Option<String>>(1)?.as_deref().map(text_hash),
                         r.get::<_, bool>(2)?,
                     ))
                 })
@@ -208,7 +214,7 @@ pub(crate) fn apply_invalidation(
                      WHERE node_id = ?1 AND (text_hash IS NULL OR text_hash <> ?2)",
                 )
                 .context("prepare stale-vector delete")?;
-            for (node_id, embed_text, has_vector) in &pending {
+            for (node_id, text_digest, has_vector) in &pending {
                 // Nothing to invalidate: the node was never embedded (an
                 // `import` or `file-module` node, or one still queued). Acked
                 // immediately — deferring these would pin the backlog above
@@ -218,12 +224,12 @@ pub(crate) fn apply_invalidation(
                     resolved.push(*node_id);
                     continue;
                 }
-                match embed_text {
+                match text_digest {
                     // Text not knowable yet — keep the vector, keep the tombstone.
                     None => report.deferred += 1,
-                    Some(text) => {
+                    Some(digest) => {
                         let n = del
-                            .execute(rusqlite::params![node_id, text_hash(text)])
+                            .execute(rusqlite::params![node_id, digest])
                             .context("delete stale vector")?;
                         if n > 0 {
                             report.stale += n;
@@ -253,6 +259,14 @@ pub(crate) fn apply_invalidation(
                     "doc-space too large for full verification — falling back to CDC-only"
                 );
             } else {
+                // Digest in the row mapper, not after collecting: `DOC_VERIFY_MAX_ROWS`
+                // bounds this sweep in *rows*, but a doc chunk carries up to the
+                // `EmbedRichness::Standard` cap of prose, so collecting the text
+                // would let a corpus at the cap hold ~500 MB at once inside a write
+                // transaction. Digesting per row makes the cap bound bytes too.
+                // The rows must still be collected rather than streamed: the
+                // SELECT's EXISTS subquery reads the same table the loop below
+                // deletes from, and SQLite leaves that interleaving undefined.
                 let docs: Vec<(i64, String)> = {
                     let mut stmt = conn
                         .prepare(
@@ -263,7 +277,9 @@ pub(crate) fn apply_invalidation(
                         )
                         .context("prepare doc verification query")?;
                     let rows = stmt
-                        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+                        .query_map([], |r| {
+                            Ok((r.get::<_, i64>(0)?, text_hash(&r.get::<_, String>(1)?)))
+                        })
                         .context("run doc verification query")?;
                     rows.collect::<rusqlite::Result<Vec<_>>>()
                         .context("decode doc verification rows")?
@@ -274,9 +290,9 @@ pub(crate) fn apply_invalidation(
                          WHERE node_id = ?1 AND (text_hash IS NULL OR text_hash <> ?2)",
                     )
                     .context("prepare doc stale-vector delete")?;
-                for (node_id, text) in &docs {
+                for (node_id, digest) in &docs {
                     report.doc_stale += del
-                        .execute(rusqlite::params![node_id, text_hash(text)])
+                        .execute(rusqlite::params![node_id, digest])
                         .context("delete stale doc vector")?;
                 }
             }
@@ -513,6 +529,110 @@ mod tests {
         assert_eq!(report.doc_stale, 2);
         assert_eq!(embedding_ids(&conn), vec![3, 4]);
         assert!(report.removed_any());
+    }
+
+    /// Node ids the next embedding pass would pick up, using the **same two
+    /// conditions** the real pending-node query in `main.rs` applies:
+    /// [`crate::index::NODE_ELIGIBLE`] and "has no row in `node_embeddings` for
+    /// this model". Written against the shared `NODE_ELIGIBLE` constant rather
+    /// than a copy of the predicate, so a change to embedding eligibility that
+    /// broke recovery would fail this test instead of silently passing it.
+    fn would_be_reembedded(conn: &Connection, model_id: &str) -> Vec<i64> {
+        let sql = format!(
+            "SELECT n.id FROM nodes n \
+             WHERE {} \
+             AND NOT EXISTS (SELECT 1 FROM edb.node_embeddings e \
+                             WHERE e.node_id = n.id AND e.model_id = ?1) \
+             ORDER BY n.id",
+            crate::index::NODE_ELIGIBLE
+        );
+        let mut stmt = conn.prepare(&sql).unwrap();
+        stmt.query_map([model_id], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    /// **G4 / O4: the kill-between-ack-and-embed recovery path**, which #376
+    /// §19.3 recorded as reasoned but never exercised.
+    ///
+    /// An invalidation pass acks tombstones and deletes stale vectors in one
+    /// committed transaction, and only *then* starts embedding. A crash, a
+    /// SIGKILL, or the no-progress watchdog firing in that window leaves the
+    /// affected nodes with **no vector and no tombstone** — the tombstone, which
+    /// is the record that anything was wrong, is already gone. Nothing would
+    /// ever repair them if recovery depended on tombstones.
+    ///
+    /// It does not: recovery rides on the ordinary coverage query, which selects
+    /// on the *absence of a vector*. This test simulates the kill by doing
+    /// exactly what the pass does and then stopping — no embedding — and asserts
+    /// the affected nodes are queued for the next pass anyway.
+    #[test]
+    fn a_kill_between_ack_and_embed_leaves_every_affected_node_queued() {
+        let (_tmp, conn) = setup();
+        // 1 and 2 have edited prose (their vectors are stale), 3 is untouched.
+        for id in 1..=3 {
+            let text = format!("chunk {id} body");
+            add_node(&conn, id, "doc-chunk", Some(&text));
+            add_embedding(&conn, id, Some(text_hash(&text)));
+        }
+        conn.execute("DELETE FROM nodes", []).unwrap();
+        for id in 1..=3 {
+            let text = if id == 3 {
+                format!("chunk {id} body")
+            } else {
+                format!("chunk {id} body EDITED")
+            };
+            add_node(&conn, id, "doc-chunk", Some(&text));
+        }
+
+        // The pass runs to completion and commits: vectors deleted, tombstones
+        // acked. Then the process dies here, before a single row is embedded.
+        let report = apply_invalidation(&conn, true, true).unwrap();
+        assert_eq!(report.stale, 2);
+        assert_eq!(embedding_ids(&conn), vec![3]);
+
+        let orphaned_tombstones: i64 = conn
+            .query_row("SELECT COUNT(*) FROM node_tombstones", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            orphaned_tombstones, 0,
+            "precondition: the ack already happened, so no tombstone remains to \
+             drive recovery — this is exactly what makes the window dangerous"
+        );
+
+        // The next pass must pick both nodes up with no manual command.
+        assert_eq!(
+            would_be_reembedded(&conn, "m"),
+            vec![1, 2],
+            "every node whose vector the killed pass deleted must be queued for \
+             the next one, on vector-absence alone"
+        );
+        assert!(
+            !would_be_reembedded(&conn, "m").contains(&3),
+            "an untouched node must not be re-embedded — recovery repairs the \
+             damage, it does not redo the repo"
+        );
+    }
+
+    /// The recovery above must not resurrect the F3 hazard: a node whose
+    /// `embed_text` is NULL keeps its vector *and* its tombstone, so a kill in
+    /// the same window leaves it out of the queue rather than queued to be
+    /// re-embedded from the heading-only fallback.
+    #[test]
+    fn kill_recovery_does_not_queue_null_embed_text_nodes() {
+        let (_tmp, conn) = setup();
+        add_node(&conn, 1, "doc-chunk", Some("body"));
+        add_embedding(&conn, 1, Some(text_hash("body")));
+        conn.execute("DELETE FROM nodes", []).unwrap();
+        add_node(&conn, 1, "doc-chunk", None);
+
+        apply_invalidation(&conn, true, true).unwrap();
+        assert!(
+            would_be_reembedded(&conn, "m").is_empty(),
+            "a NULL-embed_text doc chunk is ineligible, so it is never queued \
+             for a fallback-text embedding"
+        );
     }
 
     /// Every tombstone on this repo at the time of writing (374 of 374) was for

@@ -68,6 +68,41 @@ const TOKEN_BUDGET: usize = 4_096;
 // Cheap: embed.db uses synchronous=OFF, so a commit is a WAL append, not an
 // fsync — the single fsync happens once at the end via wal_checkpoint(TRUNCATE).
 const TX_BATCH: usize = 500;
+/// Commit a partially-filled buffer once it is this old, independent of how many
+/// rows it holds (#376 O2 / G3).
+///
+/// `TX_BATCH` alone does not deliver the "near-real-time progress" the comment
+/// above promises: a pass with fewer than `TX_BATCH` items commits **nothing**
+/// until it finishes. The host's no-progress watchdog
+/// (`travsr_plugin_host::embed_catalog`, `NO_PROGRESS_SECS = 600`) watches
+/// exactly this row count, so such a pass looks stalled for its entire duration
+/// and is killed at 600 s with zero rows written — an error the user cannot
+/// action, on a pass that was making perfectly good progress.
+///
+/// Reachable rather than theoretical: doc chunks embed at roughly 2/s (plan
+/// §8.7), so 499 of them take ~250 s on an idle machine, but under
+/// `embed.priority = low`/`idle` or on loaded hardware the same pass crosses
+/// 600 s. #376 W2 made sub-`TX_BATCH` invalidation passes the *common* case.
+///
+/// 30 s leaves a 20x margin under the watchdog while costing one extra WAL
+/// append per 30 s of work, which is not measurable next to inference.
+const TX_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Whether a buffer holding `buffered` rows, last committed at `last_flush`,
+/// should be committed now (#376 O2).
+///
+/// Split out from the two write loops it governs so the property that actually
+/// matters can be asserted directly rather than inferred from a long-running
+/// integration run: **a non-empty buffer always becomes observable within
+/// `TX_FLUSH_INTERVAL`, whatever its size.** An empty buffer never flushes —
+/// committing nothing would reset the timer without moving the row count the
+/// watchdog reads, which is the bug wearing a different hat.
+fn should_flush(buffered: usize, last_flush: std::time::Instant) -> bool {
+    if buffered == 0 {
+        return false;
+    }
+    buffered >= TX_BATCH || last_flush.elapsed() >= TX_FLUSH_INTERVAL
+}
 
 /// Which nodes to embed in a reindex run.
 #[derive(Clone, Copy)]
@@ -1003,6 +1038,9 @@ fn reindex(
 
     let mut tx_buffer: Vec<(i64, Vec<u8>, String)> = Vec::with_capacity(TX_BATCH + 512);
     let mut inserted = 0usize;
+    // #376 O2: see TX_FLUSH_INTERVAL — the row count this drives is what the
+    // host's no-progress watchdog observes.
+    let mut last_flush = std::time::Instant::now();
 
     let flush_buffer = |tx_buffer: &Vec<(i64, Vec<u8>, String)>,
                         conn: &rusqlite::Connection,
@@ -1031,13 +1069,14 @@ fn reindex(
             tx_buffer.push((*node_id, blob.clone(), crate::freshness::text_hash(text)));
         }
 
-        if tx_buffer.len() >= TX_BATCH {
+        if should_flush(tx_buffer.len(), last_flush) {
             flush_buffer(&tx_buffer, &conn, &mut ins, &idx)?;
             inserted += tx_buffer.len();
             if inserted % 1_000 < tx_buffer.len() || inserted >= total {
                 println!("  embedded {inserted}/{total}");
             }
             tx_buffer.clear();
+            last_flush = std::time::Instant::now();
         }
     }
 
@@ -1312,6 +1351,8 @@ fn reindex_parallel(
                     let mut tx_buf: Vec<(i64, Vec<u8>, String)> =
                         Vec::with_capacity(TX_BATCH + 512);
                     let mut inserted = 0usize;
+                    // #376 O2: see TX_FLUSH_INTERVAL.
+                    let mut last_flush = std::time::Instant::now();
 
                     // ── consumer loop: claim batches until the queue is empty ─
                     loop {
@@ -1326,7 +1367,7 @@ fn reindex_parallel(
                         for ((nid, text), blob) in batch.iter().zip(blobs.iter()) {
                             tx_buf.push((*nid, blob.clone(), crate::freshness::text_hash(text)));
                         }
-                        if tx_buf.len() >= TX_BATCH {
+                        if should_flush(tx_buf.len(), last_flush) {
                             wconn.execute("BEGIN", []).context("worker: begin")?;
                             for (nid, blob, hash) in &tx_buf {
                                 ins.execute(rusqlite::params![nid, mid_w.as_str(), blob, hash])
@@ -1335,6 +1376,7 @@ fn reindex_parallel(
                             wconn.execute("COMMIT", []).context("worker: commit")?;
                             inserted += tx_buf.len();
                             tx_buf.clear();
+                            last_flush = std::time::Instant::now();
                         }
                     }
 
@@ -1901,6 +1943,66 @@ fn model_dir(model_id: &str) -> Result<PathBuf> {
         dir.display()
     );
     Ok(dir)
+}
+
+#[cfg(test)]
+mod flush_policy_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// The pre-#376-O2 behaviour, stated as a test so a revert is loud: a
+    /// sub-`TX_BATCH` buffer that has just been committed does not flush again
+    /// on size alone. This is the condition that used to hold for a whole pass.
+    #[test]
+    fn small_buffer_does_not_flush_on_size() {
+        assert!(!should_flush(TX_BATCH - 1, Instant::now()));
+        assert!(!should_flush(1, Instant::now()));
+    }
+
+    /// A full buffer flushes immediately regardless of age — the original
+    /// trigger, unchanged.
+    #[test]
+    fn full_buffer_flushes_on_size() {
+        assert!(should_flush(TX_BATCH, Instant::now()));
+        assert!(should_flush(TX_BATCH + 1, Instant::now()));
+    }
+
+    /// The actual fix, and the property the host's no-progress watchdog depends
+    /// on: **any** non-empty buffer becomes observable once it is
+    /// `TX_FLUSH_INTERVAL` old. Asserted at an age past the interval rather
+    /// than by sleeping, so the test is instant and deterministic.
+    #[test]
+    fn any_nonempty_buffer_flushes_once_it_is_old_enough() {
+        let old = Instant::now() - (TX_FLUSH_INTERVAL + Duration::from_secs(1));
+        assert!(should_flush(1, old), "a single buffered row must commit");
+        assert!(should_flush(TX_BATCH - 1, old));
+    }
+
+    /// The margin under the watchdog is what makes the fix sufficient, not just
+    /// directionally right: `NO_PROGRESS_SECS` is 600 in
+    /// `travsr_plugin_host::embed_catalog`, so the interval must leave room for
+    /// several flushes inside one watchdog window. Guards against someone
+    /// raising `TX_FLUSH_INTERVAL` to a value that reintroduces the kill.
+    #[test]
+    fn flush_interval_leaves_margin_under_the_host_watchdog() {
+        const HOST_NO_PROGRESS_SECS: u64 = 600;
+        assert!(
+            TX_FLUSH_INTERVAL.as_secs() * 4 <= HOST_NO_PROGRESS_SECS,
+            "TX_FLUSH_INTERVAL ({}s) must stay well under the host's \
+             NO_PROGRESS_SECS ({HOST_NO_PROGRESS_SECS}s)",
+            TX_FLUSH_INTERVAL.as_secs()
+        );
+    }
+
+    /// An empty buffer must never flush: an empty commit resets the flush timer
+    /// without moving the row count the watchdog reads, which would recreate the
+    /// original failure with extra steps.
+    #[test]
+    fn empty_buffer_never_flushes() {
+        let old = Instant::now() - (TX_FLUSH_INTERVAL + Duration::from_secs(60));
+        assert!(!should_flush(0, old));
+        assert!(!should_flush(0, Instant::now()));
+    }
 }
 
 #[cfg(test)]

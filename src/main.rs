@@ -85,19 +85,49 @@ enum Phase {
 // ── Plugin struct ─────────────────────────────────────────────────────────────
 
 /// #376 Phase 2: single-slot memo of the last query's embedding. The host
-/// issues one round trip per space (Space::Code, then Space::Docs) for the
-/// same `query_text` within milliseconds of each other (§4.4's latency goal,
-/// achieved here instead of by fusing both spaces into one wire request — see
-/// `Space`'s doc comment in travsr-plugin-protocol). A short TTL bounds staleness
-/// risk to nothing (the model is stateless per call) while still skipping
-/// re-inference for the second, immediately-following request.
+/// issues one round trip per space (Space::Code, then Space::Docs) for the same
+/// `query_text` (§4.4's "one inference, two searches", achieved here instead of
+/// by fusing both spaces into one wire request — see `Space`'s doc comment in
+/// travsr-plugin-protocol). The memo is what makes that contract true, so its
+/// lifetime has to exceed the gap between the two round trips.
 struct QueryEmbedCache {
     text: String,
     blob: Vec<u8>,
     at: std::time::Instant,
 }
 
-const QUERY_EMBED_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+impl QueryEmbedCache {
+    /// Whether this entry may serve `query_text` at `age`.
+    ///
+    /// Split out from [`NomicPlugin::embed_query_cached`] so the TTL's effect is
+    /// testable without a loaded model. It is worth testing directly: the
+    /// k8s Gate 4 failure it fixes only reproduces when the machine is loaded
+    /// enough to put >5 s between the two lanes, so a green gate run is
+    /// consistent with the fix but does not prove it.
+    fn serves(&self, query_text: &str, age: std::time::Duration) -> bool {
+        self.text == query_text && age < QUERY_EMBED_CACHE_TTL
+    }
+}
+
+/// How long a memoized query embedding stays usable.
+///
+/// **Sized by the gap it must span, not by staleness risk.** The two round trips
+/// are not "milliseconds apart" as this was originally written for: the code
+/// lane runs a cross-encoder rerank between them, which is ~1 s on a small repo
+/// and multiple seconds on a large one. Measured on kubernetes (264 k nodes),
+/// the slowest queries put 6.1-7.1 s between the two calls, so the previous 5 s
+/// bound expired mid-query and the docs lane re-embedded the same text: 5 of 20
+/// queries did two inferences, failing the §7 Gate 4 contract on that repo while
+/// passing on travsr, where the same queries cost about a second. Scale, not
+/// correctness, is what moved.
+///
+/// There is no staleness for a longer bound to risk. The entry is keyed on exact
+/// query text, an embedding is a pure function of (text, model), and a sidecar
+/// process loads exactly one model for its lifetime — so a hit is always the
+/// vector this process would have recomputed. The TTL is kept only as a bound on
+/// how long one 3 KB blob may sit in memory, and is set an order of magnitude
+/// above the worst interval measured.
+const QUERY_EMBED_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// #376 Phase 2: set to a **file path** to record per-KNN memo hit/miss events.
 ///
@@ -200,7 +230,7 @@ impl NomicPlugin {
     fn embed_query_cached(&self, query_text: &str, space: Space) -> Result<Vec<u8>> {
         if let Ok(guard) = self.query_embed_cache.lock() {
             if let Some(entry) = guard.as_ref() {
-                if entry.text == query_text && entry.at.elapsed() < QUERY_EMBED_CACHE_TTL {
+                if entry.serves(query_text, entry.at.elapsed()) {
                     self.trace_query_cache(space, "hit", query_text);
                     return Ok(entry.blob.clone());
                 }
@@ -1871,4 +1901,55 @@ fn model_dir(model_id: &str) -> Result<PathBuf> {
         dir.display()
     );
     Ok(dir)
+}
+
+#[cfg(test)]
+mod query_memo_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn entry(text: &str) -> QueryEmbedCache {
+        QueryEmbedCache {
+            text: text.to_string(),
+            blob: vec![0u8; 4],
+            at: std::time::Instant::now(),
+        }
+    }
+
+    /// The regression guard for the k8s Gate 4 failure (#376 §7 gate 4).
+    ///
+    /// The two KNN round trips for one query are separated by the code lane's
+    /// cross-encoder rerank. On kubernetes that gap was measured at 6.1-7.1 s,
+    /// so the old 5 s TTL expired mid-query and the docs lane re-embedded the
+    /// same text — two inferences where the contract allows one. This asserts
+    /// the memo now spans a gap the old bound could not.
+    #[test]
+    fn memo_spans_a_gap_that_the_old_five_second_ttl_could_not() {
+        let e = entry("why does the apiserver use a watch cache");
+        assert!(
+            e.serves(
+                "why does the apiserver use a watch cache",
+                Duration::from_secs(7)
+            ),
+            "a 7s gap (measured on kubernetes) must still hit the memo"
+        );
+    }
+
+    #[test]
+    fn memo_expires_eventually() {
+        let e = entry("q");
+        assert!(e.serves("q", Duration::from_secs(59)));
+        assert!(!e.serves("q", QUERY_EMBED_CACHE_TTL));
+        assert!(!e.serves("q", Duration::from_secs(3600)));
+    }
+
+    /// Keyed on exact text: the memo exists to share ONE query's embedding
+    /// across both spaces, never to answer a different query.
+    #[test]
+    fn memo_never_serves_a_different_query() {
+        let e = entry("watch cache");
+        assert!(!e.serves("watch  cache", Duration::from_millis(1)));
+        assert!(!e.serves("Watch cache", Duration::from_millis(1)));
+        assert!(!e.serves("", Duration::from_millis(1)));
+    }
 }

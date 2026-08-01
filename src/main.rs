@@ -32,6 +32,7 @@
 
 #![forbid(unsafe_code)]
 
+mod freshness;
 mod index;
 mod model;
 
@@ -474,8 +475,13 @@ impl NomicPlugin {
         // is not blocked by SQLite I/O. INSERT OR IGNORE is safe under races.
         let edb = self.embed_db_path.clone();
         let mid = self.model_id.clone();
-        let pairs: Vec<(i64, Vec<u8>)> =
-            candidates.iter().map(|(nid, _)| *nid).zip(blobs).collect();
+        // #376 W3: carry the content hash of the exact text embedded, so a
+        // lazily-embedded vector is verifiable like any other.
+        let pairs: Vec<(i64, Vec<u8>, String)> = candidates
+            .iter()
+            .zip(blobs)
+            .map(|((nid, text), blob)| (*nid, blob, crate::freshness::text_hash(text)))
+            .collect();
         std::thread::Builder::new()
             .name("lazy-embed-persist".into())
             .spawn(move || {
@@ -593,7 +599,7 @@ impl NomicPlugin {
 /// embedding. Called from a background thread — all errors are non-fatal.
 fn persist_lazy_embeddings(
     embed_db_path: &Path,
-    pairs: &[(i64, Vec<u8>)],
+    pairs: &[(i64, Vec<u8>, String)],
     model_id: &str,
 ) -> Result<()> {
     let conn = Connection::open(embed_db_path).context("lazy persist: open embed.db")?;
@@ -603,15 +609,16 @@ fn persist_lazy_embeddings(
          PRAGMA busy_timeout = 30000;",
     )
     .context("lazy persist: configure embed.db")?;
+    crate::freshness::ensure_schema(&conn, "").context("lazy persist: ensure schema")?;
     conn.execute("BEGIN", []).context("lazy persist: begin")?;
     let mut ins = conn
         .prepare(
-            "INSERT OR IGNORE INTO node_embeddings (node_id, model_id, embedding) \
-             VALUES (?1, ?2, ?3)",
+            "INSERT OR IGNORE INTO node_embeddings (node_id, model_id, embedding, text_hash) \
+             VALUES (?1, ?2, ?3, ?4)",
         )
         .context("lazy persist: prepare insert")?;
-    for (nid, blob) in pairs {
-        ins.execute(rusqlite::params![nid, model_id, blob])
+    for (nid, blob, hash) in pairs {
+        ins.execute(rusqlite::params![nid, model_id, blob, hash])
             .context("lazy persist: insert")?;
     }
     conn.execute("COMMIT", []).context("lazy persist: commit")?;
@@ -767,34 +774,19 @@ fn reindex(
     ))
     .context("attach and configure embed.db")?;
 
-    // Create schema in embed.db on first run (idempotent).
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS edb.node_embeddings (
-             node_id   INTEGER NOT NULL,
-             model_id  TEXT    NOT NULL,
-             embedding BLOB    NOT NULL,
-             PRIMARY KEY (node_id, model_id)
-         ) WITHOUT ROWID;
-         CREATE INDEX IF NOT EXISTS edb.idx_node_embeddings_model
-             ON node_embeddings(model_id);",
-    )
-    .context("create embed.db schema")?;
+    // Create schema in embed.db on first run, and migrate in `text_hash` on an
+    // index built before #376 W3 (idempotent).
+    crate::freshness::ensure_schema(&conn, "edb.")?;
 
-    // CDC: apply pending tombstones atomically — delete from embed.db, ack in graph.db.
-    let tombstone_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM node_tombstones", [], |r| r.get(0))
-        .unwrap_or(0);
-    if tombstone_count > 0 {
-        conn.execute_batch(
-            "BEGIN;
-             DELETE FROM edb.node_embeddings
-                 WHERE node_id IN (SELECT node_id FROM node_tombstones);
-             DELETE FROM node_tombstones;
-             COMMIT;",
-        )
-        .context("applying CDC tombstones")?;
-        tracing::info!(tombstone_count, "applied CDC tombstones to embed.db");
-    }
+    // #376 W3: content-hash invalidation replaces the blanket
+    // "tombstone ⇒ delete the vector" rule. Workers skip it — the orchestrator's
+    // main-thread pass owns invalidation for the whole run.
+    let invalidation = if worker_mode {
+        crate::freshness::InvalidationReport::default()
+    } else {
+        crate::freshness::apply_invalidation(&conn, true, true)
+            .context("applying content-hash invalidation")?
+    };
 
     let phase_clause = match phase {
         Phase::All => String::new(),
@@ -868,6 +860,16 @@ fn reindex(
     if total == 0 {
         if worker_mode {
             println!("  {worker_label}: no pending nodes.");
+            return Ok(());
+        }
+        // #376 W2: a pass that only *removed* vectors (a deleted file, an edited
+        // chunk whose re-embed is not this phase's job) still has to rebuild the
+        // HNSW — otherwise the deleted vector stays live in the index file and
+        // keeps being returned by KNN, which is how a deleted doc outlives its
+        // file. Checked before the phase/short-circuit returns below.
+        if invalidation.removed_any() {
+            println!("  Invalidation removed vectors — rebuilding HNSW index...");
+            rebuild_index(db_path, embed_db_path, model_id)?;
             return Ok(());
         }
         if matches!(phase, Phase::Phase2(_)) {
@@ -962,22 +964,24 @@ fn reindex(
     }
 
     // INSERT into edb.node_embeddings — never touches graph.db WAL.
+    // #376 W3: `text_hash` records the exact text this vector was built from, so
+    // a later pass can tell "re-indexed" from "actually changed".
     let mut ins = conn.prepare(
-        "INSERT OR REPLACE INTO edb.node_embeddings (node_id, model_id, embedding) \
-         VALUES (?1, ?2, ?3)",
+        "INSERT OR REPLACE INTO edb.node_embeddings (node_id, model_id, embedding, text_hash) \
+         VALUES (?1, ?2, ?3, ?4)",
     )?;
 
-    let mut tx_buffer: Vec<(i64, Vec<u8>)> = Vec::with_capacity(TX_BATCH + 512);
+    let mut tx_buffer: Vec<(i64, Vec<u8>, String)> = Vec::with_capacity(TX_BATCH + 512);
     let mut inserted = 0usize;
 
-    let flush_buffer = |tx_buffer: &Vec<(i64, Vec<u8>)>,
+    let flush_buffer = |tx_buffer: &Vec<(i64, Vec<u8>, String)>,
                         conn: &rusqlite::Connection,
                         ins: &mut rusqlite::Statement<'_>,
                         idx: &Option<index::VecIndex>|
      -> Result<()> {
         conn.execute("BEGIN", [])?;
-        for (node_id, blob) in tx_buffer {
-            ins.execute(rusqlite::params![node_id, model_id, blob])?;
+        for (node_id, blob, hash) in tx_buffer {
+            ins.execute(rusqlite::params![node_id, model_id, blob, hash])?;
             if let Some(ref idx_inner) = idx {
                 let vec = model::blob_to_f32(blob);
                 idx_inner.add(*node_id, &vec)?;
@@ -993,8 +997,8 @@ fn reindex(
 
         let blobs = model.embed_documents(&text_refs)?;
 
-        for ((node_id, _), blob) in chunk.iter().zip(blobs.iter()) {
-            tx_buffer.push((*node_id, blob.clone()));
+        for ((node_id, text), blob) in chunk.iter().zip(blobs.iter()) {
+            tx_buffer.push((*node_id, blob.clone(), crate::freshness::text_hash(text)));
         }
 
         if tx_buffer.len() >= TX_BATCH {
@@ -1080,9 +1084,11 @@ fn reindex_parallel(
         parallel
     );
 
-    // ── Step 1: CDC tombstones (main thread, needs write access to both dbs) ──
-    {
-        let conn = Connection::open(db_path).context("open graph.db for tombstones")?;
+    // ── Step 1: invalidation (main thread, needs write access to both dbs) ────
+    // #376 W3: content-hash verification, not a blanket tombstone delete. See
+    // `freshness` for why the two spaces are verified differently.
+    let invalidation = {
+        let conn = Connection::open(db_path).context("open graph.db for invalidation")?;
         let embed_str = embed_db_path
             .to_str()
             .context("embed.db path is not valid UTF-8")?;
@@ -1092,33 +1098,11 @@ fn reindex_parallel(
              ATTACH DATABASE '{escaped}' AS edb;
              PRAGMA edb.journal_mode = WAL;"
         ))
-        .context("configure connections for tombstone pass")?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS edb.node_embeddings (
-                 node_id   INTEGER NOT NULL,
-                 model_id  TEXT    NOT NULL,
-                 embedding BLOB    NOT NULL,
-                 PRIMARY KEY (node_id, model_id)
-             ) WITHOUT ROWID;
-             CREATE INDEX IF NOT EXISTS edb.idx_node_embeddings_model
-                 ON node_embeddings(model_id);",
-        )
-        .context("create embed.db schema")?;
-        let tombstone_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM node_tombstones", [], |r| r.get(0))
-            .unwrap_or(0);
-        if tombstone_count > 0 {
-            conn.execute_batch(
-                "BEGIN;
-                 DELETE FROM edb.node_embeddings
-                     WHERE node_id IN (SELECT node_id FROM node_tombstones);
-                 DELETE FROM node_tombstones;
-                 COMMIT;",
-            )
-            .context("applying CDC tombstones")?;
-            tracing::info!(tombstone_count, "applied CDC tombstones to embed.db");
-        }
-    }
+        .context("configure connections for invalidation pass")?;
+        crate::freshness::ensure_schema(&conn, "edb.")?;
+        crate::freshness::apply_invalidation(&conn, true, true)
+            .context("applying content-hash invalidation")?
+    };
 
     // ── Step 2: materialise ALL pending (id, text) pairs on the main thread ──
     // One read pass with NOT EXISTS applied here — workers receive their chunk
@@ -1189,6 +1173,14 @@ fn reindex_parallel(
 
     let total = all_pending.len();
     if total == 0 {
+        // #376 W2: nothing to embed, but if invalidation removed vectors the
+        // live HNSW still contains them. Deletions must reach the index even
+        // when no inference is needed.
+        if invalidation.removed_any() {
+            println!("  Invalidation removed vectors — rebuilding HNSW index...");
+            rebuild_index(db_path, embed_db_path, model_id)?;
+            return Ok(());
+        }
         println!("All nodes already embedded — nothing to do.");
         return Ok(());
     }
@@ -1279,26 +1271,16 @@ fn reindex_parallel(
                              PRAGMA busy_timeout = {busy_timeout_ms};"
                         ))
                         .context("worker: configure embed.db")?;
-                    wconn
-                        .execute_batch(
-                            "CREATE TABLE IF NOT EXISTS node_embeddings (
-                                 node_id   INTEGER NOT NULL,
-                                 model_id  TEXT    NOT NULL,
-                                 embedding BLOB    NOT NULL,
-                                 PRIMARY KEY (node_id, model_id)
-                             ) WITHOUT ROWID;
-                             CREATE INDEX IF NOT EXISTS idx_node_embeddings_model
-                                 ON node_embeddings(model_id);",
-                        )
-                        .context("worker: ensure schema")?;
+                    crate::freshness::ensure_schema(&wconn, "").context("worker: ensure schema")?;
                     let mut ins = wconn
                         .prepare(
                             "INSERT OR REPLACE INTO node_embeddings \
-                             (node_id, model_id, embedding) VALUES (?1, ?2, ?3)",
+                             (node_id, model_id, embedding, text_hash) VALUES (?1, ?2, ?3, ?4)",
                         )
                         .context("worker: prepare insert")?;
 
-                    let mut tx_buf: Vec<(i64, Vec<u8>)> = Vec::with_capacity(TX_BATCH + 512);
+                    let mut tx_buf: Vec<(i64, Vec<u8>, String)> =
+                        Vec::with_capacity(TX_BATCH + 512);
                     let mut inserted = 0usize;
 
                     // ── consumer loop: claim batches until the queue is empty ─
@@ -1311,13 +1293,13 @@ fn reindex_parallel(
                         let batch = &items_w[range];
                         let texts: Vec<&str> = batch.iter().map(|(_, t)| t.as_str()).collect();
                         let blobs = model_w.embed_documents(&texts).context("worker: embed")?;
-                        for ((nid, _), blob) in batch.iter().zip(blobs.iter()) {
-                            tx_buf.push((*nid, blob.clone()));
+                        for ((nid, text), blob) in batch.iter().zip(blobs.iter()) {
+                            tx_buf.push((*nid, blob.clone(), crate::freshness::text_hash(text)));
                         }
                         if tx_buf.len() >= TX_BATCH {
                             wconn.execute("BEGIN", []).context("worker: begin")?;
-                            for (nid, blob) in &tx_buf {
-                                ins.execute(rusqlite::params![nid, mid_w.as_str(), blob])
+                            for (nid, blob, hash) in &tx_buf {
+                                ins.execute(rusqlite::params![nid, mid_w.as_str(), blob, hash])
                                     .context("worker: insert")?;
                             }
                             wconn.execute("COMMIT", []).context("worker: commit")?;
@@ -1328,8 +1310,8 @@ fn reindex_parallel(
 
                     if !tx_buf.is_empty() {
                         wconn.execute("BEGIN", []).context("worker: begin final")?;
-                        for (nid, blob) in &tx_buf {
-                            ins.execute(rusqlite::params![nid, mid_w.as_str(), blob])
+                        for (nid, blob, hash) in &tx_buf {
+                            ins.execute(rusqlite::params![nid, mid_w.as_str(), blob, hash])
                                 .context("worker: insert final")?;
                         }
                         wconn
@@ -1456,6 +1438,26 @@ fn rebuild_index(db_path: &Path, embed_db_path: &Path, model_id: &str) -> Result
         .context("embed.db path is not valid UTF-8")?;
     conn.execute_batch(&format!("ATTACH DATABASE '{embed_db_str}' AS edb"))
         .context("attach embed.db")?;
+
+    // #376 W2: this is the one path that writes an HNSW file without embedding
+    // anything, and before W2 it was also the one path that could publish an
+    // index built from vectors already known to be stale. Verify first. `ack`
+    // is false on purpose: this path can *remove* a stale vector but cannot
+    // re-embed it, so the tombstone must survive for the next real pass.
+    match crate::freshness::apply_invalidation(&conn, false, true) {
+        Ok(r) if r.removed_any() => {
+            tracing::info!(
+                stale = r.stale,
+                orphaned = r.orphaned,
+                doc_stale = r.doc_stale,
+                "rebuild-index: dropped stale vectors before building"
+            );
+        }
+        Ok(_) => {}
+        // A rebuild on a db with no tombstone table (or a read-only graph.db)
+        // must still produce an index — freshness is best-effort here.
+        Err(e) => tracing::warn!("rebuild-index: invalidation skipped (non-fatal): {e:#}"),
+    }
 
     // #376 Phase 2: code and doc spaces are counted and built independently —
     // CODE_SPACE_ELIGIBLE and DOC_SPACE_ELIGIBLE partition the corpus, and a

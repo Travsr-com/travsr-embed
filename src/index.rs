@@ -30,9 +30,21 @@ use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 /// can never drift between the write path and the index-build path. Assumes the
 /// `nodes` table is aliased `n`. Caller/callee sub-queries keep the bare
 /// exclusion list — a file must never be listed as a caller.
+///
+/// #376 W1: a `doc-chunk` with NULL `embed_text` is *ineligible*. Its entire
+/// retrieval value is its prose, and the candidate query's COALESCE fallback
+/// would embed the heading trail and path alone — a lexical-match-only vector
+/// wearing a semantic vector's clothes, permanent because candidacy is
+/// presence-only. Excluding it keeps the node a candidate until real text
+/// exists (the daemon regenerates `embed_text` before spawning a pass). Code
+/// kinds keep the fallback: signature + path + callers/callees is a weak but
+/// real signal. `travsr-store::embed_progress`'s KIND_FILTER mirrors this — if
+/// the two drift, `travsr embed status` reports coverage the sidecar disagrees
+/// with and the daemon's auto-spawn either never fires or never stops.
 pub(crate) const NODE_ELIGIBLE: &str =
-    "(n.kind NOT IN ('file', 'file-module', 'import', 'module', 'field', 'variable') \
-      OR n.embed_text IS NOT NULL)";
+    "((n.kind NOT IN ('file', 'file-module', 'import', 'module', 'field', 'variable') \
+      OR n.embed_text IS NOT NULL) \
+      AND NOT (n.kind = 'doc-chunk' AND n.embed_text IS NULL))";
 
 /// #376 Phase 2: which *index* a node's embedding belongs in, not whether it
 /// gets embedded at all. `NODE_ELIGIBLE` (embedding eligibility, used by the
@@ -377,6 +389,38 @@ mod tests {
             ids,
             vec![1, 3, 5],
             "eligible set must be {{file+embed_text, symbol, package+embed_text}}"
+        );
+    }
+
+    /// #376 W1: a doc-chunk without prose must never be embedded. The candidate
+    /// query's COALESCE fallback would build its text from the heading trail and
+    /// path alone, and presence-only candidacy would then make that degraded
+    /// vector permanent — invisible in the output, since the docs section prints
+    /// no score. It stays a candidate until the daemon regenerates `embed_text`.
+    #[test]
+    fn node_eligible_rejects_doc_chunk_without_prose() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE nodes (id INTEGER PRIMARY KEY, kind TEXT, embed_text TEXT);
+             INSERT INTO nodes (id, kind, embed_text) VALUES
+                 (1, 'doc-chunk', 'doc: readme > setup | install it'), -- IN
+                 (2, 'doc-chunk', NULL),                               -- OUT
+                 (3, 'function',  NULL);                               -- IN (fallback ok)",
+        )
+        .unwrap();
+
+        let sql = format!("SELECT id FROM nodes n WHERE {NODE_ELIGIBLE} ORDER BY id");
+        let mut stmt = conn.prepare(&sql).unwrap();
+        let ids: Vec<i64> = stmt
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+
+        assert_eq!(
+            ids,
+            vec![1, 3],
+            "a doc-chunk with NULL embed_text must be ineligible"
         );
     }
 

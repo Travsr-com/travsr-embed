@@ -124,6 +124,21 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # travsr sibling repo required for [patch.crates-io] path deps - see the
+      # ci job's identical steps above for why this has to be a checkout+symlink
+      # rather than a plain checkout. cargo-deny-action resolves the manifest
+      # the same way `cargo` does, so it hits the same unresolved-path failure
+      # without this.
+      - uses: actions/checkout@v4
+        id: checkout_travsr
+        with:
+          repository: Travsr-com/travsr
+          path: _travsr
+          ref: master
+
+      - name: Symlink travsr sibling for Cargo patch paths
+        run: ln -s "$GITHUB_WORKSPACE/_travsr" "$GITHUB_WORKSPACE/../travsr"
+
       # deny.toml is deliberately kept in sync with travsr's own (see its
       # header comment) - a job that never runs cannot hold that invariant.
       - name: Check advisories, licenses, and bans

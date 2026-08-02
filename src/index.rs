@@ -30,9 +30,35 @@ use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 /// can never drift between the write path and the index-build path. Assumes the
 /// `nodes` table is aliased `n`. Caller/callee sub-queries keep the bare
 /// exclusion list — a file must never be listed as a caller.
+///
+/// #376 W1: a `doc-chunk` with NULL `embed_text` is *ineligible*. Its entire
+/// retrieval value is its prose, and the candidate query's COALESCE fallback
+/// would embed the heading trail and path alone — a lexical-match-only vector
+/// wearing a semantic vector's clothes, permanent because candidacy is
+/// presence-only. Excluding it keeps the node a candidate until real text
+/// exists (the daemon regenerates `embed_text` before spawning a pass). Code
+/// kinds keep the fallback: signature + path + callers/callees is a weak but
+/// real signal. `travsr-store::embed_progress`'s KIND_FILTER mirrors this — if
+/// the two drift, `travsr embed status` reports coverage the sidecar disagrees
+/// with and the daemon's auto-spawn either never fires or never stops.
 pub(crate) const NODE_ELIGIBLE: &str =
-    "(n.kind NOT IN ('file', 'file-module', 'import', 'module', 'field', 'variable') \
-      OR n.embed_text IS NOT NULL)";
+    "((n.kind NOT IN ('file', 'file-module', 'import', 'module', 'field', 'variable') \
+      OR n.embed_text IS NOT NULL) \
+      AND NOT (n.kind = 'doc-chunk' AND n.embed_text IS NULL))";
+
+/// #376 Phase 2: which *index* a node's embedding belongs in, not whether it
+/// gets embedded at all. `NODE_ELIGIBLE` (embedding eligibility, used by the
+/// reindex/lazy-embed candidate queries in `main.rs`) correctly admits
+/// `doc-chunk` nodes — they must be embedded like any other node. But the two
+/// spaces are separate HNSW files with separate recall semantics (plan §4.1:
+/// no cross-modal ranking), so the *index build* queries need a stricter,
+/// mutually exclusive split: a doc-chunk node must never enter the code index
+/// (the plan's "mirror exclusion") and nothing else may enter the doc index.
+pub(crate) const CODE_SPACE_ELIGIBLE: &str =
+    "(n.kind != 'doc-chunk' AND (n.kind NOT IN ('file', 'file-module', 'import', 'module', 'field', 'variable') \
+      OR n.embed_text IS NOT NULL))";
+
+pub(crate) const DOC_SPACE_ELIGIBLE: &str = "n.kind = 'doc-chunk'";
 
 pub struct VecIndex {
     inner: Index,
@@ -94,6 +120,11 @@ impl VecIndex {
     /// RFC-019: embeddings live in embed.db; graph.db holds nodes for the JOIN.
     /// embed.db is ATTACHed to the graph.db connection as "edb" so the kind-filter
     /// JOIN works across both files without loading everything into memory.
+    /// `node_filter` selects which space this build populates —
+    /// [`CODE_SPACE_ELIGIBLE`] or [`DOC_SPACE_ELIGIBLE`] (#376 Phase 2). The two
+    /// are mutually exclusive by construction (see their doc comments), so
+    /// calling this once per space with a shared `embed_db_path` always
+    /// partitions the corpus correctly.
     pub fn build_from_db(
         db_path: &Path,
         embed_db_path: &Path,
@@ -101,6 +132,7 @@ impl VecIndex {
         index_path: &Path,
         expected_count: usize,
         dim: usize,
+        node_filter: &str,
     ) -> Result<Self> {
         let conn = Connection::open(db_path).context("open graph.db")?;
         let embed_db_str = embed_db_path
@@ -126,14 +158,16 @@ impl VecIndex {
         // what the index contains. Dropping the clause also makes a full rebuild
         // consistent with the incremental add() path, which never filtered.
         // #391: shared eligibility predicate — see NODE_ELIGIBLE for rationale.
-        const SEED_FILTER: &str = NODE_ELIGIBLE;
+        // #376 Phase 2: `node_filter` is CODE_SPACE_ELIGIBLE or DOC_SPACE_ELIGIBLE,
+        // never the raw NODE_ELIGIBLE (which admits doc-chunk nodes into a would-be
+        // code index — the plan's "mirror exclusion" bug).
 
         let n: usize = conn
             .query_row(
                 &format!(
                     "SELECT COUNT(*) FROM edb.node_embeddings e \
                      JOIN nodes n ON n.id = e.node_id \
-                     WHERE e.model_id = ?1 AND {SEED_FILTER}"
+                     WHERE e.model_id = ?1 AND {node_filter}"
                 ),
                 [model_id],
                 |r| r.get(0),
@@ -147,7 +181,7 @@ impl VecIndex {
             "SELECT e.node_id, e.embedding \
              FROM edb.node_embeddings e \
              JOIN nodes n ON n.id = e.node_id \
-             WHERE e.model_id = ?1 AND {SEED_FILTER}",
+             WHERE e.model_id = ?1 AND {node_filter}",
         ))?;
         let mut rows = stmt.query([model_id])?;
         let mut count = 0usize;
@@ -356,5 +390,175 @@ mod tests {
             vec![1, 3, 5],
             "eligible set must be {{file+embed_text, symbol, package+embed_text}}"
         );
+    }
+
+    /// #376 W1: a doc-chunk without prose must never be embedded. The candidate
+    /// query's COALESCE fallback would build its text from the heading trail and
+    /// path alone, and presence-only candidacy would then make that degraded
+    /// vector permanent — invisible in the output, since the docs section prints
+    /// no score. It stays a candidate until the daemon regenerates `embed_text`.
+    #[test]
+    fn node_eligible_rejects_doc_chunk_without_prose() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE nodes (id INTEGER PRIMARY KEY, kind TEXT, embed_text TEXT);
+             INSERT INTO nodes (id, kind, embed_text) VALUES
+                 (1, 'doc-chunk', 'doc: readme > setup | install it'), -- IN
+                 (2, 'doc-chunk', NULL),                               -- OUT
+                 (3, 'function',  NULL);                               -- IN (fallback ok)",
+        )
+        .unwrap();
+
+        let sql = format!("SELECT id FROM nodes n WHERE {NODE_ELIGIBLE} ORDER BY id");
+        let mut stmt = conn.prepare(&sql).unwrap();
+        let ids: Vec<i64> = stmt
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+
+        assert_eq!(
+            ids,
+            vec![1, 3],
+            "a doc-chunk with NULL embed_text must be ineligible"
+        );
+    }
+
+    /// #376 Phase 2: CODE_SPACE_ELIGIBLE and DOC_SPACE_ELIGIBLE must partition
+    /// the corpus with no overlap. In particular a doc-chunk node — which
+    /// always has `embed_text` set (plan §3.2) and would therefore pass the
+    /// plain NODE_ELIGIBLE check — must be excluded from the code space (the
+    /// plan's "mirror exclusion") while still being admitted to the doc space.
+    #[test]
+    fn code_and_doc_space_eligible_partition_with_no_overlap() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE nodes (id INTEGER PRIMARY KEY, kind TEXT, embed_text TEXT);
+             INSERT INTO nodes (id, kind, embed_text) VALUES
+                 (1, 'file',      'workflow: ci.yml'), -- data-format file → code
+                 (2, 'file',      NULL),               -- source file      → neither
+                 (3, 'function',  NULL),                -- symbol           → code
+                 (4, 'import',    NULL),                -- structural noise → neither
+                 (5, 'doc-chunk', 'doc: intro'),         -- doc chunk        → docs
+                 (6, 'doc-chunk', 'doc: another section'); -- doc chunk      → docs",
+        )
+        .unwrap();
+
+        let code_sql = format!("SELECT id FROM nodes n WHERE {CODE_SPACE_ELIGIBLE} ORDER BY id");
+        let mut stmt = conn.prepare(&code_sql).unwrap();
+        let code_ids: Vec<i64> = stmt
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            code_ids,
+            vec![1, 3],
+            "code space must exclude doc-chunk nodes even though they carry embed_text"
+        );
+
+        let doc_sql = format!("SELECT id FROM nodes n WHERE {DOC_SPACE_ELIGIBLE} ORDER BY id");
+        let mut stmt = conn.prepare(&doc_sql).unwrap();
+        let doc_ids: Vec<i64> = stmt
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(doc_ids, vec![5, 6]);
+
+        assert!(
+            code_ids.iter().all(|id| !doc_ids.contains(id)),
+            "code and doc spaces must never share a node id"
+        );
+    }
+
+    /// #376 Phase 2: `build_from_db` called once per space against a shared
+    /// embed.db must produce two separate on-disk indices, each containing
+    /// only its own space's vectors — the end-to-end version of the predicate
+    /// test above, through the real ATTACH + stream + save path.
+    #[test]
+    fn build_from_db_partitions_code_and_doc_spaces() {
+        let dir = std::env::temp_dir().join(format!(
+            "travsr_embed_space_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("graph.db");
+        let embed_db_path = dir.join("embed.db");
+        let code_index_path = dir.join("code.usearch");
+        let doc_index_path = dir.join("docs.usearch");
+
+        // graph.db: 2 code-eligible nodes, 2 doc-chunk nodes.
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE nodes (id INTEGER PRIMARY KEY, kind TEXT, embed_text TEXT);
+             INSERT INTO nodes (id, kind, embed_text) VALUES
+                 (1, 'function',  NULL),
+                 (2, 'function',  NULL),
+                 (3, 'doc-chunk', 'doc: intro'),
+                 (4, 'doc-chunk', 'doc: another section');",
+        )
+        .unwrap();
+        drop(conn);
+
+        // embed.db: one embedding row per node, same model_id.
+        let embed_conn = Connection::open(&embed_db_path).unwrap();
+        embed_conn
+            .execute_batch(
+                "CREATE TABLE node_embeddings (
+                     node_id INTEGER NOT NULL, model_id TEXT NOT NULL, embedding BLOB NOT NULL,
+                     PRIMARY KEY (node_id, model_id)
+                 ) WITHOUT ROWID;",
+            )
+            .unwrap();
+        for id in 1i64..=4 {
+            let blob: Vec<u8> = unit_vec(id as u32)
+                .iter()
+                .flat_map(|f| f.to_le_bytes())
+                .collect();
+            embed_conn
+                .execute(
+                    "INSERT INTO node_embeddings (node_id, model_id, embedding) VALUES (?1, 'm', ?2)",
+                    rusqlite::params![id, blob],
+                )
+                .unwrap();
+        }
+        drop(embed_conn);
+
+        VecIndex::build_from_db(
+            &db_path,
+            &embed_db_path,
+            "m",
+            &code_index_path,
+            2,
+            TEST_DIM,
+            CODE_SPACE_ELIGIBLE,
+        )
+        .unwrap();
+        VecIndex::build_from_db(
+            &db_path,
+            &embed_db_path,
+            "m",
+            &doc_index_path,
+            2,
+            TEST_DIM,
+            DOC_SPACE_ELIGIBLE,
+        )
+        .unwrap();
+
+        let code_idx = VecIndex::try_load(&code_index_path).unwrap().unwrap();
+        assert_eq!(
+            code_idx.count(),
+            2,
+            "code index must contain only nodes 1,2"
+        );
+        let doc_idx = VecIndex::try_load(&doc_index_path).unwrap().unwrap();
+        assert_eq!(doc_idx.count(), 2, "doc index must contain only nodes 3,4");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

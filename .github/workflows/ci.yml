@@ -125,10 +125,12 @@ jobs:
         uses: actions/checkout@v4
 
       # travsr sibling repo required for [patch.crates-io] path deps - see the
-      # ci job's identical steps above for why this has to be a checkout+symlink
-      # rather than a plain checkout. cargo-deny-action resolves the manifest
-      # the same way `cargo` does, so it hits the same unresolved-path failure
-      # without this.
+      # ci job's identical steps above. Unlike that job, this one can't use
+      # EmbarkStudios/cargo-deny-action: it runs cargo-deny inside a Docker
+      # container that bind-mounts only $GITHUB_WORKSPACE, so a symlink
+      # pointing outside the workspace (../travsr) resolves to nothing in
+      # there. Installing cargo-deny and running it directly on the runner
+      # keeps it in the same filesystem view as the ci/msrv jobs.
       - uses: actions/checkout@v4
         id: checkout_travsr
         with:
@@ -139,9 +141,13 @@ jobs:
       - name: Symlink travsr sibling for Cargo patch paths
         run: ln -s "$GITHUB_WORKSPACE/_travsr" "$GITHUB_WORKSPACE/../travsr"
 
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@cargo-deny
+
       # deny.toml is deliberately kept in sync with travsr's own (see its
       # header comment) - a job that never runs cannot hold that invariant.
       - name: Check advisories, licenses, and bans
-        uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          command: check advisories licenses bans sources
+        run: cargo deny check advisories licenses bans sources

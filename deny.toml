@@ -6,9 +6,15 @@
 # allowed" — a missing-config failure that read like a license problem and made
 # the real signal (the advisory list below) impossible to see.
 #
-# Deliberately kept in sync with the travsr repo's deny.toml: the two ship as a
-# pair, and a dependency judged acceptable in one must not be rejected by the
-# other. Only the advisories that this tree actually pulls are listed.
+# The [licenses] allow list below is deliberately kept identical to the travsr
+# repo's: the two ship as a pair, and a dependency judged acceptable in one must
+# not be rejected by the other.
+#
+# The advisory ignores are per-tree and cannot converge: this repo pins
+# tract-onnx 0.23 while travsr's tree resolves tract-linalg 0.21.x, so the two
+# are exposed to different advisories by construction. travsr ignores
+# RUSTSEC-2026-0173 and RUSTSEC-2026-0009; neither is reachable here. Read a
+# difference in this list as expected, not as drift.
 
 [advisories]
 version = 2
@@ -24,12 +30,10 @@ ignore = [
 # is strictly better than documenting why the bug does not bite us:
 #   • RUSTSEC-2026-0190 (anyhow `Error::downcast_mut` unsoundness) -> anyhow 1.0.104
 #   • RUSTSEC-2026-0204 (crossbeam-epoch `fmt::Pointer` null deref) -> 0.9.20
-# The travsr repo still carries an ignore for RUSTSEC-2026-0204 whose own note
-# says "unblock on 0.9.19+"; that upgrade is now available there too.
+# travsr took the same upgrades and likewise carries no ignore for either.
 #
-# RUSTSEC-2026-0217 (tract-nnef) is listed in the travsr repo's deny.toml but
-# does not appear in this tree, so no ignore is carried here — an unmatched
-# ignore is itself a cargo-deny warning.
+# RUSTSEC-2026-0217 (tract-nnef) does not appear in this tree either, so no
+# ignore is carried — an unmatched ignore is itself a cargo-deny warning.
 
 [licenses]
 # Anything not in this allow list is denied. Verified to cover every SPDX

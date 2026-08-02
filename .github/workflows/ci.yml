@@ -2,8 +2,21 @@ name: CI
 
 on:
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
+
+# Every branch push used to also arrive as a pull_request event, so each commit
+# on a PR ran the whole workflow twice and nothing cancelled the superseded
+# runs. Mirrors travsr's own ci.yml.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# The jobs only read the repo (plus the public travsr sibling). Nothing here
+# needs a write token, and `cargo check` runs third-party build scripts and
+# proc macros, so hand it the narrowest one available.
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -33,7 +46,7 @@ jobs:
           ref: master
 
       - name: Symlink travsr sibling for Cargo patch paths
-        run: ln -s "$GITHUB_WORKSPACE/_travsr" "$GITHUB_WORKSPACE/../travsr"
+        run: ln -sfn "$GITHUB_WORKSPACE/_travsr" "$GITHUB_WORKSPACE/../travsr"
 
       - name: Install Rust (stable + MSRV)
         uses: dtolnay/rust-toolchain@stable
@@ -47,7 +60,11 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          # `Cargo.lock`, not `**/Cargo.lock`: the sibling travsr checkout lives
+          # inside the workspace by this point, so the recursive glob folded its
+          # lockfile into the key and any travsr master commit touching deps
+          # this repo does not even use threw away the whole target/ cache.
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
       # L7: this repo path-depends on travsr-plugin-{protocol,sdk} from the
@@ -58,18 +75,36 @@ jobs:
       - name: Preflight — compile against travsr master
         id: preflight
         continue-on-error: true
-        run: cargo check --all-targets --quiet
+        shell: bash
+        run: cargo check --all-targets --quiet 2>&1 | tee "$RUNNER_TEMP/preflight.log"
 
       - name: Explain a preflight failure
         if: steps.preflight.outcome == 'failure'
+        shell: bash
         env:
           TRAVSR_SHA: ${{ steps.checkout_travsr.outputs.commit }}
         run: |
-          echo "::error::This repo path-depends on travsr-plugin-{protocol,sdk} from"
-          echo "::error::Travsr-com/travsr@master (checked out above at $TRAVSR_SHA)."
-          echo "::error::If this PR needs a travsr-side change, that change must be"
-          echo "::error::merged to travsr master FIRST. Unresolved-import errors here"
-          echo "::error::usually mean the paired travsr PR is still open."
+          # The preflight step is `continue-on-error`, so the checks UI renders
+          # it as passed and its output is a click away. Re-print it here, where
+          # the failure actually is.
+          echo "::group::cargo check output"
+          cat "$RUNNER_TEMP/preflight.log" || true
+          echo "::endgroup::"
+          # Only claim the sibling-drift diagnosis when the errors actually look
+          # like it. Most red CI is this repo's own code, and a confidently
+          # wrong "go merge the other PR first" is worse than no hint at all.
+          if grep -qE 'unresolved import|E0432|E0433|travsr_plugin_' "$RUNNER_TEMP/preflight.log"; then
+            echo "::error::This repo path-depends on travsr-plugin-{protocol,sdk} from"
+            echo "::error::Travsr-com/travsr@master (checked out above at $TRAVSR_SHA)."
+            echo "::error::If this PR needs a travsr-side change, that change must be"
+            echo "::error::merged to travsr master FIRST. Unresolved-import errors here"
+            echo "::error::usually mean the paired travsr PR is still open."
+          else
+            echo "::error::Preflight failed to compile, and the errors do not look like"
+            echo "::error::travsr-sibling drift (compiled against travsr@master $TRAVSR_SHA)."
+            echo "::error::Treat this as a compile error in this repo's own code - see the"
+            echo "::error::'cargo check output' group above."
+          fi
           exit 1
 
       - name: fmt
@@ -87,33 +122,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
-        id: checkout_travsr
         with:
           repository: Travsr-com/travsr
           path: _travsr
           ref: master
       - name: Symlink travsr sibling for Cargo patch paths
-        run: ln -s "$GITHUB_WORKSPACE/_travsr" "$GITHUB_WORKSPACE/../travsr"
+        run: ln -sfn "$GITHUB_WORKSPACE/_travsr" "$GITHUB_WORKSPACE/../travsr"
       - uses: dtolnay/rust-toolchain@1.91
 
-      # L7: same preflight as the ci job above — see that job's comment.
-      - name: Preflight — compile against travsr master
-        id: preflight
-        continue-on-error: true
-        run: cargo check --all-targets --quiet
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-msrv-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-msrv-cargo-
 
-      - name: Explain a preflight failure
-        if: steps.preflight.outcome == 'failure'
-        env:
-          TRAVSR_SHA: ${{ steps.checkout_travsr.outputs.commit }}
-        run: |
-          echo "::error::This repo path-depends on travsr-plugin-{protocol,sdk} from"
-          echo "::error::Travsr-com/travsr@master (checked out above at $TRAVSR_SHA)."
-          echo "::error::If this PR needs a travsr-side change, that change must be"
-          echo "::error::merged to travsr master FIRST. Unresolved-import errors here"
-          echo "::error::usually mean the paired travsr PR is still open."
-          exit 1
-
+      # L7: `build (MSRV)` below surfaces the same unresolved-import error the
+      # ci job's preflight explains, so this job does not repeat the preflight -
+      # a second copy of the identical ::error:: block in the checks UI is noise,
+      # and on this (previously uncached) job it cost more than the build it
+      # duplicated. The ci job owns the diagnosis.
       - name: build (MSRV)
         run: cargo build --all-targets
 
@@ -139,7 +170,7 @@ jobs:
           ref: master
 
       - name: Symlink travsr sibling for Cargo patch paths
-        run: ln -s "$GITHUB_WORKSPACE/_travsr" "$GITHUB_WORKSPACE/../travsr"
+        run: ln -sfn "$GITHUB_WORKSPACE/_travsr" "$GITHUB_WORKSPACE/../travsr"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable

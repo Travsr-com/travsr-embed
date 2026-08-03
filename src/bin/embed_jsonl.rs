@@ -8,8 +8,9 @@
 // The `--mode` flag selects the model's asymmetric role. This matters: arctic and
 // E5-family models are trained with a query-side prefix and a bare document side,
 // and embedding a query without its prefix measurably degrades retrieval. Using the
-// same code path as the sidecar (`EncoderModel::embed_documents` / `embed_query`)
-// guarantees the prototype's vectors are byte-identical to production's.
+// same code path as the sidecar (`EmbedBackend::embed_documents` / `embed_query`
+// through the issue-#6 engine cascade) guarantees the prototype's vectors are
+// byte-identical to production's.
 //
 // Run:
 //   cargo run --release --bin embed-jsonl -- \
@@ -21,14 +22,20 @@ use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
 
-// The shared encoder module, included by path rather than through a lib
-// target (this crate is bin-only). This tool uses a subset of it, so the
+// The shared encoder + backend modules, included by path rather than through a
+// lib target (this crate is bin-only). This tool uses a subset of them, so the
 // rest is dead code *here* while being live in the sidecar binary.
+#[allow(dead_code)]
+#[path = "../backend/mod.rs"]
+mod backend;
+#[allow(dead_code)]
+#[path = "../encode.rs"]
+mod encode;
 #[allow(dead_code)]
 #[path = "../model.rs"]
 mod model;
 
-use model::{EncoderModel, ModelDescriptor};
+use model::ModelDescriptor;
 
 /// Texts per ONNX forward pass. Matches the sidecar's realistic batch size; the
 /// tokenizer right-pads to the batch-longest sequence, so mixing very short and
@@ -145,7 +152,7 @@ fn main() -> Result<()> {
         mode,
         desc.query_prefix
     );
-    let enc = EncoderModel::load(&model_dir, desc).context("loading encoder")?;
+    let enc = backend::create_backend(&model_dir, &desc).context("loading encoder")?;
 
     // Read all rows first so batches can be length-sorted (padding waste).
     let file = std::fs::File::open(&input).with_context(|| format!("open {}", input.display()))?;

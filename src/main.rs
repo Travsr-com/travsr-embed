@@ -32,8 +32,10 @@
 
 #![forbid(unsafe_code)]
 
+
 mod backend;
 mod encode;
+mod freshness;
 mod index;
 mod model;
 
@@ -46,7 +48,9 @@ use std::sync::{
 
 use anyhow::{Context as _, Result};
 use rusqlite::Connection;
-use travsr_plugin_protocol::{EmbedPlugin, EmbedRequest, EmbedResponse, KnnRequest, KnnResponse};
+use travsr_plugin_protocol::{
+    EmbedPlugin, EmbedRequest, EmbedResponse, KnnRequest, KnnResponse, Space,
+};
 use travsr_plugin_sdk::run_embed_plugin;
 
 /// Human-readable backend label shown in `travsr embed status` and sidecar logs.
@@ -67,6 +71,41 @@ const TOKEN_BUDGET: usize = 4_096;
 // Cheap: embed.db uses synchronous=OFF, so a commit is a WAL append, not an
 // fsync — the single fsync happens once at the end via wal_checkpoint(TRUNCATE).
 const TX_BATCH: usize = 500;
+/// Commit a partially-filled buffer once it is this old, independent of how many
+/// rows it holds (#376 O2 / G3).
+///
+/// `TX_BATCH` alone does not deliver the "near-real-time progress" the comment
+/// above promises: a pass with fewer than `TX_BATCH` items commits **nothing**
+/// until it finishes. The host's no-progress watchdog
+/// (`travsr_plugin_host::embed_catalog`, `NO_PROGRESS_SECS = 600`) watches
+/// exactly this row count, so such a pass looks stalled for its entire duration
+/// and is killed at 600 s with zero rows written — an error the user cannot
+/// action, on a pass that was making perfectly good progress.
+///
+/// Reachable rather than theoretical: doc chunks embed at roughly 2/s (plan
+/// §8.7), so 499 of them take ~250 s on an idle machine, but under
+/// `embed.priority = low`/`idle` or on loaded hardware the same pass crosses
+/// 600 s. #376 W2 made sub-`TX_BATCH` invalidation passes the *common* case.
+///
+/// 30 s leaves a 20x margin under the watchdog while costing one extra WAL
+/// append per 30 s of work, which is not measurable next to inference.
+const TX_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Whether a buffer holding `buffered` rows, last committed at `last_flush`,
+/// should be committed now (#376 O2).
+///
+/// Split out from the two write loops it governs so the property that actually
+/// matters can be asserted directly rather than inferred from a long-running
+/// integration run: **a non-empty buffer always becomes observable within
+/// `TX_FLUSH_INTERVAL`, whatever its size.** An empty buffer never flushes —
+/// committing nothing would reset the timer without moving the row count the
+/// watchdog reads, which is the bug wearing a different hat.
+fn should_flush(buffered: usize, last_flush: std::time::Instant) -> bool {
+    if buffered == 0 {
+        return false;
+    }
+    buffered >= TX_BATCH || last_flush.elapsed() >= TX_FLUSH_INTERVAL
+}
 
 /// Which nodes to embed in a reindex run.
 #[derive(Clone, Copy)]
@@ -83,17 +122,101 @@ enum Phase {
 
 // ── Plugin struct ─────────────────────────────────────────────────────────────
 
+/// #376 Phase 2: single-slot memo of the last query's embedding. The host
+/// issues one round trip per space (Space::Code, then Space::Docs) for the same
+/// `query_text` (§4.4's "one inference, two searches", achieved here instead of
+/// by fusing both spaces into one wire request — see `Space`'s doc comment in
+/// travsr-plugin-protocol). The memo is what makes that contract true, so its
+/// lifetime has to exceed the gap between the two round trips.
+struct QueryEmbedCache {
+    text: String,
+    blob: Vec<u8>,
+    at: std::time::Instant,
+}
+
+impl QueryEmbedCache {
+    /// Whether this entry may serve `query_text` at `age`.
+    ///
+    /// Split out from [`NomicPlugin::embed_query_cached`] so the TTL's effect is
+    /// testable without a loaded model. It is worth testing directly: the
+    /// k8s Gate 4 failure it fixes only reproduces when the machine is loaded
+    /// enough to put >5 s between the two lanes, so a green gate run is
+    /// consistent with the fix but does not prove it.
+    fn serves(&self, query_text: &str, age: std::time::Duration) -> bool {
+        self.text == query_text && age < QUERY_EMBED_CACHE_TTL
+    }
+}
+
+/// How long a memoized query embedding stays usable.
+///
+/// **Sized by the gap it must span, not by staleness risk.** The two round trips
+/// are not "milliseconds apart" as this was originally written for: the code
+/// lane runs a cross-encoder rerank between them, which is ~1 s on a small repo
+/// and multiple seconds on a large one. Measured on kubernetes (264 k nodes),
+/// the slowest queries put 6.1-7.1 s between the two calls, so the previous 5 s
+/// bound expired mid-query and the docs lane re-embedded the same text: 5 of 20
+/// queries did two inferences, failing the §7 Gate 4 contract on that repo while
+/// passing on travsr, where the same queries cost about a second. Scale, not
+/// correctness, is what moved.
+///
+/// There is no staleness for a longer bound to risk. The entry is keyed on exact
+/// query text, an embedding is a pure function of (text, model), and a sidecar
+/// process loads exactly one model for its lifetime — so a hit is always the
+/// vector this process would have recomputed. The TTL is kept only as a bound on
+/// how long one 3 KB blob may sit in memory, and is set an order of magnitude
+/// above the worst interval measured.
+const QUERY_EMBED_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// #376 Phase 2: set to a **file path** to record per-KNN memo hit/miss events.
+///
+/// The memo is what makes the plan's §4.4 "one inference, two searches"
+/// guarantee true after the wire protocol dropped `KnnRequest.spaces` fusion in
+/// favour of one round trip per space. Wall-clock latency cannot verify that
+/// guarantee: it is dominated by the cross-encoder passes downstream, so a
+/// silently-missing memo (a full 200-270ms re-embed against a 600ms circuit
+/// breaker) is invisible in a timing measurement. That is not hypothetical —
+/// the host sent the raw query on the docs lane and the normalized one on the
+/// code lane, so every punctuated query missed, undetected, until inference
+/// count was made observable. This makes it observable.
+///
+/// A file rather than stderr because the plugin host captures sidecar stderr
+/// into a bounded ring buffer for error surfacing (`StderrRing`,
+/// `travsr-plugin-host/src/embed_sidecar.rs`) — it never reaches the host
+/// process's own stderr, so a bench harness cannot read it there.
+///
+/// Off unless the variable is set, and then costs one `OnceLock` read per KNN.
+/// Consumed by `bench/run-phase2-gate.mjs`'s single-inference gate.
+const QUERY_CACHE_DEBUG_ENV: &str = "TRAVSR_EMBED_QUERY_CACHE_DEBUG";
+
+/// Resolved once — the sidecar is long-lived and the env cannot change under it.
+/// An empty value counts as unset so `FOO=` behaves like absence.
+fn query_cache_debug_path() -> Option<&'static Path> {
+    static PATH: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        std::env::var(QUERY_CACHE_DEBUG_ENV)
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .map(PathBuf::from)
+    })
+    .as_deref()
+}
+
 struct NomicPlugin {
     model: Arc<dyn backend::EmbedBackend>,
     model_id: String,
     backend: String,
-    /// HNSW index — None until first KNN call if not present at startup.
+    /// Code-space HNSW index — None until first KNN call if not present at startup.
     index: Mutex<Option<index::VecIndex>>,
     index_path: PathBuf,
+    /// #376 Phase 2: doc-space HNSW index, mirrors `index`/`index_path`. None
+    /// both before the first reindex and on every repo with no markdown.
+    doc_index: Mutex<Option<index::VecIndex>>,
+    doc_index_path: PathBuf,
     /// graph.db path — for FTS candidate lookup in lazy embed path.
     db_path: PathBuf,
     /// embed.db path — for NOT-EXISTS filter + async persist of lazy embeds.
     embed_db_path: PathBuf,
+    query_embed_cache: Mutex<Option<QueryEmbedCache>>,
 }
 
 impl NomicPlugin {
@@ -130,15 +253,82 @@ impl NomicPlugin {
             );
             None
         });
+        let doc_index_path = doc_index_path_for_db(&db_path, model_id);
+        let doc_index = index::VecIndex::try_load(&doc_index_path).unwrap_or_else(|e| {
+            tracing::debug!("no doc-space HNSW index yet: {e:#}");
+            None
+        });
         Ok(Self {
             model,
             model_id: model_id.to_owned(),
             backend: backend_label(model_id, dim),
             index: Mutex::new(index),
             index_path,
+            doc_index: Mutex::new(doc_index),
+            doc_index_path,
             db_path,
             embed_db_path,
+            query_embed_cache: Mutex::new(None),
         })
+    }
+
+    /// Embed `query_text`, reusing the single-slot memo when the immediately
+    /// preceding call embedded the same text within `QUERY_EMBED_CACHE_TTL`.
+    ///
+    /// `space` is used only for the [`QUERY_CACHE_DEBUG_ENV`] trace line; the
+    /// memo itself is space-agnostic on purpose, since sharing one query
+    /// embedding across both spaces is the entire point (§4.4).
+    fn embed_query_cached(&self, query_text: &str, space: Space) -> Result<Vec<u8>> {
+        if let Ok(guard) = self.query_embed_cache.lock() {
+            if let Some(entry) = guard.as_ref() {
+                if entry.serves(query_text, entry.at.elapsed()) {
+                    self.trace_query_cache(space, "hit", query_text);
+                    return Ok(entry.blob.clone());
+                }
+            }
+        }
+        self.trace_query_cache(space, "miss", query_text);
+        let blob = self.model.embed_query(query_text)?;
+        if let Ok(mut guard) = self.query_embed_cache.lock() {
+            *guard = Some(QueryEmbedCache {
+                text: query_text.to_string(),
+                blob: blob.clone(),
+                at: std::time::Instant::now(),
+            });
+        }
+        Ok(blob)
+    }
+
+    /// One tab-separated line per KNN when [`QUERY_CACHE_DEBUG_ENV`] is set.
+    /// A `miss` is one real query-embedding inference; the §4.4 contract is
+    /// exactly one `miss` per distinct query regardless of how many spaces are
+    /// searched. Tabs (not spaces) so a query containing spaces stays one
+    /// field, and the query goes last so a query containing a tab cannot shift
+    /// the fields the gate parses.
+    ///
+    /// Diagnostics only: every failure is swallowed, since a bench trace must
+    /// never be able to fail a real KNN. Opened in append mode per call rather
+    /// than held open — this path runs at most twice per query and a held
+    /// handle would outlive the harness's own truncation of the file.
+    fn trace_query_cache(&self, space: Space, outcome: &str, query_text: &str) {
+        let Some(path) = query_cache_debug_path() else {
+            return;
+        };
+        let space = match space {
+            Space::Code => "code",
+            Space::Docs => "docs",
+        };
+        // Single newline-terminated write; O_APPEND keeps concurrent sidecars
+        // from interleaving partial lines.
+        let line = format!("QUERY_EMBED_CACHE\t{space}\t{outcome}\t{query_text}\n");
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            use std::io::Write as _;
+            let _ = f.write_all(line.as_bytes());
+        }
     }
 }
 
@@ -156,6 +346,14 @@ impl EmbedPlugin for NomicPlugin {
     }
     fn backend(&self) -> &str {
         &self.backend
+    }
+    // #376 Phase 2: must be evaluated here, in travsr-embed's own source, not
+    // in the shared trait default or the SDK runner — env! expands against the
+    // lexically containing crate's Cargo.toml, so only this crate's own
+    // CARGO_PKG_VERSION reports travsr-embed's real release version (see
+    // EmbedPlugin::plugin_version's doc comment for the bug this avoids).
+    fn plugin_version(&self) -> &str {
+        env!("CARGO_PKG_VERSION")
     }
     fn max_batch(&self) -> u32 {
         MAX_BATCH as u32
@@ -190,8 +388,50 @@ impl EmbedPlugin for NomicPlugin {
 }
 
 impl NomicPlugin {
+    /// #376 Phase 2: dispatch on which index this request searches.
     fn knn_impl(&self, req: &KnnRequest) -> Result<(Vec<i64>, Vec<f32>)> {
-        let query_blob = self.model.embed_query(&req.query_text)?;
+        match req.space {
+            Space::Code => self.knn_impl_code(req),
+            Space::Docs => self.knn_impl_docs(req),
+        }
+    }
+
+    /// #376 Phase 2: doc-space KNN. No lazy-embed fallback (plan §4.4: "Never
+    /// lazy-embed the doc space") — a doc corpus is 2-4 orders of magnitude
+    /// smaller than the code corpus (§8.7), so `knn_raw.len() < req.k` is the
+    /// routine case here, not the rare one the code path's gate protects
+    /// against; running the ~15s FTS wedge (`fts_candidates_unembedded`) on
+    /// nearly every doc query would reintroduce the exact daemon stall #391
+    /// fixed on the code path.
+    fn knn_impl_docs(&self, req: &KnnRequest) -> Result<(Vec<i64>, Vec<f32>)> {
+        let query_blob = self.embed_query_cached(&req.query_text, Space::Docs)?;
+        let mut guard = self
+            .doc_index
+            .lock()
+            .map_err(|_| anyhow::anyhow!("doc index mutex poisoned"))?;
+
+        if guard.is_none() && self.doc_index_path.exists() {
+            *guard = index::VecIndex::try_load(&self.doc_index_path)?;
+        }
+
+        let raw: Vec<(i64, f32)> = match guard.as_mut() {
+            None => {
+                tracing::debug!("no doc-space HNSW index — run `travsr embed reindex`");
+                vec![]
+            }
+            Some(idx) => idx.knn(&query_blob, req.k)?,
+        };
+
+        let ids = raw.iter().map(|(id, _)| *id).collect();
+        let scores = raw
+            .iter()
+            .map(|(_, dist)| (1.0 - dist).clamp(0.0, 1.0))
+            .collect();
+        Ok((ids, scores))
+    }
+
+    fn knn_impl_code(&self, req: &KnnRequest) -> Result<(Vec<i64>, Vec<f32>)> {
+        let query_blob = self.embed_query_cached(&req.query_text, Space::Code)?;
         let query_vec = model::blob_to_f32(&query_blob);
 
         // ── KNN against HNSW (Phase 1 nodes) ─────────────────────────────
@@ -321,8 +561,13 @@ impl NomicPlugin {
         // is not blocked by SQLite I/O. INSERT OR IGNORE is safe under races.
         let edb = self.embed_db_path.clone();
         let mid = self.model_id.clone();
-        let pairs: Vec<(i64, Vec<u8>)> =
-            candidates.iter().map(|(nid, _)| *nid).zip(blobs).collect();
+        // #376 W3: carry the content hash of the exact text embedded, so a
+        // lazily-embedded vector is verifiable like any other.
+        let pairs: Vec<(i64, Vec<u8>, String)> = candidates
+            .iter()
+            .zip(blobs)
+            .map(|((nid, text), blob)| (*nid, blob, crate::freshness::text_hash(text)))
+            .collect();
         std::thread::Builder::new()
             .name("lazy-embed-persist".into())
             .spawn(move || {
@@ -440,7 +685,7 @@ impl NomicPlugin {
 /// embedding. Called from a background thread — all errors are non-fatal.
 fn persist_lazy_embeddings(
     embed_db_path: &Path,
-    pairs: &[(i64, Vec<u8>)],
+    pairs: &[(i64, Vec<u8>, String)],
     model_id: &str,
 ) -> Result<()> {
     let conn = Connection::open(embed_db_path).context("lazy persist: open embed.db")?;
@@ -450,15 +695,16 @@ fn persist_lazy_embeddings(
          PRAGMA busy_timeout = 30000;",
     )
     .context("lazy persist: configure embed.db")?;
+    crate::freshness::ensure_schema(&conn, "").context("lazy persist: ensure schema")?;
     conn.execute("BEGIN", []).context("lazy persist: begin")?;
     let mut ins = conn
         .prepare(
-            "INSERT OR IGNORE INTO node_embeddings (node_id, model_id, embedding) \
-             VALUES (?1, ?2, ?3)",
+            "INSERT OR IGNORE INTO node_embeddings (node_id, model_id, embedding, text_hash) \
+             VALUES (?1, ?2, ?3, ?4)",
         )
         .context("lazy persist: prepare insert")?;
-    for (nid, blob) in pairs {
-        ins.execute(rusqlite::params![nid, model_id, blob])
+    for (nid, blob, hash) in pairs {
+        ins.execute(rusqlite::params![nid, model_id, blob, hash])
             .context("lazy persist: insert")?;
     }
     conn.execute("COMMIT", []).context("lazy persist: commit")?;
@@ -670,34 +916,19 @@ fn reindex(
     ))
     .context("attach and configure embed.db")?;
 
-    // Create schema in embed.db on first run (idempotent).
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS edb.node_embeddings (
-             node_id   INTEGER NOT NULL,
-             model_id  TEXT    NOT NULL,
-             embedding BLOB    NOT NULL,
-             PRIMARY KEY (node_id, model_id)
-         ) WITHOUT ROWID;
-         CREATE INDEX IF NOT EXISTS edb.idx_node_embeddings_model
-             ON node_embeddings(model_id);",
-    )
-    .context("create embed.db schema")?;
+    // Create schema in embed.db on first run, and migrate in `text_hash` on an
+    // index built before #376 W3 (idempotent).
+    crate::freshness::ensure_schema(&conn, "edb.")?;
 
-    // CDC: apply pending tombstones atomically — delete from embed.db, ack in graph.db.
-    let tombstone_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM node_tombstones", [], |r| r.get(0))
-        .unwrap_or(0);
-    if tombstone_count > 0 {
-        conn.execute_batch(
-            "BEGIN;
-             DELETE FROM edb.node_embeddings
-                 WHERE node_id IN (SELECT node_id FROM node_tombstones);
-             DELETE FROM node_tombstones;
-             COMMIT;",
-        )
-        .context("applying CDC tombstones")?;
-        tracing::info!(tombstone_count, "applied CDC tombstones to embed.db");
-    }
+    // #376 W3: content-hash invalidation replaces the blanket
+    // "tombstone ⇒ delete the vector" rule. Workers skip it — the orchestrator's
+    // main-thread pass owns invalidation for the whole run.
+    let invalidation = if worker_mode {
+        crate::freshness::InvalidationReport::default()
+    } else {
+        crate::freshness::apply_invalidation(&conn, true, true)
+            .context("applying content-hash invalidation")?
+    };
 
     let phase_clause = match phase {
         Phase::All => String::new(),
@@ -773,6 +1004,16 @@ fn reindex(
             println!("  {worker_label}: no pending nodes.");
             return Ok(());
         }
+        // #376 W2: a pass that only *removed* vectors (a deleted file, an edited
+        // chunk whose re-embed is not this phase's job) still has to rebuild the
+        // HNSW — otherwise the deleted vector stays live in the index file and
+        // keeps being returned by KNN, which is how a deleted doc outlives its
+        // file. Checked before the phase/short-circuit returns below.
+        if invalidation.removed_any() {
+            println!("  Invalidation removed vectors — rebuilding HNSW index...");
+            rebuild_index(db_path, embed_db_path, model_id)?;
+            return Ok(());
+        }
         if matches!(phase, Phase::Phase2(_)) {
             println!("Phase 2 complete — no pending symbol nodes.");
             return Ok(());
@@ -790,17 +1031,11 @@ fn reindex(
             )
             .unwrap_or(0);
         println!("All nodes already embedded ({existing} rows). Building missing HNSW index...");
-        index::VecIndex::build_from_db(
-            db_path,
-            embed_db_path,
-            model_id,
-            &index_path,
-            existing,
-            dim,
-        )
-        .context("build_from_db")?;
-        write_current_embed_model_meta(&conn, model_id)?;
-        println!("Done — index saved to {}.", index_path.display());
+        // #376 Phase 2: rebuild_index() builds both the code index (missing here)
+        // and, when any exist, the doc-space index — a plain build_from_db call
+        // would silently skip doc-chunk vectors. It opens its own connection to
+        // db_path; SQLite's WAL mode allows this alongside the still-live `conn`.
+        rebuild_index(db_path, embed_db_path, model_id)?;
         return Ok(());
     }
 
@@ -827,6 +1062,7 @@ fn reindex(
                     &index_path,
                     existing,
                     dim,
+                    crate::index::CODE_SPACE_ELIGIBLE,
                 )
                 .context("rebuild HNSW from existing embeddings before adding pending")?;
                 index::VecIndex::try_load(&index_path)
@@ -870,22 +1106,27 @@ fn reindex(
     }
 
     // INSERT into edb.node_embeddings — never touches graph.db WAL.
+    // #376 W3: `text_hash` records the exact text this vector was built from, so
+    // a later pass can tell "re-indexed" from "actually changed".
     let mut ins = conn.prepare(
-        "INSERT OR REPLACE INTO edb.node_embeddings (node_id, model_id, embedding) \
-         VALUES (?1, ?2, ?3)",
+        "INSERT OR REPLACE INTO edb.node_embeddings (node_id, model_id, embedding, text_hash) \
+         VALUES (?1, ?2, ?3, ?4)",
     )?;
 
-    let mut tx_buffer: Vec<(i64, Vec<u8>)> = Vec::with_capacity(TX_BATCH + 512);
+    let mut tx_buffer: Vec<(i64, Vec<u8>, String)> = Vec::with_capacity(TX_BATCH + 512);
     let mut inserted = 0usize;
+    // #376 O2: see TX_FLUSH_INTERVAL — the row count this drives is what the
+    // host's no-progress watchdog observes.
+    let mut last_flush = std::time::Instant::now();
 
-    let flush_buffer = |tx_buffer: &Vec<(i64, Vec<u8>)>,
+    let flush_buffer = |tx_buffer: &Vec<(i64, Vec<u8>, String)>,
                         conn: &rusqlite::Connection,
                         ins: &mut rusqlite::Statement<'_>,
                         idx: &Option<index::VecIndex>|
      -> Result<()> {
         conn.execute("BEGIN", [])?;
-        for (node_id, blob) in tx_buffer {
-            ins.execute(rusqlite::params![node_id, model_id, blob])?;
+        for (node_id, blob, hash) in tx_buffer {
+            ins.execute(rusqlite::params![node_id, model_id, blob, hash])?;
             if let Some(ref idx_inner) = idx {
                 let vec = model::blob_to_f32(blob);
                 idx_inner.add(*node_id, &vec)?;
@@ -901,17 +1142,18 @@ fn reindex(
 
         let blobs = model.embed_documents(&text_refs)?;
 
-        for ((node_id, _), blob) in chunk.iter().zip(blobs.iter()) {
-            tx_buffer.push((*node_id, blob.clone()));
+        for ((node_id, text), blob) in chunk.iter().zip(blobs.iter()) {
+            tx_buffer.push((*node_id, blob.clone(), crate::freshness::text_hash(text)));
         }
 
-        if tx_buffer.len() >= TX_BATCH {
+        if should_flush(tx_buffer.len(), last_flush) {
             flush_buffer(&tx_buffer, &conn, &mut ins, &idx)?;
             inserted += tx_buffer.len();
             if inserted % 1_000 < tx_buffer.len() || inserted >= total {
                 println!("  embedded {inserted}/{total}");
             }
             tx_buffer.clear();
+            last_flush = std::time::Instant::now();
         }
     }
 
@@ -988,9 +1230,11 @@ fn reindex_parallel(
         parallel
     );
 
-    // ── Step 1: CDC tombstones (main thread, needs write access to both dbs) ──
-    {
-        let conn = Connection::open(db_path).context("open graph.db for tombstones")?;
+    // ── Step 1: invalidation (main thread, needs write access to both dbs) ────
+    // #376 W3: content-hash verification, not a blanket tombstone delete. See
+    // `freshness` for why the two spaces are verified differently.
+    let invalidation = {
+        let conn = Connection::open(db_path).context("open graph.db for invalidation")?;
         let embed_str = embed_db_path
             .to_str()
             .context("embed.db path is not valid UTF-8")?;
@@ -1000,33 +1244,11 @@ fn reindex_parallel(
              ATTACH DATABASE '{escaped}' AS edb;
              PRAGMA edb.journal_mode = WAL;"
         ))
-        .context("configure connections for tombstone pass")?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS edb.node_embeddings (
-                 node_id   INTEGER NOT NULL,
-                 model_id  TEXT    NOT NULL,
-                 embedding BLOB    NOT NULL,
-                 PRIMARY KEY (node_id, model_id)
-             ) WITHOUT ROWID;
-             CREATE INDEX IF NOT EXISTS edb.idx_node_embeddings_model
-                 ON node_embeddings(model_id);",
-        )
-        .context("create embed.db schema")?;
-        let tombstone_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM node_tombstones", [], |r| r.get(0))
-            .unwrap_or(0);
-        if tombstone_count > 0 {
-            conn.execute_batch(
-                "BEGIN;
-                 DELETE FROM edb.node_embeddings
-                     WHERE node_id IN (SELECT node_id FROM node_tombstones);
-                 DELETE FROM node_tombstones;
-                 COMMIT;",
-            )
-            .context("applying CDC tombstones")?;
-            tracing::info!(tombstone_count, "applied CDC tombstones to embed.db");
-        }
-    }
+        .context("configure connections for invalidation pass")?;
+        crate::freshness::ensure_schema(&conn, "edb.")?;
+        crate::freshness::apply_invalidation(&conn, true, true)
+            .context("applying content-hash invalidation")?
+    };
 
     // ── Step 2: materialise ALL pending (id, text) pairs on the main thread ──
     // One read pass with NOT EXISTS applied here — workers receive their chunk
@@ -1097,6 +1319,14 @@ fn reindex_parallel(
 
     let total = all_pending.len();
     if total == 0 {
+        // #376 W2: nothing to embed, but if invalidation removed vectors the
+        // live HNSW still contains them. Deletions must reach the index even
+        // when no inference is needed.
+        if invalidation.removed_any() {
+            println!("  Invalidation removed vectors — rebuilding HNSW index...");
+            rebuild_index(db_path, embed_db_path, model_id)?;
+            return Ok(());
+        }
         println!("All nodes already embedded — nothing to do.");
         return Ok(());
     }
@@ -1204,27 +1434,19 @@ fn reindex_parallel(
                              PRAGMA busy_timeout = {busy_timeout_ms};"
                         ))
                         .context("worker: configure embed.db")?;
-                    wconn
-                        .execute_batch(
-                            "CREATE TABLE IF NOT EXISTS node_embeddings (
-                                 node_id   INTEGER NOT NULL,
-                                 model_id  TEXT    NOT NULL,
-                                 embedding BLOB    NOT NULL,
-                                 PRIMARY KEY (node_id, model_id)
-                             ) WITHOUT ROWID;
-                             CREATE INDEX IF NOT EXISTS idx_node_embeddings_model
-                                 ON node_embeddings(model_id);",
-                        )
-                        .context("worker: ensure schema")?;
+                    crate::freshness::ensure_schema(&wconn, "").context("worker: ensure schema")?;
                     let mut ins = wconn
                         .prepare(
                             "INSERT OR REPLACE INTO node_embeddings \
-                             (node_id, model_id, embedding) VALUES (?1, ?2, ?3)",
+                             (node_id, model_id, embedding, text_hash) VALUES (?1, ?2, ?3, ?4)",
                         )
                         .context("worker: prepare insert")?;
 
-                    let mut tx_buf: Vec<(i64, Vec<u8>)> = Vec::with_capacity(TX_BATCH + 512);
+                    let mut tx_buf: Vec<(i64, Vec<u8>, String)> =
+                        Vec::with_capacity(TX_BATCH + 512);
                     let mut inserted = 0usize;
+                    // #376 O2: see TX_FLUSH_INTERVAL.
+                    let mut last_flush = std::time::Instant::now();
 
                     // ── consumer loop: claim batches until the queue is empty ─
                     loop {
@@ -1236,25 +1458,26 @@ fn reindex_parallel(
                         let batch = &items_w[range];
                         let texts: Vec<&str> = batch.iter().map(|(_, t)| t.as_str()).collect();
                         let blobs = model_w.embed_documents(&texts).context("worker: embed")?;
-                        for ((nid, _), blob) in batch.iter().zip(blobs.iter()) {
-                            tx_buf.push((*nid, blob.clone()));
+                        for ((nid, text), blob) in batch.iter().zip(blobs.iter()) {
+                            tx_buf.push((*nid, blob.clone(), crate::freshness::text_hash(text)));
                         }
-                        if tx_buf.len() >= TX_BATCH {
+                        if should_flush(tx_buf.len(), last_flush) {
                             wconn.execute("BEGIN", []).context("worker: begin")?;
-                            for (nid, blob) in &tx_buf {
-                                ins.execute(rusqlite::params![nid, mid_w.as_str(), blob])
+                            for (nid, blob, hash) in &tx_buf {
+                                ins.execute(rusqlite::params![nid, mid_w.as_str(), blob, hash])
                                     .context("worker: insert")?;
                             }
                             wconn.execute("COMMIT", []).context("worker: commit")?;
                             inserted += tx_buf.len();
                             tx_buf.clear();
+                            last_flush = std::time::Instant::now();
                         }
                     }
 
                     if !tx_buf.is_empty() {
                         wconn.execute("BEGIN", []).context("worker: begin final")?;
-                        for (nid, blob) in &tx_buf {
-                            ins.execute(rusqlite::params![nid, mid_w.as_str(), blob])
+                        for (nid, blob, hash) in &tx_buf {
+                            ins.execute(rusqlite::params![nid, mid_w.as_str(), blob, hash])
                                 .context("worker: insert final")?;
                         }
                         wconn
@@ -1382,30 +1605,92 @@ fn rebuild_index(db_path: &Path, embed_db_path: &Path, model_id: &str) -> Result
     conn.execute_batch(&format!("ATTACH DATABASE '{embed_db_str}' AS edb"))
         .context("attach embed.db")?;
 
-    let existing: usize = conn
+    // #376 W2: this is the one path that writes an HNSW file without embedding
+    // anything, and before W2 it was also the one path that could publish an
+    // index built from vectors already known to be stale. Verify first. `ack`
+    // is false on purpose: this path can *remove* a stale vector but cannot
+    // re-embed it, so the tombstone must survive for the next real pass.
+    match crate::freshness::apply_invalidation(&conn, false, true) {
+        Ok(r) if r.removed_any() => {
+            tracing::info!(
+                stale = r.stale,
+                orphaned = r.orphaned,
+                doc_stale = r.doc_stale,
+                "rebuild-index: dropped stale vectors before building"
+            );
+        }
+        Ok(_) => {}
+        // A rebuild on a db with no tombstone table (or a read-only graph.db)
+        // must still produce an index — freshness is best-effort here.
+        Err(e) => tracing::warn!("rebuild-index: invalidation skipped (non-fatal): {e:#}"),
+    }
+
+    // #376 Phase 2: code and doc spaces are counted and built independently —
+    // CODE_SPACE_ELIGIBLE and DOC_SPACE_ELIGIBLE partition the corpus, and a
+    // repo may legitimately have embeddings in only one (no markdown, or
+    // `docs.enabled` never turned on at index time).
+    let code_existing: usize = conn
         .query_row(
-            // #391: same eligibility predicate as the index build (NODE_ELIGIBLE).
             &format!(
                 "SELECT COUNT(*) FROM edb.node_embeddings e \
                  JOIN nodes n ON n.id = e.node_id \
                  WHERE e.model_id = ?1 AND {}",
-                crate::index::NODE_ELIGIBLE
+                crate::index::CODE_SPACE_ELIGIBLE
             ),
             [model_id],
             |r| r.get(0),
         )
-        .context("counting existing meaningful embeddings")?;
+        .context("counting existing code embeddings")?;
+    let doc_existing: usize = conn
+        .query_row(
+            &format!(
+                "SELECT COUNT(*) FROM edb.node_embeddings e \
+                 JOIN nodes n ON n.id = e.node_id \
+                 WHERE e.model_id = ?1 AND {}",
+                crate::index::DOC_SPACE_ELIGIBLE
+            ),
+            [model_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
     anyhow::ensure!(
-        existing > 0,
+        code_existing > 0 || doc_existing > 0,
         "no embeddings in embed.db — run `travsr embed reindex` first"
     );
-    let index_path = index_path_for_db(db_path, model_id);
-    println!("Building HNSW index from {existing} embeddings...");
-    index::VecIndex::build_from_db(db_path, embed_db_path, model_id, &index_path, existing, dim)
-        .context("build_from_db")?;
+
+    if code_existing > 0 {
+        let index_path = index_path_for_db(db_path, model_id);
+        println!("Building code HNSW index from {code_existing} embeddings...");
+        index::VecIndex::build_from_db(
+            db_path,
+            embed_db_path,
+            model_id,
+            &index_path,
+            code_existing,
+            dim,
+            crate::index::CODE_SPACE_ELIGIBLE,
+        )
+        .context("build_from_db (code space)")?;
+        println!("Done — code index saved to {}.", index_path.display());
+    }
+    if doc_existing > 0 {
+        let doc_index_path = doc_index_path_for_db(db_path, model_id);
+        println!("Building doc-space HNSW index from {doc_existing} embeddings...");
+        index::VecIndex::build_from_db(
+            db_path,
+            embed_db_path,
+            model_id,
+            &doc_index_path,
+            doc_existing,
+            dim,
+            crate::index::DOC_SPACE_ELIGIBLE,
+        )
+        .context("build_from_db (doc space)")?;
+        println!("Done — doc index saved to {}.", doc_index_path.display());
+    }
+
     write_current_embed_model_meta(&conn, model_id)?;
-    println!("Done — index saved to {}.", index_path.display());
-    tracing::info!(existing, "HNSW index rebuilt");
+    tracing::info!(code_existing, doc_existing, "HNSW index rebuilt");
     Ok(())
 }
 
@@ -1733,6 +2018,16 @@ fn index_path_for_db(db_path: &Path, model_id: &str) -> PathBuf {
     dir.join(format!("{model_id}.hnsw.usearch"))
 }
 
+/// #376 Phase 2: per-repo doc-space HNSW index path, co-located with graph.db,
+/// keyed by model_id like [`index_path_for_db`]. Named `-docs.hnsw.usearch`
+/// rather than the plan's flat `hnsw-docs.usearch` so it stays keyed per
+/// model_id the same way the code index is — a flat name would collide or go
+/// stale across a model switch.
+fn doc_index_path_for_db(db_path: &Path, model_id: &str) -> PathBuf {
+    let dir = db_path.parent().unwrap_or(db_path);
+    dir.join(format!("{model_id}-docs.hnsw.usearch"))
+}
+
 fn model_dir(model_id: &str) -> Result<PathBuf> {
     let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("HOME not set"))?;
     let dir = home.join(".travsr").join("models").join(model_id);
@@ -1742,4 +2037,115 @@ fn model_dir(model_id: &str) -> Result<PathBuf> {
         dir.display()
     );
     Ok(dir)
+}
+
+#[cfg(test)]
+mod flush_policy_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// The pre-#376-O2 behaviour, stated as a test so a revert is loud: a
+    /// sub-`TX_BATCH` buffer that has just been committed does not flush again
+    /// on size alone. This is the condition that used to hold for a whole pass.
+    #[test]
+    fn small_buffer_does_not_flush_on_size() {
+        assert!(!should_flush(TX_BATCH - 1, Instant::now()));
+        assert!(!should_flush(1, Instant::now()));
+    }
+
+    /// A full buffer flushes immediately regardless of age — the original
+    /// trigger, unchanged.
+    #[test]
+    fn full_buffer_flushes_on_size() {
+        assert!(should_flush(TX_BATCH, Instant::now()));
+        assert!(should_flush(TX_BATCH + 1, Instant::now()));
+    }
+
+    /// The actual fix, and the property the host's no-progress watchdog depends
+    /// on: **any** non-empty buffer becomes observable once it is
+    /// `TX_FLUSH_INTERVAL` old. Asserted at an age past the interval rather
+    /// than by sleeping, so the test is instant and deterministic.
+    #[test]
+    fn any_nonempty_buffer_flushes_once_it_is_old_enough() {
+        let old = Instant::now() - (TX_FLUSH_INTERVAL + Duration::from_secs(1));
+        assert!(should_flush(1, old), "a single buffered row must commit");
+        assert!(should_flush(TX_BATCH - 1, old));
+    }
+
+    /// The margin under the watchdog is what makes the fix sufficient, not just
+    /// directionally right: `NO_PROGRESS_SECS` is 600 in
+    /// `travsr_plugin_host::embed_catalog`, so the interval must leave room for
+    /// several flushes inside one watchdog window. Guards against someone
+    /// raising `TX_FLUSH_INTERVAL` to a value that reintroduces the kill.
+    #[test]
+    fn flush_interval_leaves_margin_under_the_host_watchdog() {
+        const HOST_NO_PROGRESS_SECS: u64 = 600;
+        assert!(
+            TX_FLUSH_INTERVAL.as_secs() * 4 <= HOST_NO_PROGRESS_SECS,
+            "TX_FLUSH_INTERVAL ({}s) must stay well under the host's \
+             NO_PROGRESS_SECS ({HOST_NO_PROGRESS_SECS}s)",
+            TX_FLUSH_INTERVAL.as_secs()
+        );
+    }
+
+    /// An empty buffer must never flush: an empty commit resets the flush timer
+    /// without moving the row count the watchdog reads, which would recreate the
+    /// original failure with extra steps.
+    #[test]
+    fn empty_buffer_never_flushes() {
+        let old = Instant::now() - (TX_FLUSH_INTERVAL + Duration::from_secs(60));
+        assert!(!should_flush(0, old));
+        assert!(!should_flush(0, Instant::now()));
+    }
+}
+
+#[cfg(test)]
+mod query_memo_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn entry(text: &str) -> QueryEmbedCache {
+        QueryEmbedCache {
+            text: text.to_string(),
+            blob: vec![0u8; 4],
+            at: std::time::Instant::now(),
+        }
+    }
+
+    /// The regression guard for the k8s Gate 4 failure (#376 §7 gate 4).
+    ///
+    /// The two KNN round trips for one query are separated by the code lane's
+    /// cross-encoder rerank. On kubernetes that gap was measured at 6.1-7.1 s,
+    /// so the old 5 s TTL expired mid-query and the docs lane re-embedded the
+    /// same text — two inferences where the contract allows one. This asserts
+    /// the memo now spans a gap the old bound could not.
+    #[test]
+    fn memo_spans_a_gap_that_the_old_five_second_ttl_could_not() {
+        let e = entry("why does the apiserver use a watch cache");
+        assert!(
+            e.serves(
+                "why does the apiserver use a watch cache",
+                Duration::from_secs(7)
+            ),
+            "a 7s gap (measured on kubernetes) must still hit the memo"
+        );
+    }
+
+    #[test]
+    fn memo_expires_eventually() {
+        let e = entry("q");
+        assert!(e.serves("q", Duration::from_secs(59)));
+        assert!(!e.serves("q", QUERY_EMBED_CACHE_TTL));
+        assert!(!e.serves("q", Duration::from_secs(3600)));
+    }
+
+    /// Keyed on exact text: the memo exists to share ONE query's embedding
+    /// across both spaces, never to answer a different query.
+    #[test]
+    fn memo_never_serves_a_different_query() {
+        let e = entry("watch cache");
+        assert!(!e.serves("watch  cache", Duration::from_millis(1)));
+        assert!(!e.serves("Watch cache", Duration::from_millis(1)));
+        assert!(!e.serves("", Duration::from_millis(1)));
+    }
 }

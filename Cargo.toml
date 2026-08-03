@@ -1,6 +1,6 @@
 [package]
 name = "travsr-embed"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 description = "Travsr embed sidecar — BGE family ONNX fp32, runtime model selection via --model-id"
 license = "Apache-2.0"
@@ -13,6 +13,12 @@ path = "src/main.rs"
 [[bin]]
 name = "bench-tract"
 path = "src/bin/bench_tract.rs"
+
+# Offline text-to-vector tool for retrieval prototyping (#376). Reads/writes JSONL,
+# touches no database or index.
+[[bin]]
+name = "embed-jsonl"
+path = "src/bin/embed_jsonl.rs"
 
 [dependencies]
 # Published crates.io versions — patched below to local path while RFC-018

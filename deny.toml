@@ -1,0 +1,67 @@
+# cargo-deny configuration — cargo-deny 0.16+ schema
+#
+# #376 O12 (§13 item 6): this repo had no deny.toml at all, so `cargo deny check`
+# fell back to the built-in defaults, which allow no licenses whatsoever. Every
+# MIT and Apache-2.0 dependency in the tree was reported as "not explicitly
+# allowed" — a missing-config failure that read like a license problem and made
+# the real signal (the advisory list below) impossible to see.
+#
+# The [licenses] allow list below is deliberately kept identical to the travsr
+# repo's: the two ship as a pair, and a dependency judged acceptable in one must
+# not be rejected by the other.
+#
+# The advisory ignores are per-tree and cannot converge: this repo pins
+# tract-onnx 0.23 while travsr's tree resolves tract-linalg 0.21.x, so the two
+# are exposed to different advisories by construction. travsr ignores
+# RUSTSEC-2026-0173 and RUSTSEC-2026-0009; neither is reachable here. Read a
+# difference in this list as expected, not as drift.
+
+[advisories]
+version = 2
+ignore = [
+    # paste is unmaintained/archived by its author (RUSTSEC-2024-0436). Pure
+    # compile-time token-pasting proc-macro, zero generated runtime logic beyond
+    # macro expansion. Pulled in transitively by tract-core/tract-linalg and by
+    # tokenizers (via macro_rules_attribute). No safe upgrade available.
+    # Same judgement, same wording, as the travsr repo's entry.
+    { id = "RUSTSEC-2024-0436", reason = "compile-time proc-macro only, no runtime exposure" },
+]
+# Deliberately NOT ignored, because both had a real fix available and taking it
+# is strictly better than documenting why the bug does not bite us:
+#   • RUSTSEC-2026-0190 (anyhow `Error::downcast_mut` unsoundness) -> anyhow 1.0.104
+#   • RUSTSEC-2026-0204 (crossbeam-epoch `fmt::Pointer` null deref) -> 0.9.20
+# travsr took the same upgrades and likewise carries no ignore for either.
+#
+# RUSTSEC-2026-0217 (tract-nnef) does not appear in this tree either, so no
+# ignore is carried — an unmatched ignore is itself a cargo-deny warning.
+
+[licenses]
+# Anything not in this allow list is denied. Verified to cover every SPDX
+# expression in this tree: each OR expression offers at least one allowed
+# alternative, and the single AND expression ("(MIT OR Apache-2.0) AND
+# Unicode-3.0") has both halves allowed.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "OpenSSL",
+    "Zlib",
+    "CC0-1.0",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+    "MPL-2.0",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+deny = []
+
+[sources]
+unknown-registry = "warn"
+unknown-git = "warn"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

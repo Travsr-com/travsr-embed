@@ -146,6 +146,11 @@ impl EmbedPlugin for NomicPlugin {
     fn model_id(&self) -> &str {
         &self.model_id
     }
+    // Must be this binary's own version, not the protocol crate's — the daemon
+    // gates capabilities (e.g. supports_doc_space) on the running sidecar.
+    fn plugin_version(&self) -> &str {
+        env!("CARGO_PKG_VERSION")
+    }
     fn embedding_dim(&self) -> u32 {
         self.model.dim() as u32
     }

@@ -56,6 +56,22 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }
 toml  = "0.8"
 
+# OnnxRuntime — universal ONNX engine (issue #6). Optional: the default build
+# compiles zero ORT code and registers only the tract factory. `download-binaries`
+# (an ort default feature) fetches the per-target ONNX Runtime library at build
+# time; CUDA/TensorRT additionally need the host CUDA 12 runtime + cuDNN.
+ort = { version = "=2.0.0-rc.12", optional = true }
+
+[features]
+default = []                                          # tract only — byte-identical to today
+# ORT with CPU execution only — the universal fallback engine for model
+# families tract cannot run (ModernBERT, nomic-bert, …).
+ort = ["dep:ort"]
+# Hardware-accelerated execution providers (each implies the ORT CPU engine).
+ort-coreml   = ["ort", "ort/coreml"]                  # macOS ANE+GPU, zero-install
+ort-cuda     = ["ort", "ort/cuda"]                    # Linux/Win x86_64, needs CUDA 12 + cuDNN
+ort-tensorrt = ["ort", "ort/tensorrt", "ort/cuda"]    # Linux/Win x86_64, needs TensorRT
+
 # ── Local development override ────────────────────────────────────────────────
 [patch.crates-io]
 travsr-plugin-protocol = { path = "../travsr/crates/travsr-plugin-protocol" }

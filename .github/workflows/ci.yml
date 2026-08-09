@@ -125,10 +125,12 @@ jobs:
     name: Windows build (x86_64-pc-windows-msvc)
     runs-on: windows-latest
     env:
-      # Mirrors release.yml: skip the one AVX512-FP16 simsimd kernel. cl.exe
-      # accepts the -D spelling.
-      CFLAGS: "-DSIMSIMD_TARGET_SAPPHIRE=0"
-      CXXFLAGS: "-DSIMSIMD_TARGET_SAPPHIRE=0"
+      # Mirrors release.yml (including its Windows-only extra_defs): skip the
+      # one AVX512-FP16 simsimd kernel, and define the POSIX MAP_FAILED that
+      # usearch 2.24.0 references in an unguarded template body — see the
+      # release.yml matrix comment. cl.exe accepts the -D spelling.
+      CFLAGS: "-DSIMSIMD_TARGET_SAPPHIRE=0 -DMAP_FAILED=((void*)-1)"
+      CXXFLAGS: "-DSIMSIMD_TARGET_SAPPHIRE=0 -DMAP_FAILED=((void*)-1)"
     steps:
       - uses: actions/checkout@v4
 

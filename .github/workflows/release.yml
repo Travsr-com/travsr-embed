@@ -34,8 +34,18 @@ jobs:
           # Issue #12: the travsr CLI maps windows/x86_64 to this triple and
           # requests `<binary>-<target>.exe`; without this entry `travsr embed
           # init` 404s on Windows.
+          #
+          # extra_defs: usearch 2.24.0 references the POSIX MAP_FAILED in an
+          # unguarded template body (index_plugins.hpp:962, fixed upstream
+          # after 2.24.0; 2.25+ is blocked by the gcc-12 pin above), and the
+          # usearch build script passes /permissive- so MSVC rejects it.
+          # Supply the POSIX value: the Windows allocation paths return
+          # VirtualAlloc/NULL, never -1, so the comparison is inert. Windows-
+          # only — on unix sys/mman.h already defines it and a command-line
+          # copy would be a redefinition.
           - target: x86_64-pc-windows-msvc
             os: windows-latest
+            extra_defs: "-DMAP_FAILED=((void*)-1)"
 
     steps:
       - uses: actions/checkout@v4
@@ -62,7 +72,10 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        shell: bash
+        run: |
+          export CFLAGS="$CFLAGS ${{ matrix.extra_defs }}" CXXFLAGS="$CXXFLAGS ${{ matrix.extra_defs }}"
+          cargo build --release --target ${{ matrix.target }}
 
       - name: Bundle binary + ORT dylib
         shell: bash

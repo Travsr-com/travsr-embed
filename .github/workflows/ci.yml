@@ -131,6 +131,9 @@ jobs:
       # release.yml matrix comment. cl.exe accepts the -D spelling.
       CFLAGS: "-DSIMSIMD_TARGET_SAPPHIRE=0 -DMAP_FAILED=((void*)-1)"
       CXXFLAGS: "-DSIMSIMD_TARGET_SAPPHIRE=0 -DMAP_FAILED=((void*)-1)"
+      # esaxx-rs hardcodes static_crt(true); build everything /MT to match —
+      # see the release.yml matrix comment.
+      RUSTFLAGS: "-Ctarget-feature=+crt-static"
     steps:
       - uses: actions/checkout@v4
 

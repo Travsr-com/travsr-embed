@@ -43,9 +43,16 @@ jobs:
           # VirtualAlloc/NULL, never -1, so the comparison is inert. Windows-
           # only — on unix sys/mman.h already defines it and a command-line
           # copy would be a redefinition.
+          #
+          # rustflags: esaxx-rs (via tokenizers) hardcodes static_crt(true) in
+          # its build.rs, so its objects are /MT while Rust's msvc default is
+          # /MD — LNK2038 RuntimeLibrary mismatch. Build everything with the
+          # static CRT instead; that also frees end users from needing the
+          # VC++ redistributable for a downloaded sidecar binary.
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             extra_defs: "-DMAP_FAILED=((void*)-1)"
+            rustflags: "-Ctarget-feature=+crt-static"
 
     steps:
       - uses: actions/checkout@v4
@@ -75,6 +82,7 @@ jobs:
         shell: bash
         run: |
           export CFLAGS="$CFLAGS ${{ matrix.extra_defs }}" CXXFLAGS="$CXXFLAGS ${{ matrix.extra_defs }}"
+          export RUSTFLAGS="$RUSTFLAGS ${{ matrix.rustflags }}"
           cargo build --release --target ${{ matrix.target }}
 
       - name: Bundle binary + ORT dylib

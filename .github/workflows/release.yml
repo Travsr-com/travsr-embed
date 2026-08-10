@@ -31,6 +31,28 @@ jobs:
             os: ubuntu-22.04-arm   # native ARM64 runner - avoids cross Docker image gcc version limits
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04
+          # Issue #12: the travsr CLI maps windows/x86_64 to this triple and
+          # requests `<binary>-<target>.exe`; without this entry `travsr embed
+          # init` 404s on Windows.
+          #
+          # extra_defs: usearch 2.24.0 references the POSIX MAP_FAILED in an
+          # unguarded template body (index_plugins.hpp:962, fixed upstream
+          # after 2.24.0; 2.25+ is blocked by the gcc-12 pin above), and the
+          # usearch build script passes /permissive- so MSVC rejects it.
+          # Supply the POSIX value: the Windows allocation paths return
+          # VirtualAlloc/NULL, never -1, so the comparison is inert. Windows-
+          # only — on unix sys/mman.h already defines it and a command-line
+          # copy would be a redefinition.
+          #
+          # rustflags: esaxx-rs (via tokenizers) hardcodes static_crt(true) in
+          # its build.rs, so its objects are /MT while Rust's msvc default is
+          # /MD — LNK2038 RuntimeLibrary mismatch. Build everything with the
+          # static CRT instead; that also frees end users from needing the
+          # VC++ redistributable for a downloaded sidecar binary.
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            extra_defs: "-DMAP_FAILED=((void*)-1)"
+            rustflags: "-Ctarget-feature=+crt-static"
 
     steps:
       - uses: actions/checkout@v4
@@ -57,7 +79,11 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        shell: bash
+        run: |
+          export CFLAGS="$CFLAGS ${{ matrix.extra_defs }}" CXXFLAGS="$CXXFLAGS ${{ matrix.extra_defs }}"
+          export RUSTFLAGS="$RUSTFLAGS ${{ matrix.rustflags }}"
+          cargo build --release --target ${{ matrix.target }}
 
       - name: Bundle binary + ORT dylib
         shell: bash
@@ -66,15 +92,24 @@ jobs:
           OUTDIR="dist"
           mkdir -p "$OUTDIR"
 
-          BIN="${{ env.BINARY }}-${{ matrix.target }}"
-          cp "$TARGET_DIR/${{ env.BINARY }}" "$OUTDIR/$BIN"
+          # Windows assets keep the .exe extension: asset is
+          # `travsr-embed-x86_64-pc-windows-msvc.exe`, sha256 sidecar is
+          # `<asset>.sha256`. The travsr CLI builds the same name (issue #12).
+          EXT=""
+          case "${{ matrix.target }}" in *windows*) EXT=".exe" ;; esac
 
-          # Bundle the ORT shared library (copy-dylibs placed it next to binary).
-          for lib in "$TARGET_DIR"/libonnxruntime.*; do
+          BIN="${{ env.BINARY }}-${{ matrix.target }}${EXT}"
+          cp "$TARGET_DIR/${{ env.BINARY }}${EXT}" "$OUTDIR/$BIN"
+
+          # Bundle the ORT shared library (copy-dylibs placed it next to the
+          # binary). No-op for the default tract-only build; the dll glob
+          # covers Windows if an ort-enabled build ever ships.
+          for lib in "$TARGET_DIR"/libonnxruntime.* "$TARGET_DIR"/onnxruntime*.dll; do
             [ -f "$lib" ] && cp "$lib" "$OUTDIR/"
           done
 
-          # SHA256 sidecar for CLI integrity check.
+          # SHA256 sidecar for CLI integrity check. Git Bash on the Windows
+          # runners ships sha256sum, macOS falls back to shasum.
           cd "$OUTDIR"
           if command -v sha256sum &>/dev/null; then
             sha256sum "$BIN" | awk '{print $1}' > "$BIN.sha256"

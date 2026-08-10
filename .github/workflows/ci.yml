@@ -116,6 +116,61 @@ jobs:
       - name: test
         run: cargo test --all-targets
 
+  # Issue #12: release.yml publishes a x86_64-pc-windows-msvc binary, so prove
+  # the MSVC build compiles and links on every PR instead of discovering
+  # breakage at tag time. Build-only: the test suite stays on the ci matrix
+  # above. Uses release.yml's sibling-checkout + sed rewrite instead of the ci
+  # job's symlink, which Windows runners can't create.
+  windows-build:
+    name: Windows build (x86_64-pc-windows-msvc)
+    runs-on: windows-latest
+    env:
+      # Mirrors release.yml (including its Windows-only extra_defs): skip the
+      # one AVX512-FP16 simsimd kernel, and define the POSIX MAP_FAILED that
+      # usearch 2.24.0 references in an unguarded template body — see the
+      # release.yml matrix comment. cl.exe accepts the -D spelling.
+      CFLAGS: "-DSIMSIMD_TARGET_SAPPHIRE=0 -DMAP_FAILED=((void*)-1)"
+      CXXFLAGS: "-DSIMSIMD_TARGET_SAPPHIRE=0 -DMAP_FAILED=((void*)-1)"
+      # esaxx-rs hardcodes static_crt(true); build everything /MT to match —
+      # see the release.yml matrix comment.
+      RUSTFLAGS: "-Ctarget-feature=+crt-static"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: Travsr-com/travsr
+          path: travsr-sibling
+          ref: master
+
+      - name: Rewrite Cargo.toml patch paths for CI
+        shell: bash
+        run: sed -i.bak 's|path = "\.\./travsr/|path = "travsr-sibling/|g' Cargo.toml && rm -f Cargo.toml.bak
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build (release, mirrors release.yml)
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      # PR #13 review ask: prove the MAP_FAILED define and +crt-static at
+      # runtime, not just at build. The unit suite includes usearch HNSW
+      # build/save/load/knn roundtrips (src/index.rs) that exercise the
+      # allocator paths the define touches, on synthetic vectors with no
+      # model downloads.
+      - name: Test (runtime smoke for the Windows build flags)
+        run: cargo test --release --target x86_64-pc-windows-msvc
+
   msrv:
     name: MSRV (1.91)
     runs-on: ubuntu-24.04

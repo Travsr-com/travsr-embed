@@ -163,6 +163,14 @@ jobs:
       - name: Build (release, mirrors release.yml)
         run: cargo build --release --target x86_64-pc-windows-msvc
 
+      # PR #13 review ask: prove the MAP_FAILED define and +crt-static at
+      # runtime, not just at build. The unit suite includes usearch HNSW
+      # build/save/load/knn roundtrips (src/index.rs) that exercise the
+      # allocator paths the define touches, on synthetic vectors with no
+      # model downloads.
+      - name: Test (runtime smoke for the Windows build flags)
+        run: cargo test --release --target x86_64-pc-windows-msvc
+
   msrv:
     name: MSRV (1.91)
     runs-on: ubuntu-24.04

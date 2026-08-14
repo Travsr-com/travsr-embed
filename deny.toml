@@ -10,6 +10,13 @@
 # repo's: the two ship as a pair, and a dependency judged acceptable in one must
 # not be rejected by the other.
 #
+# CI runs this with --all-features so the optional `ort` dependency tree — which
+# the mac and CUDA release artifacts actually ship — is covered too. Note what
+# that still cannot reach: ort's `download-binaries` fetches a prebuilt ONNX
+# Runtime library (MIT, Microsoft) at build time. It is a downloaded binary, not
+# a cargo dependency, so it never appears in the graph cargo-deny walks. Its
+# license is vetted by hand, once, here in this comment.
+#
 # The advisory ignores are per-tree and cannot converge: this repo pins
 # tract-onnx 0.23 while travsr's tree resolves tract-linalg 0.21.x, so the two
 # are exposed to different advisories by construction. travsr ignores

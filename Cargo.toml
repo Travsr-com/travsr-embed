@@ -56,6 +56,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }
 toml  = "0.8"
 
+# `--capabilities` emits JSON for the travsr CLI's pre-flight model check
+# (issue #6). Already in the tree transitively; named here because we depend on
+# it directly now.
+serde_json = "1"
+
 # OnnxRuntime — universal ONNX engine (issue #6). Optional: the default build
 # compiles zero ORT code and registers only the tract factory. `download-binaries`
 # (an ort default feature) fetches the per-target ONNX Runtime library at build
@@ -68,9 +73,16 @@ default = []                                          # tract only — byte-iden
 # families tract cannot run (ModernBERT, nomic-bert, …).
 ort = ["dep:ort"]
 # Hardware-accelerated execution providers (each implies the ORT CPU engine).
+#
+# Only EPs with a prebuilt in ort's distribution manifest are listed. DirectML,
+# ROCm, OpenVINO and XNNPACK have Cargo features upstream but no prebuilt for any
+# target we ship, so enabling them would require building ONNX Runtime from
+# source — deliberately out of scope (issue #6). WebGPU is the cross-vendor
+# (AMD/Intel) path in the meantime.
 ort-coreml   = ["ort", "ort/coreml"]                  # macOS ANE+GPU, zero-install
-ort-cuda     = ["ort", "ort/cuda"]                    # Linux/Win x86_64, needs CUDA 12 + cuDNN
+ort-cuda     = ["ort", "ort/cuda"]                    # Linux/Win x86_64, needs CUDA + cuDNN on the host
 ort-tensorrt = ["ort", "ort/tensorrt", "ort/cuda"]    # Linux/Win x86_64, needs TensorRT
+ort-webgpu   = ["ort", "ort/webgpu"]                  # Win/Linux x86_64 + macOS arm64; any GPU vendor; EXPERIMENTAL upstream
 
 # ── Local development override ────────────────────────────────────────────────
 [patch.crates-io]

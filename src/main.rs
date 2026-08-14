@@ -1077,27 +1077,14 @@ fn reindex(
         .map(|(_, text)| estimate_tokens(text))
         .collect();
 
-    let mut batch_ranges: Vec<std::ops::Range<usize>> = Vec::new();
-    {
-        let mut batch_start = 0usize;
-        let mut batch_max_est = 0usize;
-        for (i, &est) in est_lens.iter().enumerate() {
-            let new_max = batch_max_est.max(est);
-            let projected_tokens = new_max * (i - batch_start + 1);
-            if i > batch_start
-                && (projected_tokens > TOKEN_BUDGET || (i - batch_start) >= MAX_BATCH)
-            {
-                batch_ranges.push(batch_start..i);
-                batch_start = i;
-                batch_max_est = est;
-            } else {
-                batch_max_est = new_max;
-            }
-        }
-        if batch_start < texts.len() {
-            batch_ranges.push(batch_start..texts.len());
-        }
-    }
+    // Was an inline copy of build_batch_ranges; call the shared function so this
+    // path and the parallel one cannot drift, and so the accelerated branch below
+    // exists in both.
+    let batch_ranges: Vec<std::ops::Range<usize>> = if model.is_accelerated() {
+        build_batch_ranges_bucketed(&est_lens, &encode::GPU_BUCKETS)
+    } else {
+        build_batch_ranges(&est_lens)
+    };
 
     // INSERT into edb.node_embeddings — never touches graph.db WAL.
     // #376 W3: `text_hash` records the exact text this vector was built from, so
@@ -1332,10 +1319,20 @@ fn reindex_parallel(
     // write. All N workers run until the queue is empty; no worker idles while
     // another still has pre-assigned work. Workload is AMX-bound in practice,
     // so scheduling gains are marginal (~3%); this form is kept for code clarity.
+    // Loaded before batching, not after: the batch shapes now depend on which
+    // engine was resolved (see build_batch_ranges_bucketed), and n_batches has to
+    // be final before the cancel watcher below captures it.
+    let desc = model::ModelDescriptor::load(model_dir).context("loading model descriptor")?;
+    let model = backend::create_backend(model_dir, &desc).context("loading model")?;
+
     let mut sorted = all_pending;
     sorted.sort_by_key(|(_, t)| estimate_tokens(t));
     let est_lens: Vec<usize> = sorted.iter().map(|(_, t)| estimate_tokens(t)).collect();
-    let batch_ranges = build_batch_ranges(&est_lens);
+    let batch_ranges = if model.is_accelerated() {
+        build_batch_ranges_bucketed(&est_lens, &encode::GPU_BUCKETS)
+    } else {
+        build_batch_ranges(&est_lens)
+    };
     let n_batches = batch_ranges.len();
 
     let items = Arc::new(sorted);
@@ -1370,26 +1367,8 @@ fn reindex_parallel(
             .expect("spawn cancel watcher")
     });
 
-    let desc = model::ModelDescriptor::load(model_dir).context("loading model descriptor")?;
-    let model = backend::create_backend(model_dir, &desc).context("loading model")?;
     record_backend_provenance(embed_db_path, model.backend_name())?;
-    // Issue #6: N CPU worker threads do not map onto one GPU. When the backend
-    // is accelerated, run a single submit loop — the backend pads each batch to
-    // fixed shape buckets (avoids CUDA/TensorRT per-shape re-optimisation) and
-    // `--parallel` stays a CPU-only hint. WS3 cancel-sentinel is unaffected:
-    // it drains via the shared batch counter either way.
-    let n_workers = if model.is_accelerated() {
-        if parallel > 1 {
-            tracing::info!(
-                requested = parallel,
-                backend = model.backend_name(),
-                "accelerated backend — --parallel is a CPU-only hint; using a single submit loop"
-            );
-        }
-        1
-    } else {
-        parallel.min(n_batches).max(1)
-    };
+    let n_workers = choose_workers(model.as_ref(), parallel, n_batches);
     tracing::info!(
         total,
         n_batches,
@@ -1555,6 +1534,74 @@ fn reindex_parallel(
     Ok(())
 }
 
+/// How many inference threads to run against this backend.
+///
+/// Issue #6: N CPU worker threads do not map onto one GPU, and they do not map
+/// onto an ORT session either — `Session::run` is `&mut self`, so submissions
+/// serialise on one mutex while ORT's intra-op pool does the parallelising. Both
+/// cases answer `single_submitter()`, so `--parallel` is a hint for the tract CPU
+/// path only. WS3's cancel-sentinel is unaffected: it drains via the shared batch
+/// counter at any worker count.
+fn choose_workers(model: &dyn backend::EmbedBackend, parallel: usize, n_batches: usize) -> usize {
+    if model.single_submitter() {
+        if parallel > 1 {
+            tracing::info!(
+                requested = parallel,
+                backend = model.backend_name(),
+                accelerated = model.is_accelerated(),
+                "backend wants a single submit loop — --parallel applies to the tract CPU path only"
+            );
+        }
+        return 1;
+    }
+    parallel.min(n_batches).max(1)
+}
+
+/// Partition items into batches whose padded shapes land on a `BucketSpec`'s
+/// fixed set, for engines that re-optimize kernels per tensor shape.
+///
+/// `build_batch_ranges` below optimises for the opposite thing: minimum wasted
+/// padding, which yields a different `[rows, seq]` shape for nearly every batch.
+/// That is right for tract and wrong for CUDA/TensorRT, which pay a kernel
+/// re-optimisation per new shape. Here each batch is kept inside ONE seq bucket
+/// and closed at that bucket's row count, so a run produces the bucket set's
+/// handful of shapes instead of hundreds.
+///
+/// Two things stop this being exact, both benign: an oversized single item can
+/// exceed its bucket's row count (never split — a row cannot be divided), and
+/// `est_lens` are estimates, so a batch grouped as bucket N can tokenize into
+/// bucket N+1 and pad to a one-off shape. Both are bounded and rare; the shape
+/// count stays in single digits rather than the hundreds.
+///
+/// Items must be pre-sorted shortest-first, same as `build_batch_ranges` — that
+/// is what keeps a batch inside one bucket instead of straddling several.
+fn build_batch_ranges_bucketed(
+    est_lens: &[usize],
+    spec: &encode::BucketSpec,
+) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    let mut max_est = 0usize;
+    for (i, &est) in est_lens.iter().enumerate() {
+        let seq_with = spec.pad_seq(max_est.max(est));
+        let rows = i - start + 1;
+        // Closing on a bucket change keeps every batch single-bucket, so the
+        // padded shape is decided by that bucket alone.
+        let bucket_changed = i > start && spec.pad_seq(max_est) != seq_with;
+        if i > start && (bucket_changed || rows > spec.rows_for_seq(seq_with)) {
+            ranges.push(start..i);
+            start = i;
+            max_est = est;
+        } else {
+            max_est = max_est.max(est);
+        }
+    }
+    if start < est_lens.len() {
+        ranges.push(start..est_lens.len());
+    }
+    ranges
+}
+
 /// Partition a slice of per-item token estimates into token-budget batches.
 /// Items must be pre-sorted shortest-first so BatchLongest padding is minimised.
 fn build_batch_ranges(est_lens: &[usize]) -> Vec<std::ops::Range<usize>> {
@@ -1708,6 +1755,29 @@ fn main() {
     if args.iter().skip(1).any(|a| a == "--version" || a == "-V") {
         println!("travsr-embed {}", env!("CARGO_PKG_VERSION"));
         std::process::exit(0);
+    }
+
+    // Issue #6: the same probe pattern, one level deeper. `--version` says which
+    // sidecar this is; `--capabilities` says which model architectures it can
+    // actually execute, so the CLI can refuse an unrunnable model at selection
+    // time instead of failing hours into a background reindex.
+    //
+    // Loads no model and builds no session — a handshake must stay cheap, and
+    // whether a GPU will be *confirmed* is deliberately not answered here (see
+    // Capabilities::accelerated_compiled). An older sidecar exits 1 on this
+    // unknown flag, which is the negotiation signal, exactly as with
+    // --cancel-sentinel above.
+    if args.iter().skip(1).any(|a| a == "--capabilities") {
+        match serde_json::to_string(&backend::capabilities()) {
+            Ok(json) => {
+                println!("{json}");
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("failed to serialize capabilities: {e}");
+                std::process::exit(1);
+            }
+        }
     }
 
     let mut reindex_db: Option<PathBuf> = None;
@@ -2141,5 +2211,175 @@ mod query_memo_tests {
         assert!(!e.serves("watch  cache", Duration::from_millis(1)));
         assert!(!e.serves("Watch cache", Duration::from_millis(1)));
         assert!(!e.serves("", Duration::from_millis(1)));
+    }
+}
+
+/// Issue #6: batching and worker-count decisions now depend on which engine was
+/// resolved, so both are pure functions with the backend passed in — testable
+/// without a model, a GPU, or an ORT build.
+#[cfg(test)]
+mod batching_tests {
+    use super::*;
+    use crate::encode::GPU_BUCKETS;
+
+    struct StubBackend {
+        accelerated: bool,
+        single: bool,
+    }
+
+    impl backend::EmbedBackend for StubBackend {
+        fn embed_documents(&self, _texts: &[&str]) -> Result<Vec<Vec<u8>>> {
+            Ok(vec![])
+        }
+        fn embed_query(&self, _text: &str) -> Result<Vec<u8>> {
+            Ok(vec![])
+        }
+        fn backend_name(&self) -> &str {
+            "stub"
+        }
+        fn is_accelerated(&self) -> bool {
+            self.accelerated
+        }
+        fn single_submitter(&self) -> bool {
+            self.single
+        }
+        fn dim(&self) -> usize {
+            4
+        }
+    }
+
+    fn covers_everything(ranges: &[std::ops::Range<usize>], n: usize) {
+        let mut next = 0usize;
+        for r in ranges {
+            assert_eq!(r.start, next, "gap or overlap at {r:?}");
+            assert!(r.end > r.start, "empty batch {r:?}");
+            next = r.end;
+        }
+        assert_eq!(next, n, "batches do not cover all {n} items");
+    }
+
+    /// Every item must appear exactly once, in order — a batcher that loses or
+    /// duplicates rows silently corrupts the index.
+    #[test]
+    fn bucketed_batches_cover_every_item_in_order() {
+        for lens in [
+            vec![5usize; 300],
+            vec![500; 40],
+            (1..=200).collect::<Vec<usize>>(),
+            vec![10, 10, 400, 400, 500],
+            vec![7],
+        ] {
+            let ranges = build_batch_ranges_bucketed(&lens, &GPU_BUCKETS);
+            covers_everything(&ranges, lens.len());
+        }
+    }
+
+    /// The reason this batcher exists: a bounded number of distinct padded
+    /// shapes. Compared against the token-budget batcher on the same input, where
+    /// the count is expected to be much larger.
+    #[test]
+    fn bucketed_batching_bounds_distinct_shapes() {
+        // Sorted shortest-first, as both batchers require.
+        let lens: Vec<usize> = (1..=2000).map(|i| (i % 512) + 1).chain(1..=500).collect();
+        let mut sorted = lens.clone();
+        sorted.sort_unstable();
+
+        let shape_of = |r: &std::ops::Range<usize>| {
+            let longest = sorted[r.start..r.end].iter().copied().max().unwrap_or(1);
+            let seq = GPU_BUCKETS.pad_seq(longest);
+            (GPU_BUCKETS.rows_for_seq(seq).max(r.len()), seq)
+        };
+
+        let bucketed: std::collections::HashSet<_> =
+            build_batch_ranges_bucketed(&sorted, &GPU_BUCKETS)
+                .iter()
+                .map(shape_of)
+                .collect();
+        let plain: std::collections::HashSet<_> = build_batch_ranges(&sorted)
+            .iter()
+            .map(|r| {
+                let longest = sorted[r.start..r.end].iter().copied().max().unwrap_or(1);
+                (r.len(), longest)
+            })
+            .collect();
+
+        assert!(
+            bucketed.len() <= GPU_BUCKETS.seq_buckets.len() + 2,
+            "expected ~{} shapes, got {}: {bucketed:?}",
+            GPU_BUCKETS.seq_buckets.len(),
+            bucketed.len()
+        );
+        assert!(
+            plain.len() > bucketed.len(),
+            "this test is pointless if the token-budget batcher is not shapier: \
+             plain={} bucketed={}",
+            plain.len(),
+            bucketed.len()
+        );
+    }
+
+    /// A batch must never straddle two seq buckets — that is what makes its
+    /// padded shape predictable from the bucket alone.
+    #[test]
+    fn each_bucketed_batch_stays_within_one_seq_bucket() {
+        let lens: Vec<usize> = (1..=600).map(|i| i.min(512)).collect();
+        for r in build_batch_ranges_bucketed(&lens, &GPU_BUCKETS) {
+            let buckets: std::collections::HashSet<usize> = lens[r.start..r.end]
+                .iter()
+                .map(|&l| GPU_BUCKETS.pad_seq(l))
+                .collect();
+            assert_eq!(buckets.len(), 1, "batch {r:?} spans buckets {buckets:?}");
+        }
+    }
+
+    /// The CPU path must be byte-identical to before this change: same function,
+    /// unchanged, still chosen whenever the backend is not accelerated.
+    #[test]
+    fn non_accelerated_batching_is_the_token_budget_batcher() {
+        let lens: Vec<usize> = (1..=500).collect();
+        let plain = build_batch_ranges(&lens);
+        assert!(!plain.is_empty());
+        covers_everything(&plain, lens.len());
+        // Token budget respected: max_est × rows stays within TOKEN_BUDGET unless
+        // a single item alone exceeds it.
+        for r in &plain {
+            let longest = lens[r.start..r.end].iter().copied().max().unwrap();
+            assert!(
+                longest * r.len() <= TOKEN_BUDGET || r.len() == 1,
+                "batch {r:?} exceeds the token budget"
+            );
+            assert!(r.len() <= MAX_BATCH);
+        }
+    }
+
+    #[test]
+    fn accelerated_backend_gets_one_submit_thread() {
+        let gpu = StubBackend {
+            accelerated: true,
+            single: true,
+        };
+        assert_eq!(choose_workers(&gpu, 8, 100), 1);
+    }
+
+    /// ort/CPU: not accelerated, but still single-submit (session mutex).
+    #[test]
+    fn single_submitter_cpu_backend_also_gets_one_thread() {
+        let ort_cpu = StubBackend {
+            accelerated: false,
+            single: true,
+        };
+        assert_eq!(choose_workers(&ort_cpu, 8, 100), 1);
+    }
+
+    #[test]
+    fn tract_honours_parallel_but_never_exceeds_batch_count() {
+        let tract = StubBackend {
+            accelerated: false,
+            single: false,
+        };
+        assert_eq!(choose_workers(&tract, 4, 100), 4);
+        assert_eq!(choose_workers(&tract, 8, 3), 3, "no idle workers");
+        assert_eq!(choose_workers(&tract, 1, 100), 1);
+        assert_eq!(choose_workers(&tract, 4, 0), 1, "never zero threads");
     }
 }

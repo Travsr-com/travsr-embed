@@ -5,6 +5,69 @@ All notable changes to `travsr-embed` are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Completes the second half of issue #6. 1.3.0 landed the engine architecture; this
+turns it into something users actually get GPU acceleration from, and something CI
+actually verifies.
+
+### Added
+- **GPU acceleration in shipped assets.** macOS release binaries now include the
+  CoreML execution provider in the DEFAULT asset — ORT's macOS prebuilt links it
+  statically, so this costs nothing to install. Linux x86_64 gains a separate
+  `travsr-embed-x86_64-unknown-linux-gnu-cuda` asset for NVIDIA hosts, with ORT's
+  provider libraries bundled beside the binary (`$ORIGIN` rpath) and a `.sha256`
+  for every shipped file. All other assets are unchanged, tract-only builds.
+- `--capabilities`: prints the compiled engines, the model families they can run,
+  and whether an accelerator is compiled in, as JSON. Lets the `travsr` CLI refuse
+  a model the installed sidecar cannot execute at selection time rather than
+  failing part way through a background reindex. Additive — an older CLI is
+  unaffected, and an older sidecar still exits non-zero on the unknown flag, which
+  is how the probe detects it.
+- `ort-webgpu` feature (vendor-neutral GPU via DX12/Vulkan/Metal — the only
+  prebuilt path to AMD/Intel GPUs). Compiled and checked in CI; not yet published
+  as a release asset, since upstream marks WebGPU experimental.
+- A real ModernBERT test fixture, so "tract cannot run this architecture" and "ORT
+  runs it with only a `family` tag" are both verified against an actual RoPE +
+  local/global-attention graph instead of a re-tagged BERT model.
+
+### Changed
+- **Accelerated batching now bounds tensor shapes.** The accelerated path had
+  sequence-length buckets but still built batches with the CPU token-budget
+  packer, producing hundreds of distinct `[rows, seq]` shapes — exactly what
+  CUDA/TensorRT pay a kernel re-optimisation for. Batches are now grouped so each
+  stays within one sequence bucket and pads to that bucket's fixed row count,
+  giving five steady-state shapes. The CPU path is untouched.
+- ORT backends now always run from a single submit loop, not just accelerated
+  ones. `Session::run` takes `&mut self`, so N worker threads under `--parallel`
+  serialised on the session mutex anyway — N threads' overhead for one thread's
+  throughput. `--parallel` is now documented as a hint for the tract CPU path.
+- Removed `TargetInfo`: both fields were dead code and no factory consulted it.
+  Platform gating already happens at compile time via the cfg-gated registry.
+
+### CI
+- **ORT code is now compiled by CI.** `src/backend/ort.rs` was 300+ lines that no
+  job built — not fmt, not clippy, not test. The matrix gains `--features ort`
+  (Linux) and `--features ort-coreml` (macOS M1 runners, where the CoreML warm-up
+  path runs against real hardware), plus an `ort-cuda` link-check job and a
+  non-blocking Windows `ort-cuda` probe for the static-CRT question that gates a
+  Windows GPU asset.
+- The `#[ignore]` model-backed tests (cross-backend parity, ModernBERT, CoreML)
+  now run: the ORT rows stage cached fixtures and execute them.
+- `cargo-deny` runs with `--all-features`, so the ORT dependency tree the release
+  assets ship is license- and advisory-checked.
+- MSRV job also checks `--features ort`, keeping ort's own MSRV claim honest.
+- Release builds smoke-test each artifact (`--version` + `--capabilities`) and
+  fail if a default asset unexpectedly produces ORT runtime libraries.
+
+### Notes for upgraders
+- **macOS users will see a backend change.** bert-family models now resolve to
+  `ort/CoreML` instead of `tract` (higher preference), so the first reindex after
+  upgrading logs the existing backend-provenance warning and recommends
+  `travsr embed reindex --rebuild`. That is intended: GPU and CPU float
+  accumulation differ in the last decimal places, and the warning exists to stop
+  an index being half one and half the other.
+
 ## [1.3.0] - 2026-08-12
 
 ### Added

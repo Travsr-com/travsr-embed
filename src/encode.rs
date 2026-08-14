@@ -33,21 +33,34 @@ pub const MAX_SEQ: usize = 512;
 pub struct BucketSpec {
     /// Sequence length is rounded up to the smallest bucket that fits.
     pub seq_buckets: &'static [usize],
-    /// Batch count is rounded up to a multiple of this (padded rows get mask 0).
-    pub batch_multiple: usize,
+    /// Rows per batch for each entry of `seq_buckets`, same length and order.
+    ///
+    /// One row count per seq bucket, rather than "round the batch up to a
+    /// multiple of N": rounding still admits every multiple, so a run would emit
+    /// dozens of distinct row counts × 5 seq widths — hundreds of shapes, which
+    /// is what shape-caching engines re-optimize for. Pinning one row count per
+    /// width bounds the steady-state shape set to `seq_buckets.len()`.
+    pub rows_per_seq: &'static [usize],
 }
 
-/// Default buckets for GPU execution providers. Five seq shapes × padded batch
-/// counts keeps the number of distinct tensor shapes small enough that
-/// CUDA/TensorRT re-optimisation happens a handful of times, not per batch.
+/// Default buckets for GPU execution providers.
+///
+/// Row counts are ~TOKEN_BUDGET (4096) tokens per batch so each shape carries
+/// comparable work, and all are multiples of 8 to stay tensor-core friendly.
+/// Five seq widths × one row count each = five steady-state shapes, so
+/// CUDA/TensorRT kernel re-optimisation happens a handful of times per run
+/// rather than per batch.
 #[cfg_attr(not(feature = "ort"), allow(dead_code))] // consumed by the ORT engine
 pub const GPU_BUCKETS: BucketSpec = BucketSpec {
     seq_buckets: &[32, 64, 128, 256, MAX_SEQ],
-    batch_multiple: 8,
+    rows_per_seq: &[128, 64, 32, 16, 8],
 };
 
 impl BucketSpec {
-    fn pad_seq(&self, seq: usize) -> usize {
+    /// The seq width a batch of this longest-token-count will be padded to.
+    /// Public so the batch builder can group items by target shape before
+    /// tokenization, rather than discovering the shape afterwards.
+    pub fn pad_seq(&self, seq: usize) -> usize {
         self.seq_buckets
             .iter()
             .copied()
@@ -55,8 +68,23 @@ impl BucketSpec {
             .unwrap_or(MAX_SEQ)
     }
 
-    fn pad_batch(&self, batch: usize) -> usize {
-        batch.div_ceil(self.batch_multiple) * self.batch_multiple
+    /// Rows to pad a batch up to, for a sequence width already run through
+    /// `pad_seq`. Falls back to the last entry for widths at/above the top
+    /// bucket.
+    pub fn rows_for_seq(&self, padded_seq: usize) -> usize {
+        self.seq_buckets
+            .iter()
+            .position(|&b| b >= padded_seq)
+            .and_then(|i| self.rows_per_seq.get(i).copied())
+            .or_else(|| self.rows_per_seq.last().copied())
+            .unwrap_or(1)
+    }
+
+    /// Batch rows for this shape: the bucket's fixed row count, except for a
+    /// batch that already exceeds it (the caller built an oversized batch), where
+    /// padding down is impossible and the real count is used as-is.
+    fn pad_batch(&self, batch: usize, padded_seq: usize) -> usize {
+        self.rows_for_seq(padded_seq).max(batch)
     }
 }
 
@@ -136,7 +164,10 @@ impl Encoder {
             .unwrap_or(1);
 
         let (seq, padded_batch) = match bucket {
-            Some(b) => (b.pad_seq(longest), b.pad_batch(batch)),
+            Some(b) => {
+                let seq = b.pad_seq(longest);
+                (seq, b.pad_batch(batch, seq))
+            }
             None => (longest, batch),
         };
 
@@ -299,10 +330,62 @@ mod tests {
     }
 
     #[test]
-    fn bucket_batch_rounds_to_multiple() {
-        assert_eq!(GPU_BUCKETS.pad_batch(1), 8);
-        assert_eq!(GPU_BUCKETS.pad_batch(8), 8);
-        assert_eq!(GPU_BUCKETS.pad_batch(9), 16);
+    fn bucket_pads_batch_to_the_seq_buckets_fixed_row_count() {
+        // Short sequences get wide batches, long ones narrow — one row count per
+        // seq width, so a partial batch pads up to the same shape as a full one.
+        assert_eq!(GPU_BUCKETS.pad_batch(1, 32), 128);
+        assert_eq!(GPU_BUCKETS.pad_batch(128, 32), 128);
+        assert_eq!(GPU_BUCKETS.pad_batch(3, MAX_SEQ), 8);
+        assert_eq!(GPU_BUCKETS.pad_batch(16, 256), 16);
+    }
+
+    /// An oversized batch cannot be padded *down* — using the bucket row count
+    /// would silently drop rows, so the real count wins.
+    #[test]
+    fn bucket_never_shrinks_an_oversized_batch() {
+        assert_eq!(GPU_BUCKETS.pad_batch(200, MAX_SEQ), 200);
+    }
+
+    #[test]
+    fn rows_per_seq_covers_every_seq_bucket() {
+        assert_eq!(
+            GPU_BUCKETS.seq_buckets.len(),
+            GPU_BUCKETS.rows_per_seq.len(),
+            "every seq bucket needs a row count"
+        );
+        // All multiples of 8, and non-increasing as sequences get longer.
+        let mut prev = usize::MAX;
+        for (&seq, &rows) in GPU_BUCKETS.seq_buckets.iter().zip(GPU_BUCKETS.rows_per_seq) {
+            assert_eq!(rows % 8, 0, "seq {seq}: {rows} rows is not a multiple of 8");
+            assert!(rows <= prev, "seq {seq}: row count must not grow with seq");
+            prev = rows;
+        }
+    }
+
+    /// Padding's half of the shape-bound guarantee: for batches the builder is
+    /// meant to produce (at most one bucket's row count), every batch of a given
+    /// seq width collapses onto ONE shape regardless of how full it was.
+    ///
+    /// The end-to-end bound is a property of the batch builder *and* this padding
+    /// together, so it is asserted where the builder lives —
+    /// `batching_tests::bucketed_batching_bounds_distinct_shapes` in main.rs. This
+    /// test deliberately does not feed oversized batches: those cannot be padded
+    /// down (see `bucket_never_shrinks_an_oversized_batch`) and are the builder's
+    /// job to avoid.
+    #[test]
+    fn every_underfull_batch_of_a_seq_width_pads_to_one_shape() {
+        let mut shapes = std::collections::HashSet::new();
+        for (&bucket_seq, &rows) in GPU_BUCKETS.seq_buckets.iter().zip(GPU_BUCKETS.rows_per_seq) {
+            for batch in 1..=rows {
+                let seq = GPU_BUCKETS.pad_seq(bucket_seq);
+                shapes.insert((GPU_BUCKETS.pad_batch(batch, seq), seq));
+            }
+        }
+        assert_eq!(
+            shapes.len(),
+            GPU_BUCKETS.seq_buckets.len(),
+            "expected exactly one shape per seq bucket, got {shapes:?}"
+        );
     }
 
     #[test]

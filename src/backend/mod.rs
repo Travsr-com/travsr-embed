@@ -42,31 +42,24 @@ pub trait EmbedBackend: Send + Sync {
     fn is_accelerated(&self) -> bool;
     /// Stored/output embedding dimension (native, or Matryoshka-truncated).
     fn dim(&self) -> usize;
-}
 
-/// Host characteristics available to `preference()` ordering. Today's factories
-/// rank by tier alone; the fields are the extension surface for target-aware
-/// ordering (e.g. preferring CoreML only on macOS/aarch64).
-pub struct TargetInfo {
-    #[allow(dead_code)]
-    pub os: &'static str,
-    #[allow(dead_code)]
-    pub arch: &'static str,
-}
-
-impl TargetInfo {
-    pub fn current() -> Self {
-        Self {
-            os: std::env::consts::OS,
-            arch: std::env::consts::ARCH,
-        }
+    /// True when this backend must be fed from a single submit loop rather than
+    /// N worker threads.
+    ///
+    /// Accelerated backends want this because N CPU threads do not map onto one
+    /// GPU. ORT wants it even on CPU for a different reason: `Session::run`
+    /// takes `&mut self`, so every submission serialises on one mutex anyway
+    /// while ORT's own intra-op pool does the parallelising. Spawning workers
+    /// that immediately queue behind that lock buys nothing and costs a thread
+    /// each, so `OrtBackend` overrides this to true regardless of EP.
+    fn single_submitter(&self) -> bool {
+        self.is_accelerated()
     }
 }
 
 /// Preference tiers: accelerated > preferred-CPU (tract) > universal-CPU (ort).
 /// ort/CPU is only *chosen* when it is the only engine that can run the model.
-#[cfg_attr(not(feature = "ort"), allow(dead_code))] // consumed by the ORT factory
-pub const PREF_ACCELERATED: i32 = 100;
+pub const PREF_ACCELERATED: i32 = 100; // also the `accelerated_compiled` threshold
 pub const PREF_PREFERRED_CPU: i32 = 50;
 #[cfg_attr(not(feature = "ort"), allow(dead_code))] // consumed by the ORT factory
 pub const PREF_UNIVERSAL_CPU: i32 = 10;
@@ -77,8 +70,14 @@ pub trait BackendFactory: Send + Sync {
     fn engine(&self) -> &'static str;
     /// Capability: can this engine execute the given model architecture family?
     fn can_run(&self, family: &str) -> bool;
-    /// Ordering among capable engines on this target.
-    fn preference(&self, target: &TargetInfo) -> i32;
+    /// The families `can_run` accepts, or `None` when the engine is universal
+    /// (accepts any family). This is `can_run` turned inside out so the
+    /// `--capabilities` handshake can *enumerate* what this build supports —
+    /// `can_run` alone can only answer one family at a time, which is no use to
+    /// a CLI deciding whether a model is selectable before it downloads it.
+    fn supported_families(&self) -> Option<&'static [&'static str]>;
+    /// Ordering among capable engines.
+    fn preference(&self) -> i32;
     /// Ok(Some) = chosen, Ok(None) = declined (not an error — e.g. no confirmed
     /// hardware accelerator), Err = failed (logged; resolver moves on).
     fn try_build(
@@ -92,7 +91,12 @@ pub trait BackendFactory: Send + Sync {
 #[allow(clippy::vec_init_then_push)] // entries are cfg-gated; vec![] can't express that
 fn registry() -> Vec<Box<dyn BackendFactory>> {
     let mut factories: Vec<Box<dyn BackendFactory>> = Vec::new();
-    #[cfg(any(feature = "ort-coreml", feature = "ort-cuda", feature = "ort-tensorrt"))]
+    #[cfg(any(
+        feature = "ort-coreml",
+        feature = "ort-cuda",
+        feature = "ort-tensorrt",
+        feature = "ort-webgpu"
+    ))]
     factories.push(Box::new(ort::OrtFactory::accelerated()));
     factories.push(Box::new(tract::TractFactory));
     #[cfg(feature = "ort")]
@@ -100,15 +104,64 @@ fn registry() -> Vec<Box<dyn BackendFactory>> {
     factories
 }
 
+/// What this compiled sidecar can run, for the CLI's pre-flight handshake.
+///
+/// Reported from the registry, so it cannot drift from what the resolver will
+/// actually do. Note the deliberate limit of `accelerated_compiled`: it says a
+/// hardware-EP factory is *compiled in*, not that an accelerator will be
+/// confirmed at run time — that answer requires loading a model and doing a
+/// warm-up inference, which this flag-only path must not do.
+#[derive(serde::Serialize, Debug)]
+pub struct Capabilities {
+    pub plugin_version: &'static str,
+    /// Bumped when the shape of this payload changes, so a newer CLI can tell
+    /// an older sidecar's format from its own.
+    pub capabilities_version: u32,
+    pub engines: Vec<&'static str>,
+    /// Families this build can run *by name*. Not exhaustive when
+    /// `universal_onnx` is true — see that field.
+    pub families: Vec<&'static str>,
+    /// True when a universal ONNX engine is compiled in, meaning families
+    /// outside `families` are very likely runnable too. A CLI must treat
+    /// `families` as a hard allowlist only when this is false.
+    pub universal_onnx: bool,
+    pub accelerated_compiled: bool,
+}
+
+pub fn capabilities() -> Capabilities {
+    let factories = registry();
+    let mut families: Vec<&'static str> = Vec::new();
+    let mut universal_onnx = false;
+    for f in &factories {
+        match f.supported_families() {
+            None => universal_onnx = true,
+            Some(list) => {
+                for fam in list {
+                    if !families.contains(fam) {
+                        families.push(fam);
+                    }
+                }
+            }
+        }
+    }
+    Capabilities {
+        plugin_version: env!("CARGO_PKG_VERSION"),
+        capabilities_version: 1,
+        engines: factories.iter().map(|f| f.engine()).collect(),
+        families,
+        universal_onnx,
+        accelerated_compiled: factories.iter().any(|f| f.preference() >= PREF_ACCELERATED),
+    }
+}
+
 /// Resolve and build the backend for this model on this machine.
 /// Logs the chosen backend + execution provider at startup (always).
 pub fn create_backend(model_dir: &Path, desc: &ModelDescriptor) -> Result<Arc<dyn EmbedBackend>> {
-    resolve(registry(), &TargetInfo::current(), model_dir, desc)
+    resolve(registry(), model_dir, desc)
 }
 
 fn resolve(
     mut factories: Vec<Box<dyn BackendFactory>>,
-    target: &TargetInfo,
     model_dir: &Path,
     desc: &ModelDescriptor,
 ) -> Result<Arc<dyn EmbedBackend>> {
@@ -121,7 +174,7 @@ fn resolve(
         desc.family,
         compiled.join(", ")
     );
-    factories.sort_by_key(|f| Reverse(f.preference(target)));
+    factories.sort_by_key(|f| Reverse(f.preference()));
 
     let mut failures: Vec<String> = Vec::new();
     for factory in &factories {
@@ -220,7 +273,10 @@ mod tests {
                 Some(list) => list.contains(&family),
             }
         }
-        fn preference(&self, _t: &TargetInfo) -> i32 {
+        fn supported_families(&self) -> Option<&'static [&'static str]> {
+            self.families
+        }
+        fn preference(&self) -> i32 {
             self.pref
         }
         fn try_build(
@@ -269,17 +325,8 @@ mod tests {
         })
     }
 
-    fn target() -> TargetInfo {
-        TargetInfo::current()
-    }
-
     fn run(factories: Vec<Box<dyn BackendFactory>>, family: &str) -> Result<Arc<dyn EmbedBackend>> {
-        resolve(
-            factories,
-            &target(),
-            Path::new("/nonexistent"),
-            &desc(family),
-        )
+        resolve(factories, Path::new("/nonexistent"), &desc(family))
     }
 
     fn run_expecting_err(factories: Vec<Box<dyn BackendFactory>>, family: &str) -> String {
@@ -287,6 +334,33 @@ mod tests {
             Ok(b) => panic!("expected error, got backend '{}'", b.backend_name()),
             Err(e) => format!("{e:#}"),
         }
+    }
+
+    /// Root directory holding the model fixtures the `#[ignore]` tests below need.
+    ///
+    /// `TRAVSR_EMBED_TEST_MODEL_DIR` overrides it so CI can stage fixtures
+    /// somewhere cacheable (see .github/scripts/fetch-test-models.sh) instead of
+    /// requiring a real user install under $HOME.
+    #[cfg_attr(not(feature = "ort"), allow(dead_code))]
+    fn test_model_root() -> std::path::PathBuf {
+        match std::env::var_os("TRAVSR_EMBED_TEST_MODEL_DIR") {
+            Some(dir) => std::path::PathBuf::from(dir),
+            None => dirs::home_dir()
+                .expect("neither TRAVSR_EMBED_TEST_MODEL_DIR nor HOME is set")
+                .join(".travsr/models"),
+        }
+    }
+
+    #[cfg_attr(not(feature = "ort"), allow(dead_code))]
+    fn fixture(name: &str) -> std::path::PathBuf {
+        let dir = test_model_root().join(name);
+        assert!(
+            dir.join("model.onnx").exists(),
+            "fixture '{name}' not installed at {} — run .github/scripts/fetch-test-models.sh \
+             or set TRAVSR_EMBED_TEST_MODEL_DIR",
+            dir.display()
+        );
+        dir
     }
 
     // ── Outcome table from issue #6 ──────────────────────────────────────────
@@ -407,40 +481,181 @@ mod tests {
     #[cfg(not(feature = "ort"))]
     #[test]
     fn real_registry_refuses_modernbert_on_tract_only_build() {
-        let msg = match resolve(
-            registry(),
-            &target(),
-            Path::new("/nonexistent"),
-            &desc("modernbert"),
-        ) {
+        let msg = match resolve(registry(), Path::new("/nonexistent"), &desc("modernbert")) {
             Ok(b) => panic!("expected error, got backend '{}'", b.backend_name()),
             Err(e) => format!("{e:#}"),
         };
         assert!(msg.contains("modernbert") && msg.contains("ORT"), "{msg}");
     }
 
-    /// With the ORT engine compiled in, the same ModernBERT descriptor resolves
-    /// to ort/CPU on a machine with no accelerator — proving a new ORT-runnable
-    /// architecture needs only a `family` tag, zero sidecar code. Uses the real
-    /// registry but a real model file is still required, so reuse bge's ONNX
-    /// (a standard BERT graph is also a valid "modernbert-tagged" stand-in for
-    /// resolution purposes — the resolver never inspects the graph).
+    /// tract's allowlist has to reflect a real limitation, not a guess. This
+    /// bypasses the allowlist and hands tract a genuine ModernBERT graph (RoPE +
+    /// alternating local/global attention + GeGLU): it must FAIL to load.
+    ///
+    /// If this ever starts passing, tract gained ModernBERT support and
+    /// `TRACT_FAMILIES` should grow — the test failing is the signal to look.
+    #[test]
+    #[ignore = "needs the tiny-modernbert fixture (see CONTRIBUTING.md)"]
+    fn tract_refuses_a_real_modernbert_graph() {
+        let dir = fixture("tiny-modernbert");
+        let md = ModelDescriptor::load(&dir).expect("fixture model.toml");
+        assert_eq!(md.family, "modernbert", "fixture must be tagged modernbert");
+        let err = tract::TractBackend::load(&dir, md)
+            .err()
+            .expect("tract must not be able to load a ModernBERT graph");
+        tracing::info!("tract rejected ModernBERT as expected: {err:#}");
+    }
+
+    /// The extensibility claim from issue #6, end to end on a real graph: a
+    /// ModernBERT model runs with NO sidecar code beyond `family = "modernbert"`
+    /// in its model.toml. tract is capability-filtered out; ORT runs it and
+    /// produces usable vectors.
     #[cfg(feature = "ort")]
     #[test]
-    #[ignore = "needs a locally installed bge-small-en-v1.5 model"]
-    fn real_registry_resolves_modernbert_tag_to_ort() {
-        let dir = dirs::home_dir()
-            .expect("HOME not set")
-            .join(".travsr/models/bge-small-en-v1.5");
-        let mut md = ModelDescriptor::load(&dir).unwrap();
-        md.family = "modernbert".to_owned();
-        let backend =
-            resolve(registry(), &target(), &dir, &md).expect("ort must run modernbert family");
+    #[ignore = "needs the tiny-modernbert fixture (see CONTRIBUTING.md)"]
+    fn ort_runs_a_real_modernbert_graph_with_only_a_family_tag() {
+        let dir = fixture("tiny-modernbert");
+        let md = ModelDescriptor::load(&dir).expect("fixture model.toml");
+        let backend = resolve(registry(), &dir, &md).expect("ORT must run the modernbert family");
         assert!(
             backend.backend_name().starts_with("ort/"),
-            "{}",
+            "expected an ORT backend, got '{}'",
             backend.backend_name()
         );
+
+        let blobs = backend
+            .embed_documents(&["fn parse_manifest", "class PodController"])
+            .expect("embed with ORT");
+        assert_eq!(blobs.len(), 2);
+        for blob in &blobs {
+            let v = crate::model::blob_to_f32(blob);
+            assert_eq!(v.len(), md.output_dim());
+            let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            assert!(
+                (norm - 1.0).abs() < 1e-3,
+                "vectors must be l2-normalized, got norm {norm}"
+            );
+        }
+    }
+
+    /// CoreML on Apple Silicon: the accelerated factory must actually CONFIRM the
+    /// EP (not decline), and its vectors must match tract's within the issue #6
+    /// drift bound. Runs for real on the macos-14 (M1) CI runner.
+    #[cfg(feature = "ort-coreml")]
+    #[test]
+    #[ignore = "needs Apple Silicon + the bge-small-en-v1.5 fixture"]
+    fn coreml_confirms_and_matches_tract() {
+        let dir = fixture("bge-small-en-v1.5");
+        let md = ModelDescriptor::load(&dir).unwrap();
+
+        let ort_backend = ort::OrtFactory::accelerated()
+            .try_build(&dir, &md)
+            .expect("CoreML factory must not error")
+            .expect("CoreML must be CONFIRMED on Apple Silicon, not declined");
+        assert_eq!(ort_backend.backend_name(), "ort/CoreML");
+        assert!(ort_backend.is_accelerated());
+
+        let tract_backend = tract::TractFactory.try_build(&dir, &md).unwrap().unwrap();
+        let texts = ["function: parseManifest", "class: PodController"];
+        let a = tract_backend.embed_documents(&texts).unwrap();
+        let b = ort_backend.embed_documents(&texts).unwrap();
+        for (blob_a, blob_b) in a.iter().zip(&b) {
+            let va = crate::model::blob_to_f32(blob_a);
+            let vb = crate::model::blob_to_f32(blob_b);
+            let cos: f32 = va.iter().zip(&vb).map(|(x, y)| x * y).sum();
+            // Looser than the ort/CPU bound: CoreML may run fp16 on the ANE.
+            assert!(cos >= 0.99, "tract vs CoreML cosine too low: {cos}");
+        }
+    }
+
+    // ── --capabilities handshake ─────────────────────────────────────────────
+
+    /// True for every build: the payload must describe the registry it was
+    /// built from, whatever features are on.
+    #[test]
+    fn capabilities_reports_the_real_registry() {
+        let c = capabilities();
+        assert_eq!(c.capabilities_version, 1);
+        assert_eq!(c.plugin_version, env!("CARGO_PKG_VERSION"));
+        let engines: Vec<&str> = registry().iter().map(|f| f.engine()).collect();
+        assert_eq!(c.engines, engines);
+        // tract is always compiled in, so its families are always enumerable.
+        assert!(c.families.contains(&"bert"), "{:?}", c.families);
+        assert!(c.families.contains(&"minilm"), "{:?}", c.families);
+        // Deduped: two factories reporting overlapping lists must not double up.
+        let mut sorted = c.families.clone();
+        sorted.sort_unstable();
+        let before = sorted.len();
+        sorted.dedup();
+        assert_eq!(before, sorted.len(), "families contains duplicates");
+    }
+
+    /// The default build is the one the travsr CLI must treat `families` as a
+    /// hard allowlist for — no universal engine means a family outside the list
+    /// genuinely cannot run.
+    #[cfg(not(feature = "ort"))]
+    #[test]
+    fn capabilities_on_default_build_is_a_closed_allowlist() {
+        let c = capabilities();
+        assert_eq!(c.engines, vec!["tract"]);
+        assert!(!c.universal_onnx);
+        assert!(!c.accelerated_compiled);
+    }
+
+    #[cfg(feature = "ort")]
+    #[test]
+    fn capabilities_with_ort_is_universal() {
+        let c = capabilities();
+        assert!(
+            c.universal_onnx,
+            "an ORT build must advertise universal ONNX support"
+        );
+    }
+
+    /// Compiling a hardware EP is what `accelerated_compiled` claims — nothing
+    /// about whether this machine has the hardware.
+    #[cfg(any(
+        feature = "ort-coreml",
+        feature = "ort-cuda",
+        feature = "ort-tensorrt",
+        feature = "ort-webgpu"
+    ))]
+    #[test]
+    fn capabilities_with_hw_ep_feature_reports_accelerated_compiled() {
+        assert!(capabilities().accelerated_compiled);
+    }
+
+    #[test]
+    fn capabilities_serializes_to_json_with_the_documented_keys() {
+        let json = serde_json::to_string(&capabilities()).unwrap();
+        for key in [
+            "plugin_version",
+            "capabilities_version",
+            "engines",
+            "families",
+            "universal_onnx",
+            "accelerated_compiled",
+        ] {
+            assert!(json.contains(key), "missing key '{key}' in {json}");
+        }
+    }
+
+    // ── single_submitter ────────────────────────────────────────────────────
+
+    /// The trait default ties single-submit to acceleration; `OrtBackend`
+    /// overrides it (see its impl). Both halves matter, so pin the default here.
+    #[test]
+    fn single_submitter_defaults_to_is_accelerated() {
+        let cpu = FakeBackend {
+            name: "x",
+            accelerated: false,
+        };
+        let gpu = FakeBackend {
+            name: "y",
+            accelerated: true,
+        };
+        assert!(!cpu.single_submitter());
+        assert!(gpu.single_submitter());
     }
 
     #[test]
@@ -456,20 +671,13 @@ mod tests {
     /// local model. Engines differ only in matmul accumulation order, so cosine
     /// similarity between their vectors must be ≥ 0.999 (issue #6 drift bound).
     ///
-    /// Needs `~/.travsr/models/bge-small-en-v1.5` on disk — run explicitly:
+    /// Needs the bge-small-en-v1.5 fixture on disk — run explicitly:
     ///   cargo test --features ort -- --ignored
     #[cfg(feature = "ort")]
     #[test]
-    #[ignore = "needs a locally installed bge-small-en-v1.5 model"]
+    #[ignore = "needs the bge-small-en-v1.5 fixture (see CONTRIBUTING.md)"]
     fn tract_vs_ort_cpu_cosine_parity() {
-        let dir = dirs::home_dir()
-            .expect("HOME not set")
-            .join(".travsr/models/bge-small-en-v1.5");
-        assert!(
-            dir.join("model.onnx").exists(),
-            "model not installed: {}",
-            dir.display()
-        );
+        let dir = fixture("bge-small-en-v1.5");
         let md = ModelDescriptor::load(&dir).unwrap();
 
         let tract_backend = tract::TractFactory

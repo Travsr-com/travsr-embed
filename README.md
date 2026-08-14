@@ -9,6 +9,38 @@ The `travsr` CLI downloads a prebuilt `travsr-embed` binary per platform from th
 repo's [GitHub Releases](https://github.com/Travsr-com/travsr-embed/releases); most
 users never build it directly.
 
+## Which release asset do I want?
+
+The default asset for your platform always works. GPU assets are opt-in **except
+on macOS**, where acceleration is free (statically linked, nothing to install):
+
+| Your machine | Asset | Accelerator | Host prerequisite |
+| --- | --- | --- | --- |
+| macOS (Apple Silicon or Intel) | default | CoreML — ANE + GPU | none |
+| Linux x86_64 + NVIDIA GPU | `…-x86_64-unknown-linux-gnu-cuda` | CUDA | CUDA runtime + cuDNN, and a Haswell-or-newer CPU (`x86-64-v3`) |
+| Linux x86_64, no GPU | default | — (tract, CPU) | none |
+| Linux aarch64 (incl. OCI) | default | — (tract, CPU) | none |
+| Windows x86_64 | default | — (tract, CPU) | none |
+
+The `-cuda` asset ships extra `libonnxruntime_providers_*.so` files. **Keep them
+in the same directory as the binary** — it finds them via an `$ORIGIN` rpath. Each
+shipped file has a `.sha256` sidecar.
+
+Nothing silently degrades: if a GPU asset cannot initialize its accelerator (no
+driver, wrong CUDA version, missing provider libraries), the sidecar logs the
+reason and falls back to CPU inference rather than failing. The worst case of
+downloading the wrong asset is CPU speed, not a broken install.
+
+Not yet available, and why:
+
+- **Windows + NVIDIA** — ONNX Runtime does publish a CUDA build for
+  `x86_64-pc-windows-msvc`, but this repo forces the static CRT (`/MT`) for
+  `esaxx-rs`, and whether that links against ORT's prebuilt is unverified. CI
+  probes it on every PR; the asset ships once that is green.
+- **AMD / Intel GPUs** — needs either DirectML or ROCm, neither of which has a
+  prebuilt ONNX Runtime for any target here, or the experimental WebGPU provider.
+  WebGPU is compiled and checked in CI (`ort-webgpu`) but not yet published.
+
 ## Binaries
 
 | Binary | Purpose |
@@ -40,12 +72,35 @@ runtime deps). ONNX Runtime support is opt-in:
 | --- | --- |
 | `ort` | ONNX Runtime CPU execution, the universal fallback for model families `tract` cannot run (ModernBERT, nomic-bert, ...). |
 | `ort-coreml` | Hardware acceleration on macOS (ANE + GPU), zero extra install. |
-| `ort-cuda` | Hardware acceleration on Linux/Windows x86_64. Needs a host CUDA 12 runtime + cuDNN. |
-| `ort-tensorrt` | TensorRT execution provider. Needs the same CUDA 12 host stack as `ort-cuda`. |
+| `ort-cuda` | Hardware acceleration on Linux/Windows x86_64. Needs a host CUDA runtime + cuDNN. |
+| `ort-tensorrt` | TensorRT execution provider. Needs the same CUDA host stack as `ort-cuda`. |
+| `ort-webgpu` | Vendor-neutral GPU (AMD/Intel/NVIDIA) via DX12/Vulkan/Metal. **Experimental upstream**; not shipped as a release asset yet. |
+
+Only providers with a prebuilt ONNX Runtime are listed. `ort` exposes DirectML,
+ROCm, OpenVINO and XNNPACK features too, but none has a prebuilt for a target this
+repo ships, so using them would mean building ONNX Runtime from source. When
+prebuilts appear, each is one line in the execution-provider cascade plus a
+feature — see `src/backend/ort.rs`.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for which of these can be built on which
+host (notably: no ORT feature builds on a Windows *GNU* toolchain).
 
 Backend selection at runtime is capability-based: each registered backend
 declares which model families it can run, and the sidecar picks the first
 backend, in preference order, that can serve the model actually being loaded.
+
+### Reporting what a build can do
+
+```bash
+travsr-embed --capabilities
+```
+
+Prints the compiled engines, the model families they can run, and whether an
+accelerator is compiled in, as JSON. The `travsr` CLI uses this to refuse a model
+the installed sidecar cannot execute at *selection* time, instead of failing part
+way through a background reindex. `accelerated_compiled` reports what was
+compiled, not whether this machine's GPU will actually be confirmed at load time —
+that answer needs a real model load, and appears in the startup log.
 
 ## Usage
 

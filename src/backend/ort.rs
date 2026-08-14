@@ -37,7 +37,7 @@ use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
 use ort::value::Tensor;
 
-use super::{BackendFactory, EmbedBackend, TargetInfo, PREF_ACCELERATED, PREF_UNIVERSAL_CPU};
+use super::{BackendFactory, EmbedBackend, PREF_ACCELERATED, PREF_UNIVERSAL_CPU};
 use crate::encode::{BucketSpec, Encoder, TokenBatch, GPU_BUCKETS};
 use crate::model::ModelDescriptor;
 
@@ -54,7 +54,12 @@ pub struct OrtFactory {
 impl OrtFactory {
     // Registered only when a hardware EP feature is compiled in.
     #[cfg_attr(
-        not(any(feature = "ort-coreml", feature = "ort-cuda", feature = "ort-tensorrt")),
+        not(any(
+            feature = "ort-coreml",
+            feature = "ort-cuda",
+            feature = "ort-tensorrt",
+            feature = "ort-webgpu"
+        )),
         allow(dead_code)
     )]
     pub fn accelerated() -> Self {
@@ -80,7 +85,14 @@ impl BackendFactory for OrtFactory {
         true
     }
 
-    fn preference(&self, _target: &TargetInfo) -> i32 {
+    // None = universal, matching `can_run` above. There is no finite list to
+    // report, and inventing one would make the handshake claim a smaller
+    // capability than the engine has.
+    fn supported_families(&self) -> Option<&'static [&'static str]> {
+        None
+    }
+
+    fn preference(&self) -> i32 {
         if self.accelerated {
             PREF_ACCELERATED
         } else {
@@ -133,6 +145,20 @@ fn hardware_ep_cascade() -> Vec<(&'static str, ExecutionProviderDispatch)> {
         cascade.push((
             "CoreML",
             CoreMLExecutionProvider::default()
+                .build()
+                .error_on_failure(),
+        ));
+    }
+    // Last of the hardware EPs: vendor-neutral (AMD/Intel/NVIDIA via
+    // DX12/Vulkan/Metal) but experimental upstream, so a vendor-specific EP above
+    // is always preferred when one is compiled in. Ranked below CoreML for the
+    // same reason on macOS.
+    #[cfg(feature = "ort-webgpu")]
+    {
+        use ort::execution_providers::WebGPUExecutionProvider;
+        cascade.push((
+            "WebGPU",
+            WebGPUExecutionProvider::default()
                 .build()
                 .error_on_failure(),
         ));
@@ -324,6 +350,14 @@ impl EmbedBackend for OrtBackend {
 
     fn is_accelerated(&self) -> bool {
         self.accelerated
+    }
+
+    // True even for ort/CPU, unlike the trait default. Every submission has to
+    // take the session mutex (`Session::run` is `&mut self`), so N worker
+    // threads would just queue behind it — N threads' overhead for one thread's
+    // throughput. ORT's intra-op pool is what parallelises the CPU path.
+    fn single_submitter(&self) -> bool {
+        true
     }
 
     fn dim(&self) -> usize {

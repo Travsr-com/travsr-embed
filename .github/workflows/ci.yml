@@ -24,12 +24,33 @@ env:
 
 jobs:
   ci:
-    name: CI (${{ matrix.os }})
+    name: CI (${{ matrix.os }}, ${{ matrix.label }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-14]
+        # Issue #6 landed src/backend/ort.rs (300+ lines) behind optional
+        # features, and no job compiled any of it: not fmt, not clippy, not
+        # test. The ORT engine could rot for a whole release cycle without CI
+        # noticing. The `ort` rows below close that hole.
+        #
+        # ort-coreml goes on macos-14 specifically because those runners are
+        # M1 — the CoreML EP has real hardware to initialize there, so the
+        # accelerated factory's warm-up confirmation path is exercised for
+        # real rather than just type-checked.
+        include:
+          - os: ubuntu-24.04
+            label: default
+            flags: ""
+          - os: macos-14
+            label: default
+            flags: ""
+          - os: ubuntu-24.04
+            label: ort
+            flags: "--features ort"
+          - os: macos-14
+            label: ort-coreml
+            flags: "--features ort-coreml"
 
     steps:
       - uses: actions/checkout@v4
@@ -64,8 +85,13 @@ jobs:
           # inside the workspace by this point, so the recursive glob folded its
           # lockfile into the key and any travsr master commit touching deps
           # this repo does not even use threw away the whole target/ cache.
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          #
+          # matrix.label is in the key because the feature rows build a
+          # different dependency graph (ort + its downloaded ONNX Runtime) into
+          # the same target/ dir; sharing one key would make the rows evict
+          # each other's artifacts on every run.
+          key: ${{ runner.os }}-cargo-${{ matrix.label }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-${{ matrix.label }}-
 
       # L7: this repo path-depends on travsr-plugin-{protocol,sdk} from the
       # sibling checked out above. When a paired travsr-side protocol change
@@ -76,7 +102,7 @@ jobs:
         id: preflight
         continue-on-error: true
         shell: bash
-        run: cargo check --all-targets --quiet 2>&1 | tee "$RUNNER_TEMP/preflight.log"
+        run: cargo check --all-targets ${{ matrix.flags }} --quiet 2>&1 | tee "$RUNNER_TEMP/preflight.log"
 
       - name: Explain a preflight failure
         if: steps.preflight.outcome == 'failure'
@@ -107,14 +133,94 @@ jobs:
           fi
           exit 1
 
+      # Formatting is feature-independent — one run per OS is enough, and
+      # repeating it on the feature rows would only duplicate failures.
       - name: fmt
+        if: matrix.flags == ''
         run: cargo fmt --all -- --check
 
       - name: clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets ${{ matrix.flags }} -- -D warnings
 
       - name: test
-        run: cargo test --all-targets
+        run: cargo test --all-targets ${{ matrix.flags }}
+
+      # The model-backed tests (cross-backend parity, the ModernBERT fixture,
+      # CoreML confirmation) are #[ignore] because they need real weights on
+      # disk. That made them tests nobody ran. The ORT rows stage fixtures and
+      # run them, so the parity bound and the "tract cannot load ModernBERT"
+      # claim are actually checked rather than merely asserted in a comment.
+      - name: Cache model fixtures
+        if: matrix.flags != ''
+        uses: actions/cache@v4
+        with:
+          path: ~/.travsr/models
+          key: test-fixtures-v1
+
+      - name: Fetch model fixtures
+        if: matrix.flags != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/scripts/fetch-test-models.sh
+
+      - name: Model-backed backend tests
+        if: matrix.flags != ''
+        run: cargo test ${{ matrix.flags }} --bin travsr-embed backend:: -- --ignored
+
+  # Issue #6: release.yml ships a CUDA artifact for x86_64 Linux, so the
+  # ort-cuda build must link on every PR. Build-only by construction — GitHub
+  # runners have no NVIDIA GPU, and EP initialization is a *runtime* event, so a
+  # successful link is the strongest signal CI can give. Functional CUDA
+  # verification is the manual per-release checklist in CONTRIBUTING.md.
+  ort-cuda-link:
+    name: ORT CUDA link check (x86_64 Linux)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: Travsr-com/travsr
+          path: _travsr
+          ref: master
+      - name: Symlink travsr sibling for Cargo patch paths
+        run: ln -sfn "$GITHUB_WORKSPACE/_travsr" "$GITHUB_WORKSPACE/../travsr"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Its own cache key: ort's CUDA prebuilt is hundreds of MB, far larger
+      # than every other job's dependency set put together. Sharing the ci
+      # job's key would push that payload into every unrelated run.
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-ortcuda-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-ortcuda-cargo-
+
+      - name: Build (release, --features ort-cuda)
+        run: cargo build --release --features ort-cuda
+
+      # release.yml has to bundle ORT's dynamic provider libraries next to the
+      # binary, and its glob must match their real names. Print what the build
+      # actually produced so the bundling step is written against observed
+      # filenames instead of guesses — and so a rename upstream shows up here.
+      - name: Record ONNX Runtime libraries the build produced
+        run: |
+          echo "::group::ONNX Runtime artifacts in target/release"
+          ls -la target/release | grep -i onnx || echo "(none found at top level)"
+          echo "::endgroup::"
+
+      # WebGPU is the only prebuilt path to AMD/Intel GPUs (DirectML and ROCm have
+      # no prebuilt for any target we ship). Upstream calls it experimental, so it
+      # is checked here but not yet published as a release artifact — this step is
+      # the evidence that has to accumulate first. Cheap: the wgpu prebuilt is a
+      # fraction of the CUDA one, and the CUDA download above is already cached.
+      - name: ORT WebGPU build check (cross-vendor GPU path)
+        continue-on-error: true
+        run: cargo build --release --features ort-webgpu
 
   # Issue #12: release.yml publishes a x86_64-pc-windows-msvc binary, so prove
   # the MSVC build compiles and links on every PR instead of discovering
@@ -171,6 +277,35 @@ jobs:
       - name: Test (runtime smoke for the Windows build flags)
         run: cargo test --release --target x86_64-pc-windows-msvc
 
+      # Issue #6 wants a CUDA artifact for Windows NVIDIA users, and ort does
+      # publish a prebuilt for x86_64-pc-windows-msvc (its dist manifest has
+      # cu12 and cu13 rows for this target — the original "Windows deferred"
+      # note was about DirectML, which has no prebuilt).
+      #
+      # Non-blocking on purpose, for now. The open question is the CRT: this job
+      # forces /MT via +crt-static above (esaxx-rs hardcodes static_crt(true)),
+      # and if ort's prebuilt import libs are /MD this fails with LNK2038. That
+      # cannot be reproduced locally without MSVC build tools, and ort publishes
+      # no prebuilt for the windows-*gnu* toolchain at all, so CI is the first
+      # place the answer exists. Read the outcome here before PR-5 adds the
+      # Windows -cuda release row; promote this step to blocking at that point.
+      - name: ORT CUDA build check (non-blocking — CRT compatibility probe)
+        id: ort_cuda_win
+        continue-on-error: true
+        run: cargo build --release --features ort-cuda --target x86_64-pc-windows-msvc
+
+      - name: Report the ORT CUDA probe outcome
+        shell: bash
+        run: |
+          if [ "${{ steps.ort_cuda_win.outcome }}" = "success" ]; then
+            echo "::notice::ort-cuda builds on windows-msvc with +crt-static — the Windows CUDA artifact is viable."
+            echo "::group::ONNX Runtime DLLs produced"
+            ls -la target/x86_64-pc-windows-msvc/release | grep -i onnx || echo "(none at top level)"
+            echo "::endgroup::"
+          else
+            echo "::warning::ort-cuda failed to build on windows-msvc. If this is LNK2038 (RuntimeLibrary mismatch), the Windows CUDA artifact needs either an ort build without +crt-static or ort's load-dynamic mode. Windows keeps shipping tract-only until resolved."
+          fi
+
   msrv:
     name: MSRV (1.91)
     runs-on: ubuntu-24.04
@@ -202,6 +337,14 @@ jobs:
       # duplicated. The ci job owns the diagnosis.
       - name: build (MSRV)
         run: cargo build --all-targets
+
+      # Issue #6: the mac release artifacts ship ORT compiled in, so ort's own
+      # MSRV becomes this repo's problem. ort 2.0.0-rc.12 / ort-sys declare
+      # rust-version 1.88, comfortably under our 1.91 — this step keeps that
+      # claim honest instead of trusting it, and catches an rc bump that
+      # quietly raises it.
+      - name: check (MSRV, --features ort)
+        run: cargo check --all-targets --features ort
 
   deny:
     name: cargo-deny
@@ -235,5 +378,11 @@ jobs:
 
       # deny.toml is deliberately kept in sync with travsr's own (see its
       # header comment) - a job that never runs cannot hold that invariant.
+      #
+      # --all-features (issue #6): the optional `ort` dependency tree was
+      # invisible to this job, so the crates the mac and CUDA artifacts actually
+      # ship were never license- or advisory-checked. See deny.toml's note on
+      # the ONNX Runtime *binary*, which is not a cargo dep and so is outside
+      # cargo-deny's reach either way.
       - name: Check advisories, licenses, and bans
-        run: cargo deny check advisories licenses bans sources
+        run: cargo deny --all-features check advisories licenses bans sources

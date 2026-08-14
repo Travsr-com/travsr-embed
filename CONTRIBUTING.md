@@ -32,12 +32,47 @@ concluding an ORT build is broken - a `-gnu` default host is the usual answer.
 Pass `--target x86_64-pc-windows-msvc` (and have the MSVC toolset installed), or
 do ORT work on Linux/macOS and let CI cover Windows.
 
-Windows also needs the two defines CI sets, or `usearch` fails to compile:
+Windows also needs the two defines CI sets, or `usearch` fails to compile —
+`usearch` 2.24.0 names the POSIX `MAP_FAILED` in a branch Windows never takes,
+but the compiler still has to parse it, and there is no `sys/mman.h` here. The
+failure is easy to misread: the build script retries with each SIMD backend
+disabled in turn, so one missing define prints as six near-identical walls of
+errors ending in `Failed to compile after disabling "SIMSIMD_TARGET_HASWELL"`.
+Only the first one matters.
+
+Set them for **the shell you are actually in** — the syntaxes are not
+interchangeable, and pasting the wrong one is its own confusing failure
+(`$env:CFLAGS = ...` in cmd.exe reports "The filename, directory name, or volume
+label syntax is incorrect", which sounds like a broken checkout and is not).
+They last only for the current window.
 
 ```bash
+# Git Bash / WSL
 export CFLAGS="-DSIMSIMD_TARGET_SAPPHIRE=0 -DMAP_FAILED=((void*)-1)"
 export CXXFLAGS="$CFLAGS"
 ```
+
+```powershell
+# PowerShell
+$env:CFLAGS = "-DSIMSIMD_TARGET_SAPPHIRE=0 -DMAP_FAILED=((void*)-1)"
+$env:CXXFLAGS = $env:CFLAGS
+```
+
+```bat
+REM cmd.exe — no quotes, and CXXFLAGS cannot reference %CFLAGS% on the next line
+REM reliably inside a script, so just repeat it
+set CFLAGS=-DSIMSIMD_TARGET_SAPPHIRE=0 -DMAP_FAILED=((void*)-1)
+set CXXFLAGS=-DSIMSIMD_TARGET_SAPPHIRE=0 -DMAP_FAILED=((void*)-1)
+```
+
+Running the built binary differs too: `./target/debug/travsr-embed` in Git Bash,
+`.\target\debug\travsr-embed.exe` in PowerShell, `target\debug\travsr-embed.exe`
+in cmd.exe.
+
+One Windows-specific test note: run `cargo test --release`. In **debug** builds
+`index::tests::build_from_db_partitions_code_and_doc_spaces` segfaults inside
+`usearch`'s native code. It reproduces on a clean tree, so it is not something
+your branch broke; CI tests Windows in release mode and passes.
 
 ### Type-checking `src/backend/ort.rs` without a prebuilt
 

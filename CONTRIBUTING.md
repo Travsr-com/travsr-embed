@@ -24,13 +24,17 @@ and that download is per-target, so where you can build what is not uniform:
 | macOS (arm64/x86_64) | `--features ort`, `--features ort-coreml`. CoreML is in every macOS prebuilt, statically linked, no extra install. |
 | Linux x86_64 | `--features ort`, `--features ort-cuda` (running it needs a host CUDA runtime + cuDNN; building it does not). |
 | Linux aarch64 | `--features ort` only - no GPU prebuilt exists for this target. |
-| Windows **MSVC** | **Nothing, measured.** `ort`, `ort-webgpu` and `ort-cuda` all fail to link under this repo's `+crt-static` (required by `esaxx-rs`), with `LNK2019` on `__imp_*` symbols — ORT's prebuilt wants the dynamic CRT. Not provider-specific: the unresolved symbols come from ONNX Runtime's own object code, which is why CPU-only ORT fails too. Three non-blocking probes in `ci.yml`'s Windows job keep this measured. **All Windows GPU support is gated behind ORT's `load-dynamic` mode** — do not add Windows `ort` features one at a time before that lands. |
-| Windows **GNU** | **Nothing.** `ort` publishes no prebuilt for `x86_64-pc-windows-gnu` and the build fails in `ort-sys` with "does not provide prebuilt binaries". |
+| Windows **MSVC** | Use **`--features ort-directml`** (or `ort-dynamic` for CPU-only ORT). No *statically linked* ort feature works here: `ort`, `ort-webgpu` and `ort-cuda` all fail with `LNK2019` on `__imp_*` symbols under this repo's `+crt-static` (required by `esaxx-rs`), because ORT's prebuilt wants the dynamic CRT. Not provider-specific — CPU-only ORT fails identically, since the unresolved symbols come from ONNX Runtime's own object code. Three non-blocking probes in `ci.yml` keep that measured. `ort-directml` avoids it entirely by linking no ORT at build time. |
+| Windows **GNU** | Same as MSVC: `--features ort-directml` / `ort-dynamic` build and link fine, because `load-dynamic` needs no prebuilt. Only the statically linked features are unavailable (ort publishes no windows-gnu binary at all). |
 
-So on Windows, check which toolchain is actually active (`rustup show`) before
-concluding an ORT build is broken - a `-gnu` default host is the usual answer.
-Pass `--target x86_64-pc-windows-msvc` (and have the MSVC toolset installed), or
-do ORT work on Linux/macOS and let CI cover Windows.
+On Windows, reach for `ort-directml` and not the statically linked features. If
+you hit `ort-sys: does not provide prebuilt binaries for the target ...` you asked
+for a static one; if you hit `LNK2019` on `__imp_*` you asked for a static one on
+MSVC. Neither is fixable from this side — both mean "use load-dynamic".
+
+`ort-directml` needs a DirectML-enabled `onnxruntime.dll` at run time, beside the
+binary or at `ORT_DYLIB_PATH`. Without it the backend declines and you get tract
+on CPU, with the reason in the log at `RUST_LOG=info`.
 
 Windows also needs the two defines CI sets, or `usearch` fails to compile —
 `usearch` 2.24.0 names the POSIX `MAP_FAILED` in a branch Windows never takes,

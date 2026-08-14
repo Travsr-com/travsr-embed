@@ -46,12 +46,16 @@ Not yet available, and why:
   Vulkan / Metal and so works on any modern adapter: `ort-webgpu` builds and is
   CI-checked **on Linux**, and upstream still marks it experimental, so it is not
   published yet.
-- **Windows GPU of any kind** — blocked, and measured as such. No ORT feature
-  links on `x86_64-pc-windows-msvc` under the static CRT this repo needs for
-  `esaxx-rs` (see CONTRIBUTING). Unblocking Windows means switching its ORT
-  builds to `load-dynamic`, which loads `onnxruntime.dll` at run time and so
-  links no ORT statically at all. Until then Windows is CPU-only regardless of
-  the GPU installed.
+- **Windows GPU** — works via `ort-directml`, which drives **any DX12 adapter**:
+  Intel, AMD and NVIDIA alike. It is built differently from the other GPU
+  features: no ORT is linked at build time (that is impossible on Windows — the
+  static CRT this repo needs for `esaxx-rs` conflicts with ORT's prebuilt, see
+  CONTRIBUTING), so `onnxruntime.dll` is loaded at run time instead, from beside
+  the executable or from `ORT_DYLIB_PATH`.
+
+  The DLL must be a DirectML-enabled build of ONNX Runtime. If it is missing the
+  sidecar logs the reason and runs on CPU — it does not fail, and it does not
+  hang.
 
 ## Binaries
 

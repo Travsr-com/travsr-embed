@@ -74,15 +74,42 @@ default = []                                          # tract only — byte-iden
 ort = ["dep:ort"]
 # Hardware-accelerated execution providers (each implies the ORT CPU engine).
 #
-# Only EPs with a prebuilt in ort's distribution manifest are listed. DirectML,
-# ROCm, OpenVINO and XNNPACK have Cargo features upstream but no prebuilt for any
-# target we ship, so enabling them would require building ONNX Runtime from
-# source — deliberately out of scope (issue #6). WebGPU is the cross-vendor
-# (AMD/Intel) path in the meantime.
+# The EPs below link ONNX Runtime statically from ort's prebuilt distribution.
+# That works on macOS and Linux and is preferred there: one self-contained
+# binary, nothing to locate at run time.
+#
+# It does NOT work on Windows — see the `ort-*-dynamic` block below. ROCm,
+# OpenVINO and XNNPACK have Cargo features upstream but no prebuilt for any
+# target we ship, so they would need ONNX Runtime built from source; still out of
+# scope (issue #6). OpenVINO is also the only route to an Intel NPU.
 ort-coreml   = ["ort", "ort/coreml"]                  # macOS ANE+GPU, zero-install
 ort-cuda     = ["ort", "ort/cuda"]                    # Linux/Win x86_64, needs CUDA + cuDNN on the host
 ort-tensorrt = ["ort", "ort/tensorrt", "ort/cuda"]    # Linux/Win x86_64, needs TensorRT
-ort-webgpu   = ["ort", "ort/webgpu"]                  # Win/Linux x86_64 + macOS arm64; any GPU vendor; EXPERIMENTAL upstream
+ort-webgpu   = ["ort", "ort/webgpu"]                  # Linux x86_64 + macOS arm64; any GPU vendor; EXPERIMENTAL upstream
+
+# ── Windows: dynamically loaded ONNX Runtime ──────────────────────────────────
+# Windows cannot use the statically linked features above. `esaxx-rs` (via
+# tokenizers) hardcodes the static CRT, so this crate must build /MT, while ort's
+# prebuilt Windows libraries want the dynamic CRT — linking them together fails
+# with LNK2019 on __imp_* symbols. That is not provider-specific: CPU-only ORT
+# fails identically, because the unresolved symbols come from ONNX Runtime's own
+# object code. CI measures all three (see ci.yml's Windows job).
+#
+# `load-dynamic` sidesteps it rather than solving it: nothing is linked at build
+# time and `onnxruntime.dll` is loaded at run time, so the two CRTs never have to
+# agree. Two consequences worth knowing:
+#
+#   1. The DLL must be present at run time. Windows searches the executable's own
+#      directory first, so the copy release.yml ships beside the binary wins;
+#      ORT_DYLIB_PATH overrides. Absent, the backend declines and the resolver
+#      falls back to tract — slower, never broken.
+#   2. We are no longer limited to ort's prebuilt set, because we supply the DLL.
+#      That is what makes DirectML reachable: it has no ort prebuilt, but
+#      Microsoft ships a DirectML-enabled onnxruntime.dll. DirectML drives ANY
+#      DX12 adapter, so it is the one Windows path that serves Intel and AMD GPUs
+#      rather than NVIDIA alone.
+ort-dynamic  = ["ort", "ort/load-dynamic"]            # Windows ORT CPU; loads onnxruntime.dll at run time
+ort-directml = ["ort-dynamic", "ort/directml"]        # Windows GPU, ANY vendor (Intel/AMD/NVIDIA) via DX12
 
 # ── Local development override ────────────────────────────────────────────────
 [patch.crates-io]

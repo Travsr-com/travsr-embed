@@ -370,8 +370,39 @@ jobs:
             ls -la target/x86_64-pc-windows-msvc/release | grep -i onnx || echo "(none at top level)"
             echo "::endgroup::"
           else
-            echo "::warning::ort-cuda does not build on windows-msvc under +crt-static (expected: LNK2019 on __imp_* symbols — ort's prebuilt wants the dynamic CRT). This is the known state, not a regression. Windows ships tract-only; ort's load-dynamic mode is the candidate fix. See the comment above this step."
+            echo "::warning::ort-cuda does not build on windows-msvc under +crt-static (expected: LNK2019 on __imp_* symbols — ort's prebuilt wants the dynamic CRT). This is the known state, not a regression. Statically linked ORT stays unavailable on Windows; the shipping path is ort-directml via load-dynamic, built below."
           fi
+
+      # The Windows GPU path that actually works, so unlike the probes above this
+      # one BLOCKS. load-dynamic links no ONNX Runtime at build time, so the CRT
+      # conflict that kills every static ort feature never arises; the library is
+      # loaded at run time instead. DirectML rather than CUDA because it drives any
+      # DX12 adapter — Intel and AMD included, not NVIDIA alone.
+      #
+      # Build-only, like the CUDA link check: runners have no usable GPU, and EP
+      # initialization is a runtime event. What this proves is that the Windows GPU
+      # build compiles and links, which is exactly what regressed before.
+      - name: Build ort-directml (Windows GPU path, load-dynamic)
+        run: cargo build --release --features ort-directml --target x86_64-pc-windows-msvc
+
+      # Guards the failure mode that cost the most to find: with load-dynamic and
+      # no onnxruntime.dll, ort's internal `.expect()` is unreachable on Windows
+      # because the failed LoadLibrary raises a modal error dialog a background
+      # process cannot display — the sidecar hangs forever instead of failing.
+      # backend::ort::ensure_dylib_present exists to turn that into a decline, and
+      # `--capabilities` is the cheapest exercise of a no-DLL run: if the guard
+      # regresses, this step times out instead of printing JSON.
+      - name: No-DLL run must not hang (regression guard)
+        shell: bash
+        timeout-minutes: 3
+        run: |
+          BIN=target/x86_64-pc-windows-msvc/release/travsr-embed.exe
+          ls "$(dirname $BIN)"/onnxruntime.dll 2>/dev/null \
+            && { echo "::error::onnxruntime.dll present — this step must run WITHOUT it"; exit 1; }
+          out="$("$BIN" --capabilities)" || { echo "::error::exited non-zero without a DLL"; exit 1; }
+          echo "$out"
+          echo "$out" | grep -q '"accelerated_compiled":true' \
+            || { echo "::error::DirectML not reported as compiled in"; exit 1; }
 
   msrv:
     name: MSRV (1.91)

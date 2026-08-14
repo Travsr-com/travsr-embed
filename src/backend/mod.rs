@@ -94,6 +94,7 @@ fn registry() -> Vec<Box<dyn BackendFactory>> {
     #[cfg(any(
         feature = "ort-coreml",
         feature = "ort-cuda",
+        feature = "ort-directml",
         feature = "ort-tensorrt",
         feature = "ort-webgpu"
     ))]
@@ -617,6 +618,7 @@ mod tests {
     #[cfg(any(
         feature = "ort-coreml",
         feature = "ort-cuda",
+        feature = "ort-directml",
         feature = "ort-tensorrt",
         feature = "ort-webgpu"
     ))]

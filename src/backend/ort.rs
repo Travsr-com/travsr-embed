@@ -27,6 +27,18 @@
 // shapes beats per-batch BatchLongest shapes. Padded rows/columns carry
 // attention-mask 0 and are dropped before pooling — output values are
 // unaffected, only tensor shapes change.
+//
+// LINKING: on macOS and Linux ONNX Runtime is linked statically from ort's
+// prebuilt and this module need do nothing about it. Windows cannot link it at
+// all (static-CRT conflict — see Cargo.toml's `ort-dynamic` block), so Windows
+// builds use ort's `load-dynamic` and load onnxruntime.dll at run time.
+//
+// That needs no code here: ort asks the OS for "onnxruntime.dll", and Windows
+// searches the executable's own directory FIRST (ahead of the system directories
+// and PATH), so the copy release.yml ships beside the binary is the one that
+// loads. Set ORT_DYLIB_PATH to override — ort reads it before falling back to the
+// bare name. If no DLL is found the session fails to build, the factory declines,
+// and the resolver falls back to tract: CPU speed, never a broken sidecar.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -115,6 +127,68 @@ impl BackendFactory for OrtFactory {
     }
 }
 
+/// Fail fast if the dynamically-loaded ONNX Runtime is not where ort will look.
+///
+/// MUST run before the first ORT API call on `load-dynamic` builds. ort resolves
+/// the library lazily inside `setup_api()` and, if it cannot, calls
+/// `.expect("Failed to load ONNX Runtime dylib")`. That is not a recoverable
+/// error we could turn into a decline — and on Windows it does not even fail
+/// loudly: the failed `LoadLibrary` raises a modal system error dialog which a
+/// background sidecar has no window to display, so the process **hangs forever**.
+/// Measured, not theorised: without this guard `embed-jsonl` printed its startup
+/// line and then blocked until killed.
+///
+/// A hang is the worst outcome available — worse than running on CPU, and worse
+/// than exiting — because a reindex that never returns looks like a slow machine.
+/// A cheap `is_file()` first turns it into an ordinary decline, and the resolver
+/// falls back to tract.
+///
+/// This deliberately checks only ORT_DYLIB_PATH and the executable's directory,
+/// not the full OS search path. A system-wide ONNX Runtime therefore needs
+/// ORT_DYLIB_PATH set explicitly. That is the right trade: reproducing Windows'
+/// search order here would be guesswork, and being explicit costs one env var
+/// while guessing costs an unkillable-looking reindex.
+#[cfg(feature = "ort-dynamic")]
+fn ensure_dylib_present() -> Result<()> {
+    use anyhow::bail;
+    use std::path::PathBuf;
+
+    let name = if cfg!(windows) {
+        "onnxruntime.dll"
+    } else if cfg!(target_os = "macos") {
+        "libonnxruntime.dylib"
+    } else {
+        "libonnxruntime.so"
+    };
+
+    if let Some(raw) = std::env::var_os("ORT_DYLIB_PATH").filter(|v| !v.is_empty()) {
+        let path = PathBuf::from(&raw);
+        if path.is_file() {
+            return Ok(());
+        }
+        bail!(
+            "ORT_DYLIB_PATH is set to {} but no file is there. Point it at a real \
+             ONNX Runtime library, or unset it to use the {name} shipped beside the \
+             executable.",
+            path.display()
+        );
+    }
+
+    let adjacent = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join(name)));
+    match adjacent {
+        Some(path) if path.is_file() => Ok(()),
+        Some(path) => bail!(
+            "no {name} next to the executable (looked for {}). This build loads ONNX \
+             Runtime at run time; ship the library alongside the binary, or set \
+             ORT_DYLIB_PATH to an existing copy. Falling back to the CPU engine.",
+            path.display()
+        ),
+        None => bail!("cannot determine the executable's directory to locate {name}"),
+    }
+}
+
 /// One hardware execution provider attempt in the cascade, in preference order.
 /// Assembled from compiled features — adding an EP (ROCm, DirectML) is one
 /// entry here plus a Cargo feature.
@@ -145,6 +219,22 @@ fn hardware_ep_cascade() -> Vec<(&'static str, ExecutionProviderDispatch)> {
         cascade.push((
             "CoreML",
             CoreMLExecutionProvider::default()
+                .build()
+                .error_on_failure(),
+        ));
+    }
+    // Windows' answer for every GPU vendor. DirectML drives any DX12 adapter —
+    // Intel, AMD and NVIDIA alike — which matters because CUDA covers only one of
+    // those and Windows has no other working GPU path (see the load-dynamic note
+    // in this module's header). Ranked under CUDA: on an NVIDIA card the vendor
+    // stack still wins, and this is the fallback that makes the other two vendors
+    // work at all.
+    #[cfg(feature = "ort-directml")]
+    {
+        use ort::execution_providers::DirectMLExecutionProvider;
+        cascade.push((
+            "DirectML",
+            DirectMLExecutionProvider::default()
                 .build()
                 .error_on_failure(),
         ));
@@ -209,6 +299,12 @@ impl OrtBackend {
         desc: ModelDescriptor,
         ep: Option<(&'static str, ExecutionProviderDispatch)>,
     ) -> Result<Self> {
+        // Before ANY ort call: a missing dylib is an unrecoverable panic inside
+        // ort, and on Windows a silent hang. Both entry points funnel through
+        // here. No-op on statically linked builds.
+        #[cfg(feature = "ort-dynamic")]
+        ensure_dylib_present()?;
+
         let model_path = model_dir.join("model.onnx");
         let (ep_label, accelerated) = match &ep {
             Some((name, _)) => (*name, true),

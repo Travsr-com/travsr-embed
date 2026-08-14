@@ -82,19 +82,34 @@ jobs:
             os: windows-latest
             extra_defs: "-DMAP_FAILED=((void*)-1)"
             rustflags: "-Ctarget-feature=+crt-static"
-          # NO Windows `-cuda` row, and this is now a measured fact rather than a
-          # caution. ort DOES publish a CUDA prebuilt for this triple, so it is
-          # not a platform gap — but that prebuilt wants the DYNAMIC CRT, while
-          # the rustflags above force /MT (esaxx-rs hardcodes static_crt(true)).
-          # Linking fails with 59 LNK2019s on `__imp_*` (dllimport) symbols. See
-          # ci.yml's "ORT CUDA build check" step, which keeps probing it.
+          # Windows GPU, every vendor. NOT a `-cuda` row: ort's CUDA prebuilt for
+          # this triple wants the dynamic CRT while the rustflags above force /MT,
+          # so it fails to link (59 LNK2019s on `__imp_*`) — as do ALL statically
+          # linked ort features, CPU-only included. ci.yml keeps probing them.
           #
-          # Dropping +crt-static does not fix it (esaxx-rs then mismatches the
-          # other way). The candidate fix is ort's `load-dynamic`, which links no
-          # ORT statically and dlopens onnxruntime.dll at run time; that needs its
-          # own feature, DLL discovery, and verification, so it is follow-up work.
-          # When it lands, this row mirrors the Linux -cuda row minus the rpath —
-          # Windows already searches the .exe's own directory.
+          # This row sidesteps that instead of fighting it: `ort-directml` uses
+          # ort's load-dynamic, linking no ONNX Runtime at build time and loading
+          # onnxruntime.dll at run time, so the two CRTs never have to agree. It
+          # also frees us from ort's prebuilt set, which is what makes DirectML
+          # reachable — and DirectML drives ANY DX12 adapter, so one artifact
+          # serves Intel, AMD and NVIDIA rather than NVIDIA alone.
+          #
+          # No rpath needed: Windows searches the .exe's own directory first.
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            extra_defs: "-DMAP_FAILED=((void*)-1)"
+            rustflags: "-Ctarget-feature=+crt-static"
+            features: ort-directml
+            suffix: "-directml"
+            # Bundle a DirectML-enabled ONNX Runtime beside the binary. Microsoft's
+            # package, pinned by version AND sha256: this DLL is loaded into the
+            # sidecar's own process, so an unverified download would be arbitrary
+            # code execution on every user's machine. 1.24.2 matches the ONNX
+            # Runtime that ort 2.0.0-rc.12 targets — keep them in step when either
+            # moves, since a mismatched ORT API version fails at run time.
+            ort_dll_pkg: microsoft.ml.onnxruntime.directml
+            ort_dll_ver: "1.24.2"
+            ort_dll_sha256: c9b8adb96dfb5578097bea42a7d9b7ff8f300fb3c3a6f3052fe5b702628ab681
 
     steps:
       - uses: actions/checkout@v4
@@ -119,6 +134,41 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      # load-dynamic builds link no ONNX Runtime, so the artifact is useless
+      # without the library beside it — and worse than useless if the library is
+      # not the one we vetted, since it is loaded straight into the sidecar's
+      # process. Hence: pinned version, checked sha256, and a hard failure rather
+      # than any attempt to carry on with an unverified DLL.
+      - name: Fetch and verify the DirectML ONNX Runtime
+        if: matrix.ort_dll_pkg != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          pkg='${{ matrix.ort_dll_pkg }}'; ver='${{ matrix.ort_dll_ver }}'
+          want='${{ matrix.ort_dll_sha256 }}'
+          url="https://api.nuget.org/v3-flatcontainer/$pkg/$ver/$pkg.$ver.nupkg"
+          echo "fetching $url"
+          curl -fsSL --retry 3 -o pkg.nupkg "$url"
+
+          got="$(sha256sum pkg.nupkg | awk '{print $1}')"
+          if [ "$got" != "$want" ]; then
+            echo "::error::sha256 mismatch for $pkg $ver — expected $want, got $got. Refusing to bundle an unverified ONNX Runtime."
+            exit 1
+          fi
+          echo "sha256 verified: $got"
+
+          # Only the native win-x64 payload; the package also carries managed
+          # assemblies this sidecar has no use for.
+          unzip -o -q pkg.nupkg 'runtimes/win-x64/native/*'
+          mkdir -p ortlib
+          cp runtimes/win-x64/native/onnxruntime.dll ortlib/
+          # Present in the package and copied when it exists: ORT loads it for
+          # out-of-tree providers. Not fatal if a future package drops it.
+          cp runtimes/win-x64/native/onnxruntime_providers_shared.dll ortlib/ 2>/dev/null || true
+          ls -la ortlib
+          # DirectML.dll itself is a Windows system component (System32) from
+          # Win10 1903 on, so it is deliberately NOT bundled.
 
       - name: Build
         shell: bash
@@ -162,8 +212,11 @@ jobs:
           # providers are named libonnxruntime_providers_{shared,cuda}.so and the
           # dot-form glob silently missed all of them. `cp -L` because copy-dylibs
           # leaves symlinks on Linux and a symlink in a tarball is useless.
+          # `ortlib/` is the verified DirectML runtime fetched above (load-dynamic
+          # builds link nothing, so copy-dylibs leaves nothing in TARGET_DIR — the
+          # library has to come from there instead).
           shopt -s nullglob
-          LIBS=("$TARGET_DIR"/libonnxruntime* "$TARGET_DIR"/onnxruntime*.dll)
+          LIBS=("$TARGET_DIR"/libonnxruntime* "$TARGET_DIR"/onnxruntime*.dll ortlib/*.dll)
           shopt -u nullglob
 
           # Guard: an unsuffixed asset is a DEFAULT asset and must contain no ORT
@@ -176,6 +229,18 @@ jobs:
             printf '::error::  %s\n' "${LIBS[@]}"
             echo "::error::Default assets must be self-contained. Give this build a matrix suffix, or find out why static linking stopped applying."
             exit 1
+          fi
+
+          # Mirror guard: a load-dynamic build links no ONNX Runtime, so shipping
+          # one without the library produces an artifact that quietly runs on CPU
+          # forever — the backend declines, the resolver falls back to tract, and
+          # nothing looks broken. A GPU artifact that is secretly a CPU artifact is
+          # worse than a failed release, because nobody reports it.
+          if [ -n "${{ matrix.ort_dll_pkg }}" ]; then
+            case " ${LIBS[*]} " in
+              *onnxruntime.dll*) : ;;
+              *) echo "::error::${{ matrix.target }}${{ matrix.suffix }} is a load-dynamic build but no onnxruntime.dll was bundled — it would silently run on CPU."; exit 1 ;;
+            esac
           fi
 
           for lib in "${LIBS[@]}"; do

@@ -39,9 +39,19 @@ Not yet available, and why:
   `__imp_*` symbols. Not a platform gap and not unknown — CI probes it on every
   PR. The fix under consideration is ORT's `load-dynamic` mode, which loads
   `onnxruntime.dll` at run time and so avoids the CRT conflict entirely.
-- **AMD / Intel GPUs** — needs DirectML or ROCm (no prebuilt ONNX Runtime for any
-  target here) or the WebGPU provider. `ort-webgpu` does build — CI verifies it —
-  but upstream still marks WebGPU experimental, so it is not published yet.
+- **AMD / Intel GPUs** — the providers that drive them natively (DirectML, ROCm,
+  and OpenVINO, which is also the only route to an Intel NPU) have no prebuilt
+  ONNX Runtime for any target here, so reaching them means building ONNX Runtime
+  from source. The portable alternative is WebGPU, which runs through D3D12 /
+  Vulkan / Metal and so works on any modern adapter: `ort-webgpu` builds and is
+  CI-checked **on Linux**, and upstream still marks it experimental, so it is not
+  published yet.
+- **Windows GPU of any kind** — blocked, and measured as such. No ORT feature
+  links on `x86_64-pc-windows-msvc` under the static CRT this repo needs for
+  `esaxx-rs` (see CONTRIBUTING). Unblocking Windows means switching its ORT
+  builds to `load-dynamic`, which loads `onnxruntime.dll` at run time and so
+  links no ORT statically at all. Until then Windows is CPU-only regardless of
+  the GPU installed.
 
 ## Binaries
 

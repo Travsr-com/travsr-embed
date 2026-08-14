@@ -24,7 +24,7 @@ and that download is per-target, so where you can build what is not uniform:
 | macOS (arm64/x86_64) | `--features ort`, `--features ort-coreml`. CoreML is in every macOS prebuilt, statically linked, no extra install. |
 | Linux x86_64 | `--features ort`, `--features ort-cuda` (running it needs a host CUDA runtime + cuDNN; building it does not). |
 | Linux aarch64 | `--features ort` only - no GPU prebuilt exists for this target. |
-| Windows **MSVC** | `--features ort-cuda` does **not** link: ORT's prebuilt wants the dynamic CRT, this repo forces `/MT` for `esaxx-rs`, and the link fails with `LNK2019` on `__imp_*` symbols. Whether plain `--features ort` and `ort-webgpu` link is being measured by the two non-blocking probes in `ci.yml`'s Windows job — expect them to fail the same way, since the unresolved symbols come from ONNX Runtime's own object code rather than from the CUDA provider. Needs the MSVC C++ build tools installed either way. |
+| Windows **MSVC** | **Nothing, measured.** `ort`, `ort-webgpu` and `ort-cuda` all fail to link under this repo's `+crt-static` (required by `esaxx-rs`), with `LNK2019` on `__imp_*` symbols — ORT's prebuilt wants the dynamic CRT. Not provider-specific: the unresolved symbols come from ONNX Runtime's own object code, which is why CPU-only ORT fails too. Three non-blocking probes in `ci.yml`'s Windows job keep this measured. **All Windows GPU support is gated behind ORT's `load-dynamic` mode** — do not add Windows `ort` features one at a time before that lands. |
 | Windows **GNU** | **Nothing.** `ort` publishes no prebuilt for `x86_64-pc-windows-gnu` and the build fails in `ort-sys` with "does not provide prebuilt binaries". |
 
 So on Windows, check which toolchain is actually active (`rustup show`) before

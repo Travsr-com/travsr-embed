@@ -287,6 +287,47 @@ jobs:
       - name: Build (release, mirrors release.yml)
         run: cargo build --release --target x86_64-pc-windows-msvc
 
+      # Scopes the CRT problem. The ort-cuda probe below fails on __imp_* CRT
+      # symbols, and those come from ONNX Runtime's OWN object code, not from the
+      # CUDA provider — so plain `ort` is expected to fail identically, and the
+      # blocker is "ORT on Windows under +crt-static", not "CUDA on Windows".
+      # CONTRIBUTING previously asserted `--features ort` builds here; nothing
+      # ever tested that, so this step exists to settle it either way.
+      #
+      # `build`, not `check`: the failure is at LINK time, and `cargo check`
+      # never links, so it would pass while a real build breaks.
+      - name: ORT CPU build check (non-blocking — is the CRT block CUDA-only?)
+        id: ort_cpu_probe
+        continue-on-error: true
+        run: cargo build --release --features ort --target x86_64-pc-windows-msvc
+
+      # The only prebuilt accelerator that can reach a non-NVIDIA Windows GPU:
+      # ort's dist manifest has a `wgpu` row for this target, and WebGPU goes
+      # through D3D12, which every DX12 FL 11+ adapter supports — Intel Arc and
+      # AMD included. If this links, an experimental Windows -webgpu artifact is
+      # viable and is the first GPU path for Intel/AMD hardware; if it fails the
+      # same way as ort-cuda, then ALL Windows GPU work is gated behind ort's
+      # load-dynamic mode and we stop trying features one at a time.
+      - name: ORT WebGPU build check (non-blocking — Intel/AMD GPU path)
+        id: ort_webgpu_probe
+        continue-on-error: true
+        run: cargo build --release --features ort-webgpu --target x86_64-pc-windows-msvc
+
+      - name: Report what ORT can and cannot link on Windows
+        shell: bash
+        run: |
+          cpu='${{ steps.ort_cpu_probe.outcome }}'
+          gpu='${{ steps.ort_webgpu_probe.outcome }}'
+          echo "ort (CPU):     $cpu"
+          echo "ort-webgpu:    $gpu"
+          if [ "$cpu" = "failure" ] && [ "$gpu" = "failure" ]; then
+            echo "::notice::Confirmed: NO ort feature links on windows-msvc under +crt-static — the blocker is ORT-on-Windows generally, not any one provider. Windows GPU support is gated behind ort's load-dynamic mode. Do not add Windows ort features one at a time until that lands."
+          elif [ "$gpu" = "success" ]; then
+            echo "::notice::ort-webgpu LINKS on windows-msvc. This is the first viable GPU path for Intel/AMD Windows hardware — worth a release row and a real-hardware check (DX12 FL11+ adapter, watch the GPU's Compute/3D engine while embedding)."
+          else
+            echo "::notice::ort (CPU) links but ort-webgpu does not — the CRT issue is provider-specific after all. Re-read both logs before drawing conclusions."
+          fi
+
       # PR #13 review ask: prove the MAP_FAILED define and +crt-static at
       # runtime, not just at build. The unit suite includes usearch HNSW
       # build/save/load/knn roundtrips (src/index.rs) that exercise the

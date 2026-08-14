@@ -165,7 +165,9 @@ jobs:
 
       - name: Model-backed backend tests
         if: matrix.flags != ''
-        run: cargo test ${{ matrix.flags }} --bin travsr-embed backend:: -- --ignored
+        # Quoted: the `backend::` test filter contains a colon, which YAML would
+        # otherwise read as a nested mapping key and reject the whole workflow.
+        run: "cargo test ${{ matrix.flags }} --bin travsr-embed backend:: -- --ignored"
 
   # Issue #6: release.yml ships a CUDA artifact for x86_64 Linux, so the
   # ort-cuda build must link on every PR. Build-only by construction — GitHub

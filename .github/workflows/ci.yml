@@ -157,17 +157,33 @@ jobs:
           path: ~/.travsr/models
           key: test-fixtures-v1
 
+      # Reports ready=true/false rather than failing when the fixture release is
+      # not set up yet. An unconfigured fixture store is a missing capability,
+      # not a defect in the code under test — failing here would paint every PR
+      # red for something no reviewer can act on, and "expected red" is
+      # indistinguishable from real red. A checksum MISMATCH still fails hard.
       - name: Fetch model fixtures
+        id: fixtures
         if: matrix.flags != ''
         env:
           GH_TOKEN: ${{ github.token }}
         run: bash .github/scripts/fetch-test-models.sh
 
       - name: Model-backed backend tests
-        if: matrix.flags != ''
+        if: matrix.flags != '' && steps.fixtures.outputs.ready == 'true'
         # Quoted: the `backend::` test filter contains a colon, which YAML would
         # otherwise read as a nested mapping key and reject the whole workflow.
         run: "cargo test ${{ matrix.flags }} --bin travsr-embed backend:: -- --ignored"
+
+      # Says out loud that coverage was lost. The whole point of issue #6's test
+      # work was that these tests existed but nobody ran them; a silent skip
+      # would put us back there, just with more YAML.
+      - name: Note that model-backed tests were skipped
+        if: matrix.flags != '' && steps.fixtures.outputs.ready != 'true'
+        run: |
+          echo "::warning::Model-backed backend tests were SKIPPED: no verified fixtures available."
+          echo "::warning::Not covered by this run: tract-vs-ORT numerical parity, the ModernBERT capability proof, and CoreML EP confirmation."
+          echo "::warning::To enable: create the fixtures release and record its checksums (CONTRIBUTING.md)."
 
   # Issue #6: release.yml ships a CUDA artifact for x86_64 Linux, so the
   # ort-cuda build must link on every PR. Build-only by construction — GitHub

@@ -82,16 +82,19 @@ jobs:
             os: windows-latest
             extra_defs: "-DMAP_FAILED=((void*)-1)"
             rustflags: "-Ctarget-feature=+crt-static"
-          # NOT YET: a Windows `-cuda` row. ort DOES publish a CUDA prebuilt for
-          # x86_64-pc-windows-msvc, so this is not a platform gap — it is an
-          # unresolved CRT question. The rustflags above force /MT (esaxx-rs
-          # hardcodes static_crt(true)), and if ort's prebuilt import libraries
-          # are /MD the link fails with LNK2038. ci.yml has a non-blocking
-          # `ORT CUDA build check` step that answers this on every PR; once it is
-          # observed green, add the row here (mirroring the Linux -cuda row, minus
-          # the rpath — Windows already searches the .exe's own directory) and
-          # promote that CI step to blocking. Do not ship an artifact whose build
-          # has never been seen to succeed.
+          # NO Windows `-cuda` row, and this is now a measured fact rather than a
+          # caution. ort DOES publish a CUDA prebuilt for this triple, so it is
+          # not a platform gap — but that prebuilt wants the DYNAMIC CRT, while
+          # the rustflags above force /MT (esaxx-rs hardcodes static_crt(true)).
+          # Linking fails with 59 LNK2019s on `__imp_*` (dllimport) symbols. See
+          # ci.yml's "ORT CUDA build check" step, which keeps probing it.
+          #
+          # Dropping +crt-static does not fix it (esaxx-rs then mismatches the
+          # other way). The candidate fix is ort's `load-dynamic`, which links no
+          # ORT statically and dlopens onnxruntime.dll at run time; that needs its
+          # own feature, DLL discovery, and verification, so it is follow-up work.
+          # When it lands, this row mirrors the Linux -cuda row minus the rpath —
+          # Windows already searches the .exe's own directory.
 
     steps:
       - uses: actions/checkout@v4

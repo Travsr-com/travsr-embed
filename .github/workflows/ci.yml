@@ -284,14 +284,22 @@ jobs:
       # cu12 and cu13 rows for this target — the original "Windows deferred"
       # note was about DirectML, which has no prebuilt).
       #
-      # Non-blocking on purpose, for now. The open question is the CRT: this job
-      # forces /MT via +crt-static above (esaxx-rs hardcodes static_crt(true)),
-      # and if ort's prebuilt import libs are /MD this fails with LNK2038. That
-      # cannot be reproduced locally without MSVC build tools, and ort publishes
-      # no prebuilt for the windows-*gnu* toolchain at all, so CI is the first
-      # place the answer exists. Read the outcome here before PR-5 adds the
-      # Windows -cuda release row; promote this step to blocking at that point.
-      - name: ORT CUDA build check (non-blocking — CRT compatibility probe)
+      # ANSWERED, and the answer is no: this currently FAILS with 59 LNK2019
+      # unresolved externals, every one of them prefixed `__imp_` (__imp_fmax,
+      # __imp_strncpy, __imp__wstat, …). That prefix is dllimport, so ort's
+      # prebuilt Windows libraries were built against the DYNAMIC CRT (/MD) and
+      # expect import stubs this job's +crt-static (/MT) does not provide. It is
+      # the CRT mismatch we suspected, just surfacing as LNK2019 rather than the
+      # LNK2038 form.
+      #
+      # Kept, and kept non-blocking, because it is the tripwire for that
+      # changing: pyke shipping /MT-compatible libraries would show up here as a
+      # green step. The likely fix on our side is ort's `load-dynamic`, which
+      # dlopens onnxruntime.dll at run time and so links no ORT statically at
+      # all, sidestepping the CRT question entirely. Dropping +crt-static is NOT
+      # a fix: esaxx-rs hardcodes static_crt(true), so that just moves the
+      # mismatch. Until one of those lands, Windows ships tract-only.
+      - name: ORT CUDA build check (non-blocking — known-failing CRT tripwire)
         id: ort_cuda_win
         continue-on-error: true
         run: cargo build --release --features ort-cuda --target x86_64-pc-windows-msvc
@@ -305,7 +313,7 @@ jobs:
             ls -la target/x86_64-pc-windows-msvc/release | grep -i onnx || echo "(none at top level)"
             echo "::endgroup::"
           else
-            echo "::warning::ort-cuda failed to build on windows-msvc. If this is LNK2038 (RuntimeLibrary mismatch), the Windows CUDA artifact needs either an ort build without +crt-static or ort's load-dynamic mode. Windows keeps shipping tract-only until resolved."
+            echo "::warning::ort-cuda does not build on windows-msvc under +crt-static (expected: LNK2019 on __imp_* symbols — ort's prebuilt wants the dynamic CRT). This is the known state, not a regression. Windows ships tract-only; ort's load-dynamic mode is the candidate fix. See the comment above this step."
           fi
 
   msrv:

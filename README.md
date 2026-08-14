@@ -33,13 +33,15 @@ downloading the wrong asset is CPU speed, not a broken install.
 
 Not yet available, and why:
 
-- **Windows + NVIDIA** — ONNX Runtime does publish a CUDA build for
-  `x86_64-pc-windows-msvc`, but this repo forces the static CRT (`/MT`) for
-  `esaxx-rs`, and whether that links against ORT's prebuilt is unverified. CI
-  probes it on every PR; the asset ships once that is green.
-- **AMD / Intel GPUs** — needs either DirectML or ROCm, neither of which has a
-  prebuilt ONNX Runtime for any target here, or the experimental WebGPU provider.
-  WebGPU is compiled and checked in CI (`ort-webgpu`) but not yet published.
+- **Windows + NVIDIA** — ONNX Runtime publishes a CUDA build for
+  `x86_64-pc-windows-msvc`, but it expects the *dynamic* CRT, while this repo
+  forces the static one (`/MT`, required by `esaxx-rs`). Linking fails on
+  `__imp_*` symbols. Not a platform gap and not unknown — CI probes it on every
+  PR. The fix under consideration is ORT's `load-dynamic` mode, which loads
+  `onnxruntime.dll` at run time and so avoids the CRT conflict entirely.
+- **AMD / Intel GPUs** — needs DirectML or ROCm (no prebuilt ONNX Runtime for any
+  target here) or the WebGPU provider. `ort-webgpu` does build — CI verifies it —
+  but upstream still marks WebGPU experimental, so it is not published yet.
 
 ## Binaries
 

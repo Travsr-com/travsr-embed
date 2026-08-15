@@ -49,8 +49,16 @@ jobs:
           # present on the HOST, so a default-shipped CUDA build would break every
           # GPU-less machine. $ORIGIN rpath so the bundled provider .so files
           # resolve from beside the binary rather than a system path.
+          #
+          # ubuntu-24.04, unlike every other Linux row: ort's prebuilt ONNX Runtime
+          # references `__isoc23_strtol` and friends, which glibc only exports from
+          # 2.38. The 22.04 runner ships 2.35, so this row failed to LINK there —
+          # and only at tag time, because ci.yml's ort-cuda-link check already ran
+          # on 24.04. Exactly the CI-versus-release gap this PR closes elsewhere.
+          # Keep this runner and ci.yml's in step; the default rows stay on 22.04
+          # deliberately, since a lower glibc floor is a feature for a CPU binary.
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-22.04
+            os: ubuntu-24.04
             features: ort-cuda
             suffix: "-cuda"
             # Not spelled as a rustflags string: the Build step interpolates
@@ -272,11 +280,19 @@ jobs:
           case "${{ matrix.target }}" in *windows*) EXT=".exe" ;; esac
           BIN="dist/${{ env.BINARY }}-${{ matrix.target }}${{ matrix.suffix }}${EXT}"
 
-          # An arm64 runner cannot execute the x86_64-darwin binary without
-          # Rosetta, and cross-built Linux targets may not match the runner arch.
+          # Only x86_64-apple-darwin gets the escape hatch: it is built on an arm64
+          # runner and needs Rosetta to execute. Every other row runs natively
+          # (aarch64 linux builds on ubuntu-22.04-arm), so for them a binary that
+          # will not start IS the failure this step exists to catch — a `-cuda` or
+          # `-directml` asset that cannot resolve its ONNX Runtime at load time
+          # would otherwise print a warning and ship anyway.
           if ! "$BIN" --version; then
-            echo "::warning::Could not execute $BIN on this runner (cross-built target) — skipping smoke test."
-            exit 0
+            if [ "${{ matrix.target }}" = "x86_64-apple-darwin" ]; then
+              echo "::warning::x86_64-darwin binary would not start on this arm64 runner (no Rosetta) — skipping smoke test."
+              exit 0
+            fi
+            echo "::error::$BIN failed to start on its native runner. For an accelerated asset this usually means the bundled ONNX Runtime is missing or unloadable."
+            exit 1
           fi
 
           CAPS="$("$BIN" --capabilities)"

@@ -155,7 +155,11 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.travsr/models
-          key: test-fixtures-v1
+          # runner.os prefix even though the fixtures are OS-independent model
+          # files: GitHub does not guarantee cache restores across runner
+          # operating systems, so a single shared key relies on behaviour that is
+          # not promised.
+          key: ${{ runner.os }}-test-fixtures-v1
 
       # Reports ready=true/false rather than failing when the fixture release is
       # not set up yet. An unconfigured fixture store is a missing capability,

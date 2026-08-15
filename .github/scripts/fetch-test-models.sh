@@ -82,8 +82,15 @@ for row in "${FIXTURES[@]}"; do
   set -- $row
   name="$1" archive="$2" want="$3"
 
+  # Trust-on-first-use, deliberately. This is what makes the script idempotent —
+  # re-running it does not re-download hundreds of MB, and CI restores the same
+  # files from cache on every job. The cost is that an already-extracted fixture
+  # is never re-verified: if a cache entry is corrupted after the fact, it stays
+  # trusted. Accepted because the checksum guards the download path, which is
+  # where an attacker-controlled substitution would enter, and the cache is
+  # GitHub-scoped rather than public. Delete "$DEST/$name" to force re-fetch.
   if [ -f "$DEST/$name/model.onnx" ]; then
-    echo "already present: $name"
+    echo "already present: $name (not re-verified — see note above)"
     continue
   fi
 

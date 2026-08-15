@@ -38,9 +38,17 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
             features: ort-coreml
+          # NO ort-coreml, unlike aarch64 above: ort publishes no prebuilt ONNX
+          # Runtime for x86_64-apple-darwin at all, so any ort feature fails the
+          # build with "ort does not provide prebuilt binaries for the target".
+          # Intel Macs therefore ship the tract-only default. This is not a
+          # choice, it is the whole of what upstream offers.
+          #
+          # ci.yml cannot catch a regression here: its macOS rows run on
+          # macos-14, which is arm64, and build for the host, so ort-coreml is
+          # only ever compiled for aarch64. This comment is the guard.
           - target: x86_64-apple-darwin
             os: macos-latest
-            features: ort-coreml
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-22.04-arm   # native ARM64 runner - avoids cross Docker image gcc version limits
           - target: x86_64-unknown-linux-gnu

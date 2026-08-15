@@ -12,11 +12,14 @@ users never build it directly.
 ## Which release asset do I want?
 
 The default asset for your platform always works. GPU assets are opt-in **except
-on macOS**, where acceleration is free (statically linked, nothing to install):
+on Apple Silicon**, where acceleration is free (statically linked, nothing to
+install). Intel Macs are CPU-only: ONNX Runtime publishes no prebuilt for
+`x86_64-apple-darwin`, so no ORT-based engine can be built for them at all.
 
 | Your machine | Asset | Accelerator | Host prerequisite |
 | --- | --- | --- | --- |
-| macOS (Apple Silicon or Intel) | default | CoreML (ANE + GPU) | none |
+| macOS (Apple Silicon) | default | CoreML (ANE + GPU) | none |
+| macOS (Intel) | default | none (tract, CPU) | none |
 | Linux x86_64 + NVIDIA GPU | `…-x86_64-unknown-linux-gnu-cuda` | CUDA | CUDA runtime + cuDNN, glibc 2.38+, and a Haswell-or-newer CPU (`x86-64-v3`) |
 | Windows x86_64 + any GPU | `…-x86_64-pc-windows-msvc-directml.exe` | DirectML (Intel, AMD **or** NVIDIA) | a DirectX 12 GPU |
 | Linux x86_64, no GPU | default | none (tract, CPU) | none |

@@ -16,22 +16,22 @@ on macOS**, where acceleration is free (statically linked, nothing to install):
 
 | Your machine | Asset | Accelerator | Host prerequisite |
 | --- | --- | --- | --- |
-| macOS (Apple Silicon or Intel) | default | CoreML — ANE + GPU | none |
+| macOS (Apple Silicon or Intel) | default | CoreML (ANE + GPU) | none |
 | Linux x86_64 + NVIDIA GPU | `…-x86_64-unknown-linux-gnu-cuda` | CUDA | CUDA runtime + cuDNN, glibc 2.38+, and a Haswell-or-newer CPU (`x86-64-v3`) |
-| Windows x86_64 + any GPU | `…-x86_64-pc-windows-msvc-directml.exe` | DirectML — Intel, AMD **or** NVIDIA | a DirectX 12 GPU |
-| Linux x86_64, no GPU | default | — (tract, CPU) | none |
-| Linux aarch64 (incl. OCI) | default | — (tract, CPU) | none |
-| Windows x86_64, no GPU | default | — (tract, CPU) | none |
+| Windows x86_64 + any GPU | `…-x86_64-pc-windows-msvc-directml.exe` | DirectML (Intel, AMD **or** NVIDIA) | a DirectX 12 GPU |
+| Linux x86_64, no GPU | default | none (tract, CPU) | none |
+| Linux aarch64 (incl. OCI) | default | none (tract, CPU) | none |
+| Windows x86_64, no GPU | default | none (tract, CPU) | none |
 
 Accelerated assets ship their ONNX Runtime libraries alongside the binary
 (`libonnxruntime_providers_*.so` for `-cuda`, `onnxruntime.dll` for `-directml`).
-**Keep them in the same directory as the binary** — `-cuda` finds them via an
+**Keep them in the same directory as the binary.** `-cuda` finds them via an
 `$ORIGIN` rpath, and `-directml` loads its DLL at run time from beside the
 executable (or from `ORT_DYLIB_PATH`). Each shipped file has a `.sha256` sidecar.
 
 The glibc 2.38 floor on `-cuda` is inherited from ORT's prebuilt, which
 references `__isoc23_*` symbols added in that release. It rules out Ubuntu 22.04,
-Debian 12 and RHEL 9 — use the default CPU asset there, which has no such floor.
+Debian 12 and RHEL 9. Use the default CPU asset there, which has no such floor.
 
 Nothing silently degrades: if a GPU asset cannot initialize its accelerator (no
 driver, wrong CUDA version, missing provider libraries), the sidecar logs the
@@ -41,21 +41,21 @@ downloading the wrong asset is CPU speed, not a broken install.
 Windows deserves a note, because it is built differently from every other GPU
 asset. No ONNX Runtime is linked into it at all: the static CRT this repo needs
 for `esaxx-rs` conflicts with ORT's prebuilt, and that blocks *every* statically
-linked ORT feature there — CPU-only included, since the unresolved `__imp_*`
+linked ORT feature there, CPU-only included, since the unresolved `__imp_*`
 symbols come from ONNX Runtime's own object code. The `-directml` asset sidesteps
 that by loading `onnxruntime.dll` at run time instead, which is also what frees it
 from ORT's prebuilt set and makes DirectML reachable in the first place.
 
 Not yet available, and why:
 
-- **Intel NPU** (and any other OpenVINO-only target) — OpenVINO is the sole route
+- **Intel NPU** (and any other OpenVINO-only target): OpenVINO is the sole route
   to an NPU, and it has no prebuilt ONNX Runtime for any target here. Reaching it
   means building ONNX Runtime from source. Now that Windows loads its runtime
-  dynamically the constraint is softer than it looks — an OpenVINO-enabled DLL
-  would be the same shape of solution as the DirectML one — but nobody has tried
+  dynamically the constraint is softer than it looks (an OpenVINO-enabled DLL
+  would be the same shape of solution as the DirectML one), but nobody has tried
   it.
-- **ROCm** — same story: a Cargo feature exists upstream, no prebuilt does.
-- **WebGPU** — the portable path (D3D12 / Vulkan / Metal, so any modern adapter).
+- **ROCm**: same story, a Cargo feature exists upstream, no prebuilt does.
+- **WebGPU**: the portable path (D3D12 / Vulkan / Metal, so any modern adapter).
   `ort-webgpu` builds, and CI compiles it on Linux and Windows, though those
   checks are advisory (`continue-on-error`) rather than blocking. Upstream still
   marks WebGPU experimental, so no asset is published. On Windows it is redundant
@@ -102,12 +102,12 @@ Windows links no ONNX Runtime at build time and loads it at run time instead
 | Feature | Adds |
 | --- | --- |
 | `ort-dynamic` | ONNX Runtime CPU execution, loading `onnxruntime.dll` at run time. The only way to get ORT at all on Windows. |
-| `ort-directml` | Windows GPU on **any DX12 adapter** — Intel, AMD or NVIDIA. Implies `ort-dynamic`; ships the DLL beside the binary. |
+| `ort-directml` | Windows GPU on **any DX12 adapter**: Intel, AMD or NVIDIA. Implies `ort-dynamic`; ships the DLL beside the binary. |
 
 The statically linked features above cover every execution provider that has a
 prebuilt ONNX Runtime. `ort` also exposes ROCm, OpenVINO and XNNPACK, none of
 which has one for a target this repo ships. Loading the runtime dynamically lifts
-that restriction — it is how `ort-directml` exists at all — so an OpenVINO or ROCm
+that restriction (it is how `ort-directml` exists at all), so an OpenVINO or ROCm
 DLL is now a plausible route rather than a source build, just an untried one.
 Either way each is one line in the execution-provider cascade plus a feature; see
 `src/backend/ort.rs`.
@@ -129,8 +129,8 @@ Prints the compiled engines, the model families they can run, and whether an
 accelerator is compiled in, as JSON. The `travsr` CLI uses this to refuse a model
 the installed sidecar cannot execute at *selection* time, instead of failing part
 way through a background reindex. `accelerated_compiled` reports what was
-compiled, not whether this machine's GPU will actually be confirmed at load time —
-that answer needs a real model load, and appears in the startup log.
+compiled, not whether this machine's GPU will actually be confirmed at load time.
+That answer needs a real model load, and appears in the startup log.
 
 ## Usage
 

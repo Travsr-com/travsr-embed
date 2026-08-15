@@ -12,8 +12,9 @@ turns it into something users actually get GPU acceleration from, and something 
 actually verifies.
 
 ### Added
-- **GPU acceleration in shipped assets, on every platform.** macOS release
-  binaries now include the CoreML execution provider in the DEFAULT asset. ORT's
+- **GPU acceleration in shipped assets, on every platform.** macOS **Apple
+  Silicon** release binaries now include the CoreML execution provider in the
+  DEFAULT asset. ORT's
   macOS prebuilt links it statically, so this costs nothing to install. Linux
   x86_64 gains a separate `travsr-embed-x86_64-unknown-linux-gnu-cuda` asset for
   NVIDIA hosts, with ORT's provider libraries bundled beside the binary
@@ -85,7 +86,7 @@ actually verifies.
   fail if a default asset unexpectedly produces ORT runtime libraries.
 
 ### Notes for upgraders
-- **macOS users will see a backend change.** bert-family models now resolve to
+- **macOS Apple Silicon users will see a backend change.** bert-family models now resolve to
   `ort/CoreML` instead of `tract` (higher preference), so the first reindex after
   upgrading logs the existing backend-provenance warning and recommends
   `travsr embed reindex --rebuild`. That is intended: GPU and CPU float

@@ -14,7 +14,7 @@ use std::sync::Arc;
 use anyhow::{Context as _, Result};
 use tract_onnx::prelude::*;
 
-use super::{BackendFactory, EmbedBackend, TargetInfo, PREF_PREFERRED_CPU};
+use super::{BackendFactory, EmbedBackend, PREF_PREFERRED_CPU};
 use crate::encode::{Encoder, TokenBatch};
 use crate::model::ModelDescriptor;
 
@@ -33,7 +33,11 @@ impl BackendFactory for TractFactory {
         TRACT_FAMILIES.contains(&family)
     }
 
-    fn preference(&self, _target: &TargetInfo) -> i32 {
+    fn supported_families(&self) -> Option<&'static [&'static str]> {
+        Some(TRACT_FAMILIES)
+    }
+
+    fn preference(&self) -> i32 {
         PREF_PREFERRED_CPU
     }
 

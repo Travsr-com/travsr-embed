@@ -33,21 +33,34 @@ pub const MAX_SEQ: usize = 512;
 pub struct BucketSpec {
     /// Sequence length is rounded up to the smallest bucket that fits.
     pub seq_buckets: &'static [usize],
-    /// Batch count is rounded up to a multiple of this (padded rows get mask 0).
-    pub batch_multiple: usize,
+    /// Rows per batch for each entry of `seq_buckets`, same length and order.
+    ///
+    /// One row count per seq bucket, rather than "round the batch up to a
+    /// multiple of N": rounding still admits every multiple, so a run would emit
+    /// dozens of distinct row counts × 5 seq widths — hundreds of shapes, which
+    /// is what shape-caching engines re-optimize for. Pinning one row count per
+    /// width bounds the steady-state shape set to `seq_buckets.len()`.
+    pub rows_per_seq: &'static [usize],
 }
 
-/// Default buckets for GPU execution providers. Five seq shapes × padded batch
-/// counts keeps the number of distinct tensor shapes small enough that
-/// CUDA/TensorRT re-optimisation happens a handful of times, not per batch.
+/// Default buckets for GPU execution providers.
+///
+/// Row counts are ~TOKEN_BUDGET (4096) tokens per batch so each shape carries
+/// comparable work, and all are multiples of 8 to stay tensor-core friendly.
+/// Five seq widths × one row count each = five steady-state shapes, so
+/// CUDA/TensorRT kernel re-optimisation happens a handful of times per run
+/// rather than per batch.
 #[cfg_attr(not(feature = "ort"), allow(dead_code))] // consumed by the ORT engine
 pub const GPU_BUCKETS: BucketSpec = BucketSpec {
     seq_buckets: &[32, 64, 128, 256, MAX_SEQ],
-    batch_multiple: 8,
+    rows_per_seq: &[128, 64, 32, 16, 8],
 };
 
 impl BucketSpec {
-    fn pad_seq(&self, seq: usize) -> usize {
+    /// The seq width a batch of this longest-token-count will be padded to.
+    /// Public so the batch builder can group items by target shape before
+    /// tokenization, rather than discovering the shape afterwards.
+    pub fn pad_seq(&self, seq: usize) -> usize {
         self.seq_buckets
             .iter()
             .copied()
@@ -55,8 +68,45 @@ impl BucketSpec {
             .unwrap_or(MAX_SEQ)
     }
 
-    fn pad_batch(&self, batch: usize) -> usize {
-        batch.div_ceil(self.batch_multiple) * self.batch_multiple
+    /// Rows to pad a batch up to, for a sequence width already run through
+    /// `pad_seq`. Falls back to the last entry for widths at/above the top
+    /// bucket.
+    pub fn rows_for_seq(&self, padded_seq: usize) -> usize {
+        self.seq_buckets
+            .iter()
+            .position(|&b| b >= padded_seq)
+            .and_then(|i| self.rows_per_seq.get(i).copied())
+            .or_else(|| self.rows_per_seq.last().copied())
+            .unwrap_or(1)
+    }
+
+    /// Batch rows for this shape: the next power of two at or above `batch`,
+    /// capped at the bucket's row count. A batch that already meets or exceeds
+    /// the cap is used as-is — a bulk batch is built at exactly the cap, and
+    /// padding an oversized one down is impossible.
+    ///
+    /// Powers of two rather than "always pad up to the bucket's row count",
+    /// because that punished the path it was never aimed at. Bulk reindex builds
+    /// batches at the row count already, so padding only ever touched the tail —
+    /// but `embed_query` and the daemon's ad-hoc batches route through the same
+    /// `BucketSpec`, and a single query is one short text. It landed in seq=32 and
+    /// padded to 128 rows: 127 masked rows of wasted matmul for one useful one, on
+    /// the most latency-sensitive path there is, and on macOS the default asset
+    /// now ships CoreML so every user's query takes it.
+    ///
+    /// The shape-count bound survives. Every entry in `GPU_BUCKETS.rows_per_seq`
+    /// is itself a power of two, so a full bulk batch still lands on exactly the
+    /// cap and its shape is unchanged. The worst case grows from
+    /// `seq_buckets.len()` to `seq_buckets.len() × log2(max rows)` — 5 × 8 = 40
+    /// shapes if every size occurred, versus the hundreds that motivated bucketing
+    /// — and in practice a run uses two: the cap for bulk, 1 for queries.
+    fn pad_batch(&self, batch: usize, padded_seq: usize) -> usize {
+        let cap = self.rows_for_seq(padded_seq);
+        if batch >= cap {
+            batch
+        } else {
+            batch.next_power_of_two().min(cap)
+        }
     }
 }
 
@@ -136,7 +186,10 @@ impl Encoder {
             .unwrap_or(1);
 
         let (seq, padded_batch) = match bucket {
-            Some(b) => (b.pad_seq(longest), b.pad_batch(batch)),
+            Some(b) => {
+                let seq = b.pad_seq(longest);
+                (seq, b.pad_batch(batch, seq))
+            }
             None => (longest, batch),
         };
 
@@ -299,10 +352,109 @@ mod tests {
     }
 
     #[test]
-    fn bucket_batch_rounds_to_multiple() {
-        assert_eq!(GPU_BUCKETS.pad_batch(1), 8);
-        assert_eq!(GPU_BUCKETS.pad_batch(8), 8);
-        assert_eq!(GPU_BUCKETS.pad_batch(9), 16);
+    fn bucket_pads_batch_up_to_a_power_of_two_capped_at_the_row_count() {
+        // A full bulk batch is unchanged: every row count is itself a power of
+        // two, so bulk shapes are exactly what they were.
+        assert_eq!(GPU_BUCKETS.pad_batch(128, 32), 128);
+        assert_eq!(GPU_BUCKETS.pad_batch(16, 256), 16);
+        // Partial batches round up to a power of two, not all the way to the cap.
+        assert_eq!(GPU_BUCKETS.pad_batch(3, MAX_SEQ), 4);
+        assert_eq!(GPU_BUCKETS.pad_batch(100, 32), 128);
+        assert_eq!(GPU_BUCKETS.pad_batch(65, 32), 128);
+        assert_eq!(GPU_BUCKETS.pad_batch(33, 32), 64);
+    }
+
+    /// The single-query path, which is why `pad_batch` rounds instead of padding
+    /// to the cap. A query is one short text, so it lands in seq=32; padding it to
+    /// that bucket's 128 rows meant 127 masked rows of matmul for one real one, on
+    /// the latency-sensitive path, for every macOS user now that the default asset
+    /// ships CoreML.
+    #[test]
+    fn a_single_query_is_not_padded() {
+        for &seq in GPU_BUCKETS.seq_buckets {
+            assert_eq!(
+                GPU_BUCKETS.pad_batch(1, seq),
+                1,
+                "seq {seq}: a one-row batch must stay one row"
+            );
+        }
+    }
+
+    /// An oversized batch cannot be padded *down* — using the bucket row count
+    /// would silently drop rows, so the real count wins.
+    #[test]
+    fn bucket_never_shrinks_an_oversized_batch() {
+        assert_eq!(GPU_BUCKETS.pad_batch(200, MAX_SEQ), 200);
+    }
+
+    #[test]
+    fn rows_per_seq_covers_every_seq_bucket() {
+        assert_eq!(
+            GPU_BUCKETS.seq_buckets.len(),
+            GPU_BUCKETS.rows_per_seq.len(),
+            "every seq bucket needs a row count"
+        );
+        // All multiples of 8, and non-increasing as sequences get longer.
+        let mut prev = usize::MAX;
+        for (&seq, &rows) in GPU_BUCKETS.seq_buckets.iter().zip(GPU_BUCKETS.rows_per_seq) {
+            assert_eq!(rows % 8, 0, "seq {seq}: {rows} rows is not a multiple of 8");
+            assert!(rows <= prev, "seq {seq}: row count must not grow with seq");
+            prev = rows;
+        }
+    }
+
+    /// Padding's half of the shape-bound guarantee. Every possible batch size, at
+    /// every seq width, collapses onto a small fixed set of shapes — one per power
+    /// of two up to that width's row count, so `log2(rows) + 1` per width rather
+    /// than one shape per distinct batch size.
+    ///
+    /// This is the bound that replaced "exactly one shape per seq width" when
+    /// padding stopped rounding every batch up to the cap (see `pad_batch`). Still
+    /// far below the hundreds that motivated bucketing, and unlike the old bound
+    /// it does not charge a single query for 127 rows it never uses.
+    ///
+    /// The end-to-end bound is a property of the batch builder *and* this padding
+    /// together, so it is asserted where the builder lives —
+    /// `batching_tests::bucketed_batching_bounds_distinct_shapes` in main.rs.
+    /// Oversized batches are deliberately not fed here: they cannot be padded down
+    /// (see `bucket_never_shrinks_an_oversized_batch`) and the builder avoids them.
+    #[test]
+    fn every_underfull_batch_pads_into_a_small_fixed_shape_set() {
+        let mut shapes = std::collections::HashSet::new();
+        let mut expected = 0usize;
+        for (&bucket_seq, &rows) in GPU_BUCKETS.seq_buckets.iter().zip(GPU_BUCKETS.rows_per_seq) {
+            expected += rows.trailing_zeros() as usize + 1; // powers of two in 1..=rows
+            for batch in 1..=rows {
+                let seq = GPU_BUCKETS.pad_seq(bucket_seq);
+                shapes.insert((GPU_BUCKETS.pad_batch(batch, seq), seq));
+            }
+        }
+        assert_eq!(
+            shapes.len(),
+            expected,
+            "expected one shape per power of two per seq bucket, got {shapes:?}"
+        );
+        // The number that matters: still a handful, not hundreds.
+        assert!(
+            shapes.len() <= 40,
+            "shape set grew to {} — bucketing exists to keep this small",
+            shapes.len()
+        );
+    }
+
+    /// Bulk reindex must be untouched by the power-of-two change: the builder
+    /// produces batches at exactly the cap, and every cap is a power of two, so
+    /// full batches land on the same shape they always did.
+    #[test]
+    fn full_bulk_batches_keep_their_original_shape() {
+        for (&bucket_seq, &rows) in GPU_BUCKETS.seq_buckets.iter().zip(GPU_BUCKETS.rows_per_seq) {
+            assert!(
+                rows.is_power_of_two(),
+                "row count {rows} must be a power of two"
+            );
+            let seq = GPU_BUCKETS.pad_seq(bucket_seq);
+            assert_eq!(GPU_BUCKETS.pad_batch(rows, seq), rows);
+        }
     }
 
     #[test]

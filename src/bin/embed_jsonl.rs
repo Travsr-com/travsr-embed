@@ -106,6 +106,20 @@ fn json_str_field(line: &str, key: &str) -> Option<String> {
 }
 
 fn main() -> Result<()> {
+    // This tool's whole claim is that it runs the sidecar's engine cascade, so
+    // which engine it picked — and, on GPU builds, whether the execution provider
+    // actually confirmed — is the first thing anyone debugging a vector mismatch
+    // or an unexpectedly slow run needs. Those decisions are logged via `tracing`
+    // and were being discarded, leaving GPU-vs-CPU to be inferred from wall-clock
+    // and OS counters. Quiet by default (warn), `RUST_LOG=info` for the cascade.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+
     let mut model_dir: Option<PathBuf> = None;
     let mut input: Option<PathBuf> = None;
     let mut output: Option<PathBuf> = None;

@@ -9,6 +9,58 @@ The `travsr` CLI downloads a prebuilt `travsr-embed` binary per platform from th
 repo's [GitHub Releases](https://github.com/Travsr-com/travsr-embed/releases); most
 users never build it directly.
 
+## Which release asset do I want?
+
+The default asset for your platform always works. GPU assets are opt-in **except
+on macOS**, where acceleration is free (statically linked, nothing to install):
+
+| Your machine | Asset | Accelerator | Host prerequisite |
+| --- | --- | --- | --- |
+| macOS (Apple Silicon or Intel) | default | CoreML — ANE + GPU | none |
+| Linux x86_64 + NVIDIA GPU | `…-x86_64-unknown-linux-gnu-cuda` | CUDA | CUDA runtime + cuDNN, glibc 2.38+, and a Haswell-or-newer CPU (`x86-64-v3`) |
+| Windows x86_64 + any GPU | `…-x86_64-pc-windows-msvc-directml.exe` | DirectML — Intel, AMD **or** NVIDIA | a DirectX 12 GPU |
+| Linux x86_64, no GPU | default | — (tract, CPU) | none |
+| Linux aarch64 (incl. OCI) | default | — (tract, CPU) | none |
+| Windows x86_64, no GPU | default | — (tract, CPU) | none |
+
+Accelerated assets ship their ONNX Runtime libraries alongside the binary
+(`libonnxruntime_providers_*.so` for `-cuda`, `onnxruntime.dll` for `-directml`).
+**Keep them in the same directory as the binary** — `-cuda` finds them via an
+`$ORIGIN` rpath, and `-directml` loads its DLL at run time from beside the
+executable (or from `ORT_DYLIB_PATH`). Each shipped file has a `.sha256` sidecar.
+
+The glibc 2.38 floor on `-cuda` is inherited from ORT's prebuilt, which
+references `__isoc23_*` symbols added in that release. It rules out Ubuntu 22.04,
+Debian 12 and RHEL 9 — use the default CPU asset there, which has no such floor.
+
+Nothing silently degrades: if a GPU asset cannot initialize its accelerator (no
+driver, wrong CUDA version, missing provider libraries), the sidecar logs the
+reason and falls back to CPU inference rather than failing. The worst case of
+downloading the wrong asset is CPU speed, not a broken install.
+
+Windows deserves a note, because it is built differently from every other GPU
+asset. No ONNX Runtime is linked into it at all: the static CRT this repo needs
+for `esaxx-rs` conflicts with ORT's prebuilt, and that blocks *every* statically
+linked ORT feature there — CPU-only included, since the unresolved `__imp_*`
+symbols come from ONNX Runtime's own object code. The `-directml` asset sidesteps
+that by loading `onnxruntime.dll` at run time instead, which is also what frees it
+from ORT's prebuilt set and makes DirectML reachable in the first place.
+
+Not yet available, and why:
+
+- **Intel NPU** (and any other OpenVINO-only target) — OpenVINO is the sole route
+  to an NPU, and it has no prebuilt ONNX Runtime for any target here. Reaching it
+  means building ONNX Runtime from source. Now that Windows loads its runtime
+  dynamically the constraint is softer than it looks — an OpenVINO-enabled DLL
+  would be the same shape of solution as the DirectML one — but nobody has tried
+  it.
+- **ROCm** — same story: a Cargo feature exists upstream, no prebuilt does.
+- **WebGPU** — the portable path (D3D12 / Vulkan / Metal, so any modern adapter).
+  `ort-webgpu` builds, and CI compiles it on Linux and Windows, though those
+  checks are advisory (`continue-on-error`) rather than blocking. Upstream still
+  marks WebGPU experimental, so no asset is published. On Windows it is redundant
+  with DirectML anyway.
+
 ## Binaries
 
 | Binary | Purpose |
@@ -40,12 +92,45 @@ runtime deps). ONNX Runtime support is opt-in:
 | --- | --- |
 | `ort` | ONNX Runtime CPU execution, the universal fallback for model families `tract` cannot run (ModernBERT, nomic-bert, ...). |
 | `ort-coreml` | Hardware acceleration on macOS (ANE + GPU), zero extra install. |
-| `ort-cuda` | Hardware acceleration on Linux/Windows x86_64. Needs a host CUDA 12 runtime + cuDNN. |
-| `ort-tensorrt` | TensorRT execution provider. Needs the same CUDA 12 host stack as `ort-cuda`. |
+| `ort-cuda` | Hardware acceleration on Linux x86_64. Needs a host CUDA runtime + cuDNN and glibc 2.38+. |
+| `ort-tensorrt` | TensorRT execution provider. Needs the same CUDA host stack as `ort-cuda`. |
+| `ort-webgpu` | Vendor-neutral GPU (AMD/Intel/NVIDIA) via DX12/Vulkan/Metal. **Experimental upstream**; not shipped as a release asset. |
+
+Windows links no ONNX Runtime at build time and loads it at run time instead
+(see the note above), so it has its own pair:
+
+| Feature | Adds |
+| --- | --- |
+| `ort-dynamic` | ONNX Runtime CPU execution, loading `onnxruntime.dll` at run time. The only way to get ORT at all on Windows. |
+| `ort-directml` | Windows GPU on **any DX12 adapter** — Intel, AMD or NVIDIA. Implies `ort-dynamic`; ships the DLL beside the binary. |
+
+The statically linked features above cover every execution provider that has a
+prebuilt ONNX Runtime. `ort` also exposes ROCm, OpenVINO and XNNPACK, none of
+which has one for a target this repo ships. Loading the runtime dynamically lifts
+that restriction — it is how `ort-directml` exists at all — so an OpenVINO or ROCm
+DLL is now a plausible route rather than a source build, just an untried one.
+Either way each is one line in the execution-provider cascade plus a feature; see
+`src/backend/ort.rs`.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for which of these can be built on which
+host (notably: no ORT feature builds on a Windows *GNU* toolchain).
 
 Backend selection at runtime is capability-based: each registered backend
 declares which model families it can run, and the sidecar picks the first
 backend, in preference order, that can serve the model actually being loaded.
+
+### Reporting what a build can do
+
+```bash
+travsr-embed --capabilities
+```
+
+Prints the compiled engines, the model families they can run, and whether an
+accelerator is compiled in, as JSON. The `travsr` CLI uses this to refuse a model
+the installed sidecar cannot execute at *selection* time, instead of failing part
+way through a background reindex. `accelerated_compiled` reports what was
+compiled, not whether this machine's GPU will actually be confirmed at load time —
+that answer needs a real model load, and appears in the startup log.
 
 ## Usage
 

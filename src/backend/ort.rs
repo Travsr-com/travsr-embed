@@ -318,9 +318,24 @@ impl OrtBackend {
             "loading ORT ONNX model"
         );
 
+        // #736 C4/D: cap ORT's thread pools explicitly. Left unset, ORT sizes
+        // its intra-op pool from the HOST's physical core count via its own
+        // topology probe — which is not cgroup/quota-aware, so a container
+        // limited to 2 CPUs on a 64-core host got ~64 spinning threads and
+        // permanent throttling. `available_parallelism()` respects cgroup CPU
+        // quotas on Linux (Rust ≥1.64) and returns the right number on bare
+        // macOS/Windows. Inter-op stays 1: the execution mode is sequential
+        // (the default), so extra inter-op threads would only idle.
+        let intra_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
         let mut builder = Session::builder()
             .map_err(ort_err)?
             .with_optimization_level(GraphOptimizationLevel::Level3)
+            .map_err(ort_err)?
+            .with_intra_threads(intra_threads)
+            .map_err(ort_err)?
+            .with_inter_threads(1)
             .map_err(ort_err)?;
         if let Some((_, dispatch)) = ep {
             // error_on_failure (set in the cascade) turns a failed EP

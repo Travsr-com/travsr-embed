@@ -256,8 +256,23 @@ impl VecIndex {
             .context("index mtime")?;
         if mtime > self.last_modified {
             tracing::info!("index file updated — reloading");
-            *self = Self::try_load(&self.index_path)?
-                .ok_or_else(|| anyhow::anyhow!("index file vanished after mtime change"))?;
+            // #736 C2: free the old graph BEFORE loading the new file. The
+            // previous `*self = Self::try_load(...)` built the replacement
+            // index while the old one was still alive — a transient 2× of the
+            // index's full size, at exactly the moment a just-finished reindex
+            // has already elevated memory. A reload that then fails leaves an
+            // empty index rather than the stale one; the next knn() sees the
+            // unchanged mtime is still newer than last_modified and retries.
+            self.inner = Index::new(&make_options(1)).context("create usearch Index")?;
+            let path_str = self
+                .index_path
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("index path is not valid UTF-8"))?;
+            self.inner
+                .load(path_str)
+                .context("reload usearch index from disk")?;
+            self.last_modified = mtime;
+            tracing::info!(count = self.inner.size(), "HNSW index reloaded");
         }
 
         if self.inner.size() == 0 {

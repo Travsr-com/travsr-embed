@@ -1120,21 +1120,26 @@ fn reindex(
     loop {
         let mut texts: Vec<(i64, String)> = {
             let mut stmt = conn.prepare(&sql)?;
-            stmt.query_map([model_id], |row| {
-                let id: i64 = row.get(0)?;
-                let kind: String = row.get(1)?;
-                let sig: String = row.get(2)?;
-                let path: String = row.get(3)?;
-                let embed_text: Option<String> = row.get(4)?;
-                let callers: Option<String> = row.get(5)?;
-                let callees: Option<String> = row.get(6)?;
-                let text = embed_text.unwrap_or_else(|| {
-                    build_node_text(&kind, &sig, &path, callers.as_deref(), callees.as_deref())
-                });
-                Ok((id, text))
-            })?
-            .filter_map(|r| r.ok())
-            .collect()
+            // Bound to a local (not the block's tail expression) so the
+            // statement's row borrow ends before `stmt` drops — the tail
+            // expression's temporaries outlive block locals (E0597).
+            let rows: Vec<(i64, String)> = stmt
+                .query_map([model_id], |row| {
+                    let id: i64 = row.get(0)?;
+                    let kind: String = row.get(1)?;
+                    let sig: String = row.get(2)?;
+                    let path: String = row.get(3)?;
+                    let embed_text: Option<String> = row.get(4)?;
+                    let callers: Option<String> = row.get(5)?;
+                    let callees: Option<String> = row.get(6)?;
+                    let text = embed_text.unwrap_or_else(|| {
+                        build_node_text(&kind, &sig, &path, callers.as_deref(), callees.as_deref())
+                    });
+                    Ok((id, text))
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+            rows
         };
         if texts.is_empty() {
             break;
@@ -1381,22 +1386,27 @@ fn reindex_parallel(
             let mut stmt = ro_conn
                 .prepare(&select_sql)
                 .context("prepare pending query")?;
-            stmt.query_map([model_id], |row| {
-                let id: i64 = row.get(0)?;
-                let kind: String = row.get(1)?;
-                let sig: String = row.get(2)?;
-                let path: String = row.get(3)?;
-                let embed_text: Option<String> = row.get(4)?;
-                let callers: Option<String> = row.get(5)?;
-                let callees: Option<String> = row.get(6)?;
-                let text = embed_text.unwrap_or_else(|| {
-                    build_node_text(&kind, &sig, &path, callers.as_deref(), callees.as_deref())
-                });
-                Ok((id, text))
-            })
-            .context("query pending nodes")?
-            .filter_map(|r| r.ok())
-            .collect()
+            // Bound to a local (not the block's tail expression) so the
+            // statement's row borrow ends before `stmt` drops — the tail
+            // expression's temporaries outlive block locals (E0597).
+            let rows: Vec<(i64, String)> = stmt
+                .query_map([model_id], |row| {
+                    let id: i64 = row.get(0)?;
+                    let kind: String = row.get(1)?;
+                    let sig: String = row.get(2)?;
+                    let path: String = row.get(3)?;
+                    let embed_text: Option<String> = row.get(4)?;
+                    let callers: Option<String> = row.get(5)?;
+                    let callees: Option<String> = row.get(6)?;
+                    let text = embed_text.unwrap_or_else(|| {
+                        build_node_text(&kind, &sig, &path, callers.as_deref(), callees.as_deref())
+                    });
+                    Ok((id, text))
+                })
+                .context("query pending nodes")?
+                .filter_map(|r| r.ok())
+                .collect();
+            rows
         };
         if chunk.is_empty() {
             break;

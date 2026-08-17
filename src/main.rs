@@ -90,6 +90,17 @@ const TX_BATCH: usize = 500;
 /// append per 30 s of work, which is not measurable next to inference.
 const TX_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Rows fetched per pending-query chunk during reindex (#736 item 7).
+///
+/// Both reindex paths previously materialised EVERY pending (id, text) pair in
+/// one Vec and held it for the whole run — O(corpus) resident for hours on a
+/// large repo. Chunking bounds that at ~50k rows (tens of MB): each chunk is
+/// embedded and COMMITTED before the next SELECT, so the `NOT EXISTS` filter
+/// excludes it on the next pass and the loop always terminates. Sorting for
+/// BatchLongest padding happens within a chunk; at this size the padding
+/// efficiency loss versus a global sort is negligible.
+const PENDING_CHUNK_ROWS: usize = 50_000;
+
 /// Whether a buffer holding `buffered` rows, last committed at `last_flush`,
 /// should be committed now (#376 O2).
 ///
@@ -246,14 +257,18 @@ impl NomicPlugin {
                 );
             }
         }
-        let index = index::VecIndex::try_load(&index_path).unwrap_or_else(|e| {
+        // #736 item 4: the daemon SERVES the index — try_serve views (mmap) it
+        // on Linux/macOS so the OS pages it in on demand instead of the sidecar
+        // holding the whole graph resident. Reindex paths keep try_load: they
+        // must add().
+        let index = index::VecIndex::try_serve(&index_path).unwrap_or_else(|e| {
             tracing::warn!(
                 "could not load HNSW index: {e:#} — KNN disabled until `travsr embed reindex` runs"
             );
             None
         });
         let doc_index_path = doc_index_path_for_db(&db_path, model_id);
-        let doc_index = index::VecIndex::try_load(&doc_index_path).unwrap_or_else(|e| {
+        let doc_index = index::VecIndex::try_serve(&doc_index_path).unwrap_or_else(|e| {
             tracing::debug!("no doc-space HNSW index yet: {e:#}");
             None
         });
@@ -405,7 +420,7 @@ impl NomicPlugin {
             .map_err(|_| anyhow::anyhow!("doc index mutex poisoned"))?;
 
         if guard.is_none() && self.doc_index_path.exists() {
-            *guard = index::VecIndex::try_load(&self.doc_index_path)?;
+            *guard = index::VecIndex::try_serve(&self.doc_index_path)?;
         }
 
         let raw: Vec<(i64, f32)> = match guard.as_mut() {
@@ -439,7 +454,7 @@ impl NomicPlugin {
 
             // Late-load: daemon may start before the first reindex run.
             if guard.is_none() && self.index_path.exists() {
-                *guard = index::VecIndex::try_load(&self.index_path)?;
+                *guard = index::VecIndex::try_serve(&self.index_path)?;
             }
 
             match guard.as_mut() {
@@ -546,6 +561,13 @@ impl NomicPlugin {
                         .sum::<f32>()
                         .clamp(0.0, 1.0);
                     results.push((*nid, sim));
+                    // Stated trade of the mmap serving path (#18 review): on a
+                    // viewed index this add is a no-op, so a lazily-embedded
+                    // node is NOT ANN-retrievable until the next reindex
+                    // rebuilds the file — it keeps taking this FTS+cosine lazy
+                    // path. Its vector is durable in embed.db and this query's
+                    // results already include it (pushed above), so the cost
+                    // is recall latency between reindexes, not correctness.
                     let _ = idx.add(*nid, &vec); // skip-if-present is safe
                 }
             }
@@ -967,29 +989,26 @@ fn reindex(
              CASE WHEN n.path LIKE '%_test.%' OR n.path LIKE '%/testing/%' OR n.path LIKE 'test/%' THEN 0 ELSE 1 END DESC, \
              n.shell_number DESC"
     );
-    let mut stmt = conn.prepare(&sql)?;
-    let pending: Vec<(i64, String)> = stmt
-        .query_map([model_id], |row| {
-            let id: i64 = row.get(0)?;
-            let kind: String = row.get(1)?;
-            let sig: String = row.get(2)?;
-            let path: String = row.get(3)?;
-            let embed_text: Option<String> = row.get(4)?;
-            let callers: Option<String> = row.get(5)?;
-            let callees: Option<String> = row.get(6)?;
-            let text = embed_text.unwrap_or_else(|| {
-                build_node_text(&kind, &sig, &path, callers.as_deref(), callees.as_deref())
-            });
-            Ok((id, text))
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
-
-    let total = pending.len();
+    // #736 item 7: count first (for progress and the zero-pending branches),
+    // then stream the pending set in PENDING_CHUNK_ROWS chunks below instead
+    // of materialising every (id, text) row up front.
+    let count_sql = format!(
+        "SELECT COUNT(*) FROM nodes n \
+         WHERE {node_eligible} \
+         AND NOT EXISTS ( \
+             SELECT 1 FROM edb.node_embeddings e \
+             WHERE e.node_id = n.id AND e.model_id = ?1 \
+         ) {phase_clause}\
+         {partition_clause}"
+    );
+    let total: usize = conn
+        .query_row(&count_sql, [model_id], |r| r.get(0))
+        .context("count pending nodes")?;
     tracing::info!(total, worker = %worker_label, "symbol nodes to embed");
 
-    let mut texts = pending;
-    texts.sort_by_key(|(_, text)| estimate_tokens(text));
+    // The chunked SELECT: same query, bounded. Committed chunks drop out of
+    // NOT EXISTS, so no OFFSET is needed and progress is guaranteed.
+    let sql = format!("{sql} LIMIT {PENDING_CHUNK_ROWS}");
 
     let index_path = index_path_for_db(db_path, model_id);
 
@@ -1067,23 +1086,18 @@ fn reindex(
                     .context("create new HNSW index")?
             }
         };
+        // #18 review: flush_buffer treats add()'s Ok as "vector indexed", but
+        // a viewed (serving) handle silently no-ops adds — every vector would
+        // be dropped from the index while its embed.db row still landed, and
+        // NOT EXISTS would never offer the node again. All constructors above
+        // produce writable handles; this keeps that structural.
+        debug_assert!(
+            !idx.is_viewed(),
+            "reindex must never hold a viewed (read-only) index handle"
+        );
         idx.reserve(idx.size() + total)
             .context("reserve HNSW capacity for pending nodes")?;
         Some(idx)
-    };
-
-    let est_lens: Vec<usize> = texts
-        .iter()
-        .map(|(_, text)| estimate_tokens(text))
-        .collect();
-
-    // Was an inline copy of build_batch_ranges; call the shared function so this
-    // path and the parallel one cannot drift, and so the accelerated branch below
-    // exists in both.
-    let batch_ranges: Vec<std::ops::Range<usize>> = if model.is_accelerated() {
-        build_batch_ranges_bucketed(&est_lens, &encode::GPU_BUCKETS)
-    } else {
-        build_batch_ranges(&est_lens)
     };
 
     // INSERT into edb.node_embeddings — never touches graph.db WAL.
@@ -1117,32 +1131,83 @@ fn reindex(
         Ok(())
     };
 
-    for range in batch_ranges {
-        let chunk = &texts[range];
-        let text_refs: Vec<&str> = chunk.iter().map(|(_, t)| t.as_str()).collect();
+    // #736 item 7: chunked outer loop — fetch, sort, batch, and embed at most
+    // PENDING_CHUNK_ROWS rows at a time.
+    loop {
+        let mut texts: Vec<(i64, String)> = {
+            let mut stmt = conn.prepare(&sql)?;
+            // Bound to a local (not the block's tail expression) so the
+            // statement's row borrow ends before `stmt` drops — the tail
+            // expression's temporaries outlive block locals (E0597).
+            let rows: Vec<(i64, String)> = stmt
+                .query_map([model_id], |row| {
+                    let id: i64 = row.get(0)?;
+                    let kind: String = row.get(1)?;
+                    let sig: String = row.get(2)?;
+                    let path: String = row.get(3)?;
+                    let embed_text: Option<String> = row.get(4)?;
+                    let callers: Option<String> = row.get(5)?;
+                    let callees: Option<String> = row.get(6)?;
+                    let text = embed_text.unwrap_or_else(|| {
+                        build_node_text(&kind, &sig, &path, callers.as_deref(), callees.as_deref())
+                    });
+                    Ok((id, text))
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+            rows
+        };
+        if texts.is_empty() {
+            break;
+        }
+        texts.sort_by_key(|(_, text)| estimate_tokens(text));
 
-        let blobs = model.embed_documents(&text_refs)?;
+        let est_lens: Vec<usize> = texts
+            .iter()
+            .map(|(_, text)| estimate_tokens(text))
+            .collect();
 
-        for ((node_id, text), blob) in chunk.iter().zip(blobs.iter()) {
-            tx_buffer.push((*node_id, blob.clone(), crate::freshness::text_hash(text)));
+        // Was an inline copy of build_batch_ranges; call the shared function so this
+        // path and the parallel one cannot drift, and so the accelerated branch below
+        // exists in both.
+        let batch_ranges: Vec<std::ops::Range<usize>> = if model.is_accelerated() {
+            build_batch_ranges_bucketed(&est_lens, &encode::GPU_BUCKETS)
+        } else {
+            build_batch_ranges(&est_lens)
+        };
+
+        for range in batch_ranges {
+            let chunk = &texts[range];
+            let text_refs: Vec<&str> = chunk.iter().map(|(_, t)| t.as_str()).collect();
+
+            let blobs = model.embed_documents(&text_refs)?;
+
+            for ((node_id, text), blob) in chunk.iter().zip(blobs.iter()) {
+                tx_buffer.push((*node_id, blob.clone(), crate::freshness::text_hash(text)));
+            }
+
+            if should_flush(tx_buffer.len(), last_flush) {
+                flush_buffer(&tx_buffer, &conn, &mut ins, &idx)?;
+                inserted += tx_buffer.len();
+                if inserted % 1_000 < tx_buffer.len() || inserted >= total {
+                    println!("  embedded {inserted}/{total}");
+                }
+                tx_buffer.clear();
+                last_flush = std::time::Instant::now();
+            }
         }
 
-        if should_flush(tx_buffer.len(), last_flush) {
+        // Commit the chunk's tail before the next SELECT: unflushed rows would
+        // be re-selected (and re-embedded) because they are not yet visible to
+        // the NOT EXISTS filter, and a chunk smaller than TX_BATCH would
+        // otherwise never become visible at all — an infinite loop.
+        if !tx_buffer.is_empty() {
             flush_buffer(&tx_buffer, &conn, &mut ins, &idx)?;
             inserted += tx_buffer.len();
-            if inserted % 1_000 < tx_buffer.len() || inserted >= total {
-                println!("  embedded {inserted}/{total}");
-            }
+            println!("  embedded {inserted}/{total}");
             tx_buffer.clear();
             last_flush = std::time::Instant::now();
         }
-    }
-
-    if !tx_buffer.is_empty() {
-        flush_buffer(&tx_buffer, &conn, &mut ins, &idx)?;
-        inserted += tx_buffer.len();
-        println!("  embedded {inserted}/{total}");
-        tx_buffer.clear();
     }
 
     // Single fsync for all embed.db WAL writes — far cheaper than per-TX fsyncs.
@@ -1231,74 +1296,50 @@ fn reindex_parallel(
             .context("applying content-hash invalidation")?
     };
 
-    // ── Step 2: materialise ALL pending (id, text) pairs on the main thread ──
-    // One read pass with NOT EXISTS applied here — workers receive their chunk
-    // by value and need no SQL connection of their own.
+    // ── Step 2: count the pending set, then stream it in chunks ──────────────
+    // #736 item 7: the previous implementation materialised EVERY pending
+    // (id, text) pair in one Vec and held it (behind an Arc) for the entire
+    // run — O(corpus) resident for hours on a large repo. Now one read-only
+    // connection fetches PENDING_CHUNK_ROWS at a time; each chunk is embedded
+    // and committed before the next SELECT, so NOT EXISTS excludes it and the
+    // loop terminates. Workers still receive their chunk by value.
     let phase_clause = match phase {
         Phase::All => String::new(),
         Phase::Phase1(t) => format!("AND n.shell_number >= {t}"),
         Phase::Phase2(t) => format!("AND n.shell_number < {t}"),
     };
 
-    let all_pending: Vec<(i64, String)> = {
-        let conn = Connection::open_with_flags(
-            db_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .context("open graph.db for pending query")?;
-        let embed_str = embed_db_path
-            .to_str()
-            .context("embed.db path is not valid UTF-8")?;
-        let escaped = embed_str.replace('\'', "''");
-        conn.execute_batch(&format!("ATTACH DATABASE '{escaped}' AS edb"))
-            .context("attach embed.db for pending query")?;
-        // #391: shared eligibility predicate (see NODE_ELIGIBLE); the bare
-        // `kind_exclude` list remains for the caller/callee sub-queries only.
-        let kind_exclude = "'file','file-module','import','module','field','variable'";
-        let node_eligible = crate::index::NODE_ELIGIBLE;
-        let sql = format!(
-            "SELECT n.id, n.kind, n.signature, n.path, \
-             n.embed_text, \
-             (SELECT GROUP_CONCAT(sub.sig, ', ') FROM \
-                 (SELECT SUBSTR(src_n.signature, 1, 60) AS sig \
-                  FROM edges e JOIN nodes src_n ON src_n.id = e.src \
-                  WHERE e.dst = n.id \
-                  AND src_n.kind NOT IN ({kind_exclude}) LIMIT 5) AS sub) AS callers, \
-             (SELECT GROUP_CONCAT(sub.sig, ', ') FROM \
-                 (SELECT SUBSTR(dst_n.signature, 1, 60) AS sig \
-                  FROM edges e JOIN nodes dst_n ON dst_n.id = e.dst \
-                  WHERE e.src = n.id \
-                  AND dst_n.kind NOT IN ({kind_exclude}) LIMIT 5) AS sub) AS callees \
-             FROM nodes n \
-             WHERE {node_eligible} \
-             AND NOT EXISTS (\
-                 SELECT 1 FROM edb.node_embeddings e \
-                 WHERE e.node_id = n.id AND e.model_id = ?1\
-             ) {phase_clause} \
-             ORDER BY n.shell_number DESC"
-        );
-        let mut stmt = conn.prepare(&sql).context("prepare pending query")?;
-        let rows: Vec<(i64, String)> = stmt
-            .query_map([model_id], |row| {
-                let id: i64 = row.get(0)?;
-                let kind: String = row.get(1)?;
-                let sig: String = row.get(2)?;
-                let path: String = row.get(3)?;
-                let embed_text: Option<String> = row.get(4)?;
-                let callers: Option<String> = row.get(5)?;
-                let callees: Option<String> = row.get(6)?;
-                let text = embed_text.unwrap_or_else(|| {
-                    build_node_text(&kind, &sig, &path, callers.as_deref(), callees.as_deref())
-                });
-                Ok((id, text))
-            })
-            .context("query pending nodes")?
-            .filter_map(|r| r.ok())
-            .collect();
-        rows
-    };
+    let ro_conn = Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .context("open graph.db for pending query")?;
+    let embed_str = embed_db_path
+        .to_str()
+        .context("embed.db path is not valid UTF-8")?;
+    let escaped = embed_str.replace('\'', "''");
+    ro_conn
+        .execute_batch(&format!("ATTACH DATABASE '{escaped}' AS edb"))
+        .context("attach embed.db for pending query")?;
+    // #391: shared eligibility predicate (see NODE_ELIGIBLE); the bare
+    // `kind_exclude` list remains for the caller/callee sub-queries only.
+    let kind_exclude = "'file','file-module','import','module','field','variable'";
+    let node_eligible = crate::index::NODE_ELIGIBLE;
 
-    let total = all_pending.len();
+    let total: usize = ro_conn
+        .query_row(
+            &format!(
+                "SELECT COUNT(*) FROM nodes n \
+                 WHERE {node_eligible} \
+                 AND NOT EXISTS (\
+                     SELECT 1 FROM edb.node_embeddings e \
+                     WHERE e.node_id = n.id AND e.model_id = ?1\
+                 ) {phase_clause}"
+            ),
+            [model_id],
+            |r| r.get(0),
+        )
+        .context("count pending nodes")?;
     if total == 0 {
         // #376 W2: nothing to embed, but if invalidation removed vectors the
         // live HNSW still contains them. Deletions must reach the index even
@@ -1312,182 +1353,252 @@ fn reindex_parallel(
         return Ok(());
     }
 
-    // ── Step 3: shared atomic batch queue (Kafka-style consumer group) ────────
-    // Sort all items shortest-first (optimal BatchLongest padding), pre-build
-    // ALL inference batches globally, then expose them via a shared AtomicUsize
-    // counter. Workers loop: atomically claim the next batch index → embed →
-    // write. All N workers run until the queue is empty; no worker idles while
-    // another still has pre-assigned work. Workload is AMX-bound in practice,
-    // so scheduling gains are marginal (~3%); this form is kept for code clarity.
-    // Loaded before batching, not after: the batch shapes now depend on which
-    // engine was resolved (see build_batch_ranges_bucketed), and n_batches has to
-    // be final before the cancel watcher below captures it.
-    let desc = model::ModelDescriptor::load(model_dir).context("loading model descriptor")?;
-    let model = backend::create_backend(model_dir, &desc).context("loading model")?;
-
-    let mut sorted = all_pending;
-    sorted.sort_by_key(|(_, t)| estimate_tokens(t));
-    let est_lens: Vec<usize> = sorted.iter().map(|(_, t)| estimate_tokens(t)).collect();
-    let batch_ranges = if model.is_accelerated() {
-        build_batch_ranges_bucketed(&est_lens, &encode::GPU_BUCKETS)
-    } else {
-        build_batch_ranges(&est_lens)
-    };
-    let n_batches = batch_ranges.len();
-
-    let items = Arc::new(sorted);
-    let batches = Arc::new(batch_ranges);
-    let next_batch = Arc::new(AtomicUsize::new(0));
-
-    // WS3: cancel watcher. Polls the sentinel every 250ms; on appearance it stores
-    // `next_batch = n_batches` so every worker's next `fetch_add` exceeds the queue
-    // length → each finishes its in-flight batch, commits, and breaks. Portable
-    // (no signals), works with or without the daemon. `watcher_done` stops the
-    // thread once the workers finish normally.
-    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let watcher_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let watcher = cancel_sentinel.map(|sentinel| {
-        let sentinel = sentinel.to_path_buf();
-        let next_c = Arc::clone(&next_batch);
-        let cancelled_c = Arc::clone(&cancelled);
-        let done_c = Arc::clone(&watcher_done);
-        std::thread::Builder::new()
-            .name("embed-cancel-watch".into())
-            .spawn(move || {
-                while !done_c.load(Ordering::Relaxed) {
-                    if sentinel.exists() {
-                        tracing::info!("cancel sentinel detected — draining workers");
-                        next_c.store(n_batches, Ordering::Relaxed);
-                        cancelled_c.store(true, Ordering::SeqCst);
-                        return;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(250));
-                }
-            })
-            .expect("spawn cancel watcher")
-    });
-
-    record_backend_provenance(embed_db_path, model.backend_name())?;
-    let n_workers = choose_workers(model.as_ref(), parallel, n_batches);
-    tracing::info!(
-        total,
-        n_batches,
-        n_workers,
-        "model loaded; spawning {} inference threads (shared batch queue)",
-        n_workers
+    let select_sql = format!(
+        "SELECT n.id, n.kind, n.signature, n.path, \
+         n.embed_text, \
+         (SELECT GROUP_CONCAT(sub.sig, ', ') FROM \
+             (SELECT SUBSTR(src_n.signature, 1, 60) AS sig \
+              FROM edges e JOIN nodes src_n ON src_n.id = e.src \
+              WHERE e.dst = n.id \
+              AND src_n.kind NOT IN ({kind_exclude}) LIMIT 5) AS sub) AS callers, \
+         (SELECT GROUP_CONCAT(sub.sig, ', ') FROM \
+             (SELECT SUBSTR(dst_n.signature, 1, 60) AS sig \
+              FROM edges e JOIN nodes dst_n ON dst_n.id = e.dst \
+              WHERE e.src = n.id \
+              AND dst_n.kind NOT IN ({kind_exclude}) LIMIT 5) AS sub) AS callees \
+         FROM nodes n \
+         WHERE {node_eligible} \
+         AND NOT EXISTS (\
+             SELECT 1 FROM edb.node_embeddings e \
+             WHERE e.node_id = n.id AND e.model_id = ?1\
+         ) {phase_clause} \
+         ORDER BY n.shell_number DESC \
+         LIMIT {PENDING_CHUNK_ROWS}"
     );
 
-    // ── Steps 4-6: N consumer threads ────────────────────────────────────────
-    // Workers share Arc<Vec<items>>, Arc<Vec<ranges>>, Arc<AtomicUsize>.
-    // The backend is shared via Arc<dyn EmbedBackend> — one model load total.
-    // Each worker opens its own write connection to embed.db; WAL serialises COMMITs.
+    // ── Step 3: model once, then a shared atomic batch queue per chunk ───────
+    // Within a chunk the shape is unchanged (Kafka-style consumer group): sort
+    // shortest-first (optimal BatchLongest padding), pre-build the chunk's
+    // inference batches, expose them via a shared AtomicUsize counter, and let
+    // workers claim batch indices until the queue is empty. The engine is
+    // loaded before batching because batch shapes depend on which engine was
+    // resolved (see build_batch_ranges_bucketed); the WS3 cancel watcher is
+    // created per chunk so it always captures that chunk's final n_batches.
+    let desc = model::ModelDescriptor::load(model_dir).context("loading model descriptor")?;
+    let model = backend::create_backend(model_dir, &desc).context("loading model")?;
+    record_backend_provenance(embed_db_path, model.backend_name())?;
+
     let edb_arc = Arc::new(embed_db_path.to_path_buf());
     let mid_arc = Arc::new(model_id.to_owned());
+    // Shared across chunks: a cancel observed in one chunk stops the run.
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut total_embedded = 0usize;
 
-    let worker_handles: Vec<_> = (0..n_workers)
-        .map(|i| {
-            let model_w = model.clone();
-            let edb_w = Arc::clone(&edb_arc);
-            let mid_w = Arc::clone(&mid_arc);
-            let items_w = Arc::clone(&items);
-            let batches_w = Arc::clone(&batches);
-            let next_w = Arc::clone(&next_batch);
+    loop {
+        if cancelled.load(Ordering::SeqCst) {
+            break;
+        }
+        let chunk: Vec<(i64, String)> = {
+            let mut stmt = ro_conn
+                .prepare(&select_sql)
+                .context("prepare pending query")?;
+            // Bound to a local (not the block's tail expression) so the
+            // statement's row borrow ends before `stmt` drops — the tail
+            // expression's temporaries outlive block locals (E0597).
+            let rows: Vec<(i64, String)> = stmt
+                .query_map([model_id], |row| {
+                    let id: i64 = row.get(0)?;
+                    let kind: String = row.get(1)?;
+                    let sig: String = row.get(2)?;
+                    let path: String = row.get(3)?;
+                    let embed_text: Option<String> = row.get(4)?;
+                    let callers: Option<String> = row.get(5)?;
+                    let callees: Option<String> = row.get(6)?;
+                    let text = embed_text.unwrap_or_else(|| {
+                        build_node_text(&kind, &sig, &path, callers.as_deref(), callees.as_deref())
+                    });
+                    Ok((id, text))
+                })
+                .context("query pending nodes")?
+                .filter_map(|r| r.ok())
+                .collect();
+            rows
+        };
+        if chunk.is_empty() {
+            break;
+        }
 
+        let mut sorted = chunk;
+        sorted.sort_by_key(|(_, t)| estimate_tokens(t));
+        let est_lens: Vec<usize> = sorted.iter().map(|(_, t)| estimate_tokens(t)).collect();
+        let batch_ranges = if model.is_accelerated() {
+            build_batch_ranges_bucketed(&est_lens, &encode::GPU_BUCKETS)
+        } else {
+            build_batch_ranges(&est_lens)
+        };
+        let n_batches = batch_ranges.len();
+
+        let items = Arc::new(sorted);
+        let batches = Arc::new(batch_ranges);
+        let next_batch = Arc::new(AtomicUsize::new(0));
+
+        // WS3: cancel watcher, one per chunk. Polls the sentinel every 250ms; on
+        // appearance it stores `next_batch = n_batches` so every worker's next
+        // `fetch_add` exceeds the queue length → each finishes its in-flight
+        // batch, commits, and breaks; `cancelled` then stops the chunk loop.
+        // Portable (no signals), works with or without the daemon.
+        // `watcher_done` stops the thread once the chunk's workers finish.
+        let watcher_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watcher = cancel_sentinel.map(|sentinel| {
+            let sentinel = sentinel.to_path_buf();
+            let next_c = Arc::clone(&next_batch);
+            let cancelled_c = Arc::clone(&cancelled);
+            let done_c = Arc::clone(&watcher_done);
             std::thread::Builder::new()
-                .name(format!("embed-{i}"))
-                .spawn(move || -> Result<usize> {
-                    // ── write: own connection, synchronous=OFF for bulk speed ──
-                    let wconn = Connection::open(&*edb_w).context("worker: open embed.db")?;
-                    wconn
-                        .execute_batch(&format!(
-                            "PRAGMA journal_mode = WAL;
-                             PRAGMA synchronous = OFF;
-                             PRAGMA wal_autocheckpoint = 0;
-                             PRAGMA cache_size = -32768;
-                             PRAGMA busy_timeout = {busy_timeout_ms};"
-                        ))
-                        .context("worker: configure embed.db")?;
-                    crate::freshness::ensure_schema(&wconn, "").context("worker: ensure schema")?;
-                    let mut ins = wconn
-                        .prepare(
-                            "INSERT OR REPLACE INTO node_embeddings \
-                             (node_id, model_id, embedding, text_hash) VALUES (?1, ?2, ?3, ?4)",
-                        )
-                        .context("worker: prepare insert")?;
-
-                    let mut tx_buf: Vec<(i64, Vec<u8>, String)> =
-                        Vec::with_capacity(TX_BATCH + 512);
-                    let mut inserted = 0usize;
-                    // #376 O2: see TX_FLUSH_INTERVAL.
-                    let mut last_flush = std::time::Instant::now();
-
-                    // ── consumer loop: claim batches until the queue is empty ─
-                    loop {
-                        let batch_idx = next_w.fetch_add(1, Ordering::Relaxed);
-                        if batch_idx >= batches_w.len() {
-                            break;
+                .name("embed-cancel-watch".into())
+                .spawn(move || {
+                    while !done_c.load(Ordering::Relaxed) {
+                        if sentinel.exists() {
+                            tracing::info!("cancel sentinel detected — draining workers");
+                            next_c.store(n_batches, Ordering::Relaxed);
+                            cancelled_c.store(true, Ordering::SeqCst);
+                            return;
                         }
-                        let range = batches_w[batch_idx].clone();
-                        let batch = &items_w[range];
-                        let texts: Vec<&str> = batch.iter().map(|(_, t)| t.as_str()).collect();
-                        let blobs = model_w.embed_documents(&texts).context("worker: embed")?;
-                        for ((nid, text), blob) in batch.iter().zip(blobs.iter()) {
-                            tx_buf.push((*nid, blob.clone(), crate::freshness::text_hash(text)));
+                        std::thread::sleep(std::time::Duration::from_millis(250));
+                    }
+                })
+                .expect("spawn cancel watcher")
+        });
+
+        let n_workers = choose_workers(model.as_ref(), parallel, n_batches);
+        tracing::info!(
+            total,
+            total_embedded,
+            n_batches,
+            n_workers,
+            "chunk loaded; spawning {} inference threads (shared batch queue)",
+            n_workers
+        );
+
+        // ── Steps 4-6: N consumer threads for this chunk ─────────────────────
+        // Workers share Arc<Vec<items>>, Arc<Vec<ranges>>, Arc<AtomicUsize>.
+        // The backend is shared via Arc<dyn EmbedBackend> — one model load total.
+        // Each worker opens its own write connection to embed.db; WAL serialises
+        // COMMITs. Every worker commits its tail before exiting, so the whole
+        // chunk is visible to the next SELECT's NOT EXISTS filter.
+        let worker_handles: Vec<_> = (0..n_workers)
+            .map(|i| {
+                let model_w = model.clone();
+                let edb_w = Arc::clone(&edb_arc);
+                let mid_w = Arc::clone(&mid_arc);
+                let items_w = Arc::clone(&items);
+                let batches_w = Arc::clone(&batches);
+                let next_w = Arc::clone(&next_batch);
+
+                std::thread::Builder::new()
+                    .name(format!("embed-{i}"))
+                    .spawn(move || -> Result<usize> {
+                        // ── write: own connection, synchronous=OFF for bulk speed ──
+                        let wconn = Connection::open(&*edb_w).context("worker: open embed.db")?;
+                        wconn
+                            .execute_batch(&format!(
+                                "PRAGMA journal_mode = WAL;
+                                 PRAGMA synchronous = OFF;
+                                 PRAGMA wal_autocheckpoint = 0;
+                                 PRAGMA cache_size = -32768;
+                                 PRAGMA busy_timeout = {busy_timeout_ms};"
+                            ))
+                            .context("worker: configure embed.db")?;
+                        crate::freshness::ensure_schema(&wconn, "")
+                            .context("worker: ensure schema")?;
+                        let mut ins = wconn
+                            .prepare(
+                                "INSERT OR REPLACE INTO node_embeddings \
+                                 (node_id, model_id, embedding, text_hash) VALUES (?1, ?2, ?3, ?4)",
+                            )
+                            .context("worker: prepare insert")?;
+
+                        let mut tx_buf: Vec<(i64, Vec<u8>, String)> =
+                            Vec::with_capacity(TX_BATCH + 512);
+                        let mut inserted = 0usize;
+                        // #376 O2: see TX_FLUSH_INTERVAL.
+                        let mut last_flush = std::time::Instant::now();
+
+                        // ── consumer loop: claim batches until the queue is empty ─
+                        loop {
+                            let batch_idx = next_w.fetch_add(1, Ordering::Relaxed);
+                            if batch_idx >= batches_w.len() {
+                                break;
+                            }
+                            let range = batches_w[batch_idx].clone();
+                            let batch = &items_w[range];
+                            let texts: Vec<&str> = batch.iter().map(|(_, t)| t.as_str()).collect();
+                            let blobs = model_w.embed_documents(&texts).context("worker: embed")?;
+                            for ((nid, text), blob) in batch.iter().zip(blobs.iter()) {
+                                tx_buf.push((
+                                    *nid,
+                                    blob.clone(),
+                                    crate::freshness::text_hash(text),
+                                ));
+                            }
+                            if should_flush(tx_buf.len(), last_flush) {
+                                wconn.execute("BEGIN", []).context("worker: begin")?;
+                                for (nid, blob, hash) in &tx_buf {
+                                    ins.execute(rusqlite::params![nid, mid_w.as_str(), blob, hash])
+                                        .context("worker: insert")?;
+                                }
+                                wconn.execute("COMMIT", []).context("worker: commit")?;
+                                inserted += tx_buf.len();
+                                tx_buf.clear();
+                                last_flush = std::time::Instant::now();
+                            }
                         }
-                        if should_flush(tx_buf.len(), last_flush) {
-                            wconn.execute("BEGIN", []).context("worker: begin")?;
+
+                        if !tx_buf.is_empty() {
+                            wconn.execute("BEGIN", []).context("worker: begin final")?;
                             for (nid, blob, hash) in &tx_buf {
                                 ins.execute(rusqlite::params![nid, mid_w.as_str(), blob, hash])
-                                    .context("worker: insert")?;
+                                    .context("worker: insert final")?;
                             }
-                            wconn.execute("COMMIT", []).context("worker: commit")?;
+                            wconn
+                                .execute("COMMIT", [])
+                                .context("worker: commit final")?;
                             inserted += tx_buf.len();
-                            tx_buf.clear();
-                            last_flush = std::time::Instant::now();
                         }
-                    }
 
-                    if !tx_buf.is_empty() {
-                        wconn.execute("BEGIN", []).context("worker: begin final")?;
-                        for (nid, blob, hash) in &tx_buf {
-                            ins.execute(rusqlite::params![nid, mid_w.as_str(), blob, hash])
-                                .context("worker: insert final")?;
-                        }
-                        wconn
-                            .execute("COMMIT", [])
-                            .context("worker: commit final")?;
-                        inserted += tx_buf.len();
-                    }
+                        tracing::debug!(thread = i, inserted, "inference worker complete");
+                        Ok(inserted)
+                    })
+                    .expect("spawn inference thread")
+            })
+            .collect();
 
-                    tracing::debug!(thread = i, inserted, "inference worker complete");
-                    Ok(inserted)
-                })
-                .expect("spawn inference thread")
-        })
-        .collect();
-
-    let mut total_embedded = 0usize;
-    let worker_errors: Vec<String> = worker_handles
-        .into_iter()
-        .enumerate()
-        .filter_map(|(i, h)| match h.join() {
-            Ok(Ok(n)) => {
-                total_embedded += n;
-                None
-            }
-            Ok(Err(e)) => Some(format!("worker {i}: {e:#}")),
-            Err(_) => Some(format!("worker {i}: panicked")),
-        })
-        .collect();
-    // Stop the cancel watcher and observe whether a cancel fired.
-    watcher_done.store(true, Ordering::Relaxed);
-    if let Some(w) = watcher {
-        let _ = w.join();
+        let mut chunk_embedded = 0usize;
+        let worker_errors: Vec<String> = worker_handles
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, h)| match h.join() {
+                Ok(Ok(n)) => {
+                    chunk_embedded += n;
+                    None
+                }
+                Ok(Err(e)) => Some(format!("worker {i}: {e:#}")),
+                Err(_) => Some(format!("worker {i}: panicked")),
+            })
+            .collect();
+        // Stop this chunk's cancel watcher; a fired cancel stays observable in
+        // the shared `cancelled` flag checked at the top of the loop.
+        watcher_done.store(true, Ordering::Relaxed);
+        if let Some(w) = watcher {
+            let _ = w.join();
+        }
+        if !worker_errors.is_empty() {
+            anyhow::bail!("inference worker errors:\n  {}", worker_errors.join("\n  "));
+        }
+        total_embedded += chunk_embedded;
+        println!("  embedded {total_embedded}/{total}");
     }
     let was_cancelled = cancelled.load(Ordering::SeqCst);
-    if !worker_errors.is_empty() {
-        anyhow::bail!("inference worker errors:\n  {}", worker_errors.join("\n  "));
-    }
 
     println!("  Embedded {total_embedded} nodes.");
 

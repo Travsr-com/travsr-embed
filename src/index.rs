@@ -64,12 +64,19 @@ pub struct VecIndex {
     inner: Index,
     index_path: PathBuf,
     last_modified: SystemTime,
+    /// True when `inner` is a memory-mapped `view()` rather than a `load()`
+    /// copy (#736 item 4). A viewed index is read-only: `add` becomes a
+    /// no-op and reloads re-view. Serving uses views so the OS can evict
+    /// index pages under memory pressure instead of the daemon holding the
+    /// whole graph in anonymous memory.
+    viewed: bool,
 }
 
 impl VecIndex {
     /// Load an existing index from disk. Returns None if the file does not exist yet.
-    /// Call this from NomicPlugin::load() at daemon startup and in the incremental
-    /// reindex path when hnsw.usearch already exists.
+    /// Call this in the incremental reindex path when hnsw.usearch already
+    /// exists — reindex must `add()`, which a viewed index cannot.
+    /// The daemon serving path uses [`Self::try_serve`] instead.
     pub fn try_load(index_path: &Path) -> Result<Option<Self>> {
         if !index_path.exists() {
             return Ok(None);
@@ -95,7 +102,56 @@ impl VecIndex {
             inner,
             index_path: index_path.to_path_buf(),
             last_modified,
+            viewed: false,
         }))
+    }
+
+    /// Open an existing index for SERVING (#736 item 4). Returns None if the
+    /// file does not exist yet.
+    ///
+    /// On Linux/macOS this memory-maps the file (`usearch::view`) instead of
+    /// copying it into RAM: a 264k-node repo's index is hundreds of MB, and a
+    /// view lets the OS page it in on demand and evict it under memory
+    /// pressure — the daemon's resident footprint no longer includes the whole
+    /// graph. The trade: a viewed index is immutable, so the lazy-embed path's
+    /// `add()` becomes a no-op (see [`Self::add`] — the vector is still
+    /// persisted to embed.db and enters the index on the next reindex).
+    ///
+    /// On Windows this falls back to `try_load` (a RAM copy): holding a file
+    /// mapping there takes a sharing lock, and the reindex sidecar's
+    /// `build_from_db` save would fail with a sharing violation while the
+    /// daemon serves — a broken reindex is worse than the memory win.
+    pub fn try_serve(index_path: &Path) -> Result<Option<Self>> {
+        #[cfg(windows)]
+        {
+            Self::try_load(index_path)
+        }
+        #[cfg(not(windows))]
+        {
+            if !index_path.exists() {
+                return Ok(None);
+            }
+            let inner = Index::new(&make_options(1)).context("create usearch Index")?;
+            let path_str = index_path
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("index path is not valid UTF-8"))?;
+            inner.view(path_str).context("view (mmap) usearch index")?;
+            let last_modified = std::fs::metadata(index_path)
+                .context("stat index file")?
+                .modified()
+                .context("index file mtime")?;
+            tracing::info!(
+                count = inner.size(),
+                path = %index_path.display(),
+                "HNSW index viewed (mmap)"
+            );
+            Ok(Some(Self {
+                inner,
+                index_path: index_path.to_path_buf(),
+                last_modified,
+                viewed: true,
+            }))
+        }
     }
 
     /// Create an empty writable index. Used for the first reindex run when
@@ -109,6 +165,7 @@ impl VecIndex {
             inner,
             index_path: index_path.to_path_buf(),
             last_modified: SystemTime::UNIX_EPOCH,
+            viewed: false,
         })
     }
 
@@ -193,10 +250,22 @@ impl VecIndex {
             count += 1;
         }
 
-        let path_str = index_path
+        // #18 review (blocking): never save onto the live index path in place.
+        // The serving daemon may hold an mmap view() of that inode (try_serve),
+        // and truncating + rewriting it underneath the mapping is a SIGBUS
+        // (touching a page past the momentarily-truncated length) or torn
+        // reads (usearch walking a half-written graph) — the danger window is
+        // the whole write, not just a moment. Write a sibling tmp and rename:
+        // the daemon's existing mapping keeps the OLD inode alive and intact
+        // until its next mtime-triggered re-view, the same protocol as
+        // [`VecIndex::save`]. (On Windows the daemon serves from a load() copy,
+        // so rename-over-open-file semantics are never exercised there.)
+        let tmp = index_path.with_extension("usearch.tmp");
+        let tmp_str = tmp
             .to_str()
-            .ok_or_else(|| anyhow::anyhow!("index path not UTF-8"))?;
-        inner.save(path_str).context("save usearch index")?;
+            .ok_or_else(|| anyhow::anyhow!("index tmp path not UTF-8"))?;
+        inner.save(tmp_str).context("save usearch index to tmp")?;
+        std::fs::rename(&tmp, index_path).context("atomic rename usearch index")?;
         let last_modified = std::fs::metadata(index_path)
             .context("stat saved index")?
             .modified()
@@ -207,6 +276,7 @@ impl VecIndex {
             inner,
             index_path: index_path.to_path_buf(),
             last_modified,
+            viewed: false,
         })
     }
 
@@ -217,7 +287,20 @@ impl VecIndex {
     /// matching SQLite COMMIT was rolled back, leaving the key in HNSW without
     /// a node_embeddings row.  The embedding is identical (same node, same model),
     /// so skipping the add is correct; the caller still writes the DB row.
+    ///
+    /// On a viewed (mmap) serving index the add is a no-op (#736 item 4): the
+    /// mapping is read-only. The only caller that adds to a serving index is
+    /// the lazy-embed path, which already treats the add as best-effort — the
+    /// vector is persisted to embed.db and enters the index on the next
+    /// reindex/reload, and the current query scores it directly by cosine.
     pub fn add(&self, node_id: i64, vec: &[f32]) -> Result<()> {
+        if self.viewed {
+            tracing::debug!(
+                node_id,
+                "viewed index is immutable — lazy add deferred to next reindex"
+            );
+            return Ok(());
+        }
         if self.inner.contains(node_id as u64) {
             return Ok(());
         }
@@ -256,8 +339,31 @@ impl VecIndex {
             .context("index mtime")?;
         if mtime > self.last_modified {
             tracing::info!("index file updated — reloading");
-            *self = Self::try_load(&self.index_path)?
-                .ok_or_else(|| anyhow::anyhow!("index file vanished after mtime change"))?;
+            // #736 C2: free the old graph BEFORE loading the new file. The
+            // previous `*self = Self::try_load(...)` built the replacement
+            // index while the old one was still alive — a transient 2× of the
+            // index's full size, at exactly the moment a just-finished reindex
+            // has already elevated memory. A reload that then fails leaves an
+            // empty index rather than the stale one; the next knn() sees the
+            // unchanged mtime is still newer than last_modified and retries.
+            self.inner = Index::new(&make_options(1)).context("create usearch Index")?;
+            let path_str = self
+                .index_path
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("index path is not valid UTF-8"))?;
+            // A serving handle re-views (mmap), a reindex handle re-loads —
+            // reload must never silently change the handle's mutability class.
+            if self.viewed {
+                self.inner
+                    .view(path_str)
+                    .context("re-view (mmap) usearch index")?;
+            } else {
+                self.inner
+                    .load(path_str)
+                    .context("reload usearch index from disk")?;
+            }
+            self.last_modified = mtime;
+            tracing::info!(count = self.inner.size(), "HNSW index reloaded");
         }
 
         if self.inner.size() == 0 {
@@ -289,6 +395,18 @@ impl VecIndex {
     /// Current number of indexed vectors.
     pub fn size(&self) -> usize {
         self.inner.size()
+    }
+
+    /// Whether this handle is a read-only mmap view (see [`Self::try_serve`]).
+    ///
+    /// #18 review: `add` on a viewed handle is a silent `Ok(())` no-op, which
+    /// is correct for the lazy-embed serving path but would be a disaster on
+    /// the reindex path — the embed.db row would be written, `NOT EXISTS`
+    /// would consider the node done, and the vector would never enter any
+    /// index. The reindex paths assert against this at handle construction so
+    /// the invariant is checked structurally, not by convention.
+    pub fn is_viewed(&self) -> bool {
+        self.viewed
     }
 
     #[allow(dead_code)]
@@ -328,6 +446,47 @@ mod tests {
         let norm = v.iter().map(|&x| x * x).sum::<f32>().sqrt().max(1e-12);
         v.iter_mut().for_each(|x| *x /= norm);
         v
+    }
+
+    /// #736 item 4: the serving path must answer KNN through a view (mmap on
+    /// unix; load-fallback on Windows) with the same results as a load, and a
+    /// viewed index must silently no-op lazy adds instead of erroring.
+    #[test]
+    fn serve_knn_roundtrip_and_add_is_noop() {
+        let dir = std::env::temp_dir().join(format!(
+            "travsr_embed_serve_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("serve.usearch");
+
+        let idx = VecIndex::new_empty(&path, 100, TEST_DIM).unwrap();
+        for i in 0u32..100 {
+            idx.add(i as i64, &unit_vec(i)).unwrap();
+        }
+        idx.save().unwrap();
+
+        let mut served = VecIndex::try_serve(&path).unwrap().unwrap();
+        assert_eq!(served.count(), 100);
+        let query = unit_vec(7);
+        let query_blob: Vec<u8> = query.iter().flat_map(|&f| f.to_le_bytes()).collect();
+        let results = served.knn(&query_blob, 5).unwrap();
+        assert_eq!(results[0].0, 7, "top-1 must be the query vector itself");
+
+        // Lazy add on a serving index must never PANIC. On a viewed (unix)
+        // index it is an Ok no-op; on the Windows load-fallback usearch may
+        // refuse the insert (capacity not reserved) — the production
+        // lazy-embed path ignores exactly that error, so the contract here is
+        // "non-fatal", not "succeeds".
+        let _ = served.add(1_000, &unit_vec(1_000));
+        #[cfg(not(windows))]
+        assert_eq!(served.count(), 100, "viewed index must not grow");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

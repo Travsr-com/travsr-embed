@@ -561,6 +561,13 @@ impl NomicPlugin {
                         .sum::<f32>()
                         .clamp(0.0, 1.0);
                     results.push((*nid, sim));
+                    // Stated trade of the mmap serving path (#18 review): on a
+                    // viewed index this add is a no-op, so a lazily-embedded
+                    // node is NOT ANN-retrievable until the next reindex
+                    // rebuilds the file — it keeps taking this FTS+cosine lazy
+                    // path. Its vector is durable in embed.db and this query's
+                    // results already include it (pushed above), so the cost
+                    // is recall latency between reindexes, not correctness.
                     let _ = idx.add(*nid, &vec); // skip-if-present is safe
                 }
             }
@@ -1079,6 +1086,15 @@ fn reindex(
                     .context("create new HNSW index")?
             }
         };
+        // #18 review: flush_buffer treats add()'s Ok as "vector indexed", but
+        // a viewed (serving) handle silently no-ops adds — every vector would
+        // be dropped from the index while its embed.db row still landed, and
+        // NOT EXISTS would never offer the node again. All constructors above
+        // produce writable handles; this keeps that structural.
+        debug_assert!(
+            !idx.is_viewed(),
+            "reindex must never hold a viewed (read-only) index handle"
+        );
         idx.reserve(idx.size() + total)
             .context("reserve HNSW capacity for pending nodes")?;
         Some(idx)

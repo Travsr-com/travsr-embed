@@ -250,10 +250,22 @@ impl VecIndex {
             count += 1;
         }
 
-        let path_str = index_path
+        // #18 review (blocking): never save onto the live index path in place.
+        // The serving daemon may hold an mmap view() of that inode (try_serve),
+        // and truncating + rewriting it underneath the mapping is a SIGBUS
+        // (touching a page past the momentarily-truncated length) or torn
+        // reads (usearch walking a half-written graph) — the danger window is
+        // the whole write, not just a moment. Write a sibling tmp and rename:
+        // the daemon's existing mapping keeps the OLD inode alive and intact
+        // until its next mtime-triggered re-view, the same protocol as
+        // [`VecIndex::save`]. (On Windows the daemon serves from a load() copy,
+        // so rename-over-open-file semantics are never exercised there.)
+        let tmp = index_path.with_extension("usearch.tmp");
+        let tmp_str = tmp
             .to_str()
-            .ok_or_else(|| anyhow::anyhow!("index path not UTF-8"))?;
-        inner.save(path_str).context("save usearch index")?;
+            .ok_or_else(|| anyhow::anyhow!("index tmp path not UTF-8"))?;
+        inner.save(tmp_str).context("save usearch index to tmp")?;
+        std::fs::rename(&tmp, index_path).context("atomic rename usearch index")?;
         let last_modified = std::fs::metadata(index_path)
             .context("stat saved index")?
             .modified()
@@ -383,6 +395,18 @@ impl VecIndex {
     /// Current number of indexed vectors.
     pub fn size(&self) -> usize {
         self.inner.size()
+    }
+
+    /// Whether this handle is a read-only mmap view (see [`Self::try_serve`]).
+    ///
+    /// #18 review: `add` on a viewed handle is a silent `Ok(())` no-op, which
+    /// is correct for the lazy-embed serving path but would be a disaster on
+    /// the reindex path — the embed.db row would be written, `NOT EXISTS`
+    /// would consider the node done, and the vector would never enter any
+    /// index. The reindex paths assert against this at handle construction so
+    /// the invariant is checked structurally, not by convention.
+    pub fn is_viewed(&self) -> bool {
+        self.viewed
     }
 
     #[allow(dead_code)]

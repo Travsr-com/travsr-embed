@@ -112,9 +112,10 @@ fn registry() -> Vec<Box<dyn BackendFactory>> {
 
 /// Kill-switch (no rebuild required): force the pure-Rust tract CPU engine when
 /// the ORT/CoreML path misbehaves — e.g. the macOS CoreML EP's per-inference
-/// native leak. `TRAVSR_EMBED_ENGINE=tract` drops every ORT factory (accelerated
-/// + CPU) so the resolver can only pick tract; `auto` or unset keeps the normal
-/// preference cascade; anything else is ignored with a warning.
+/// native leak. `TRAVSR_EMBED_ENGINE=tract` drops every ORT factory (both the
+/// accelerated and CPU ORT engines) so the resolver can only pick tract; `auto`
+/// or unset keeps the normal preference cascade; anything else is ignored with a
+/// warning.
 ///
 /// Applied inside [`registry()`] so [`capabilities()`] reports the same
 /// restricted set the resolver will use — the handshake never advertises

@@ -29,6 +29,29 @@ fn default_family() -> String {
     "bert".to_owned()
 }
 
+/// Which inference engine to prefer on macOS (Apple Silicon), per model.
+///
+/// macOS is the one platform where the "accelerated" ORT path is CoreML, which
+/// for the BERT-family models shipped here is measurably slower and heavier than
+/// the pure-Rust tract CPU engine: CoreML fragments the graph into many
+/// CoreML/CPU partitions and pays a dynamic-shape recompile tax (issue #19).
+/// This field lets the catalog record the benchmarked winner per model. It has
+/// no effect off macOS, where "accelerated" means CUDA/etc. and keeps its
+/// normal top preference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MacosEngine {
+    /// Capability + benchmarked default: tract is preferred for families tract
+    /// can run; ORT is reached only when tract cannot run the model.
+    #[default]
+    Auto,
+    /// Force the pure-Rust tract CPU engine (drops every ORT factory on macOS).
+    Tract,
+    /// Prefer the ORT accelerated (CoreML) path, restoring accelerated-first
+    /// ordering. Set this only for a model benchmarked faster on CoreML.
+    Ort,
+}
+
 /// Per-model runtime descriptor, deserialized from `<model_dir>/model.toml`.
 ///
 /// This is the single source of truth for model-specific behaviour — the sidecar
@@ -56,6 +79,10 @@ pub struct ModelDescriptor {
     /// Defaults to "bert" so existing model.toml files need no migration.
     #[serde(default = "default_family")]
     pub family: String,
+    /// macOS engine preference (see [`MacosEngine`]). Defaults to `auto` so
+    /// existing model.toml files need no migration.
+    #[serde(default)]
+    pub macos_engine: MacosEngine,
 }
 
 impl ModelDescriptor {
@@ -146,5 +173,43 @@ mod tests {
         )
         .unwrap();
         assert_eq!(desc.family, "modernbert");
+    }
+
+    #[test]
+    fn macos_engine_defaults_to_auto() {
+        let desc = ModelDescriptor::parse(
+            r#"
+            dim = 384
+            pooling = "cls"
+            n_inputs = 3
+            "#,
+        )
+        .unwrap();
+        assert_eq!(desc.macos_engine, MacosEngine::Auto);
+    }
+
+    #[test]
+    fn macos_engine_tract_and_ort_are_read() {
+        let t = ModelDescriptor::parse(
+            r#"
+            dim = 384
+            pooling = "cls"
+            n_inputs = 3
+            macos_engine = "tract"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(t.macos_engine, MacosEngine::Tract);
+
+        let o = ModelDescriptor::parse(
+            r#"
+            dim = 1024
+            pooling = "cls"
+            n_inputs = 3
+            macos_engine = "ort"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(o.macos_engine, MacosEngine::Ort);
     }
 }

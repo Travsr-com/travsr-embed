@@ -102,7 +102,38 @@ fn registry() -> Vec<Box<dyn BackendFactory>> {
     factories.push(Box::new(tract::TractFactory));
     #[cfg(feature = "ort")]
     factories.push(Box::new(ort::OrtFactory::cpu()));
+
+    apply_engine_override(
+        &mut factories,
+        std::env::var("TRAVSR_EMBED_ENGINE").ok().as_deref(),
+    );
     factories
+}
+
+/// Kill-switch (no rebuild required): force the pure-Rust tract CPU engine when
+/// the ORT/CoreML path misbehaves — e.g. the macOS CoreML EP's per-inference
+/// native leak. `TRAVSR_EMBED_ENGINE=tract` drops every ORT factory (accelerated
+/// + CPU) so the resolver can only pick tract; `auto` or unset keeps the normal
+/// preference cascade; anything else is ignored with a warning.
+///
+/// Applied inside [`registry()`] so [`capabilities()`] reports the same
+/// restricted set the resolver will use — the handshake never advertises
+/// acceleration the user has switched off. Split out from `registry()` (taking
+/// the env value as an argument) so the filtering can be tested without mutating
+/// process-wide env under a parallel test run.
+fn apply_engine_override(factories: &mut Vec<Box<dyn BackendFactory>>, engine: Option<&str>) {
+    match engine.map(str::trim) {
+        Some(v) if v.eq_ignore_ascii_case("tract") => {
+            factories.retain(|f| f.engine() == "tract");
+        }
+        Some(v) if !v.is_empty() && !v.eq_ignore_ascii_case("auto") => {
+            tracing::warn!(
+                value = v,
+                "unknown TRAVSR_EMBED_ENGINE (expected 'tract' or 'auto') — using default engine selection"
+            );
+        }
+        _ => {}
+    }
 }
 
 /// What this compiled sidecar can run, for the CLI's pre-flight handshake.
@@ -334,6 +365,58 @@ mod tests {
         match run(factories, family) {
             Ok(b) => panic!("expected error, got backend '{}'", b.backend_name()),
             Err(e) => format!("{e:#}"),
+        }
+    }
+
+    fn engine_names(factories: &[Box<dyn BackendFactory>]) -> Vec<&'static str> {
+        factories.iter().map(|f| f.engine()).collect()
+    }
+
+    /// The kill-switch: `TRAVSR_EMBED_ENGINE=tract` must drop every ORT factory
+    /// (accelerated + CPU) so the resolver can only reach tract — this is the
+    /// no-rebuild escape from the macOS CoreML EP's per-inference native leak.
+    /// Case-insensitive and whitespace-tolerant so a value from a shell profile
+    /// still takes effect.
+    #[test]
+    fn engine_override_tract_drops_every_ort_factory() {
+        for value in ["tract", "TRACT", "  tract  "] {
+            let mut factories = vec![
+                ort_accel_like(Outcome::Chosen),
+                tract_like(Outcome::Chosen),
+                ort_cpu_like(Outcome::Chosen),
+            ];
+            apply_engine_override(&mut factories, Some(value));
+            assert_eq!(
+                engine_names(&factories),
+                vec!["tract"],
+                "value {value:?} must leave only the tract factory"
+            );
+        }
+    }
+
+    /// `auto`, unset, empty, and unrecognised values all leave the cascade
+    /// untouched — the kill-switch only ever *removes* ORT, never silently
+    /// changes selection for a typo.
+    #[test]
+    fn engine_override_auto_unset_and_unknown_keep_all_factories() {
+        for value in [
+            None,
+            Some("auto"),
+            Some("AUTO"),
+            Some(""),
+            Some("gpu-please"),
+        ] {
+            let mut factories = vec![
+                ort_accel_like(Outcome::Chosen),
+                tract_like(Outcome::Chosen),
+                ort_cpu_like(Outcome::Chosen),
+            ];
+            apply_engine_override(&mut factories, value);
+            assert_eq!(
+                engine_names(&factories),
+                vec!["ort-accelerated", "tract", "ort-cpu"],
+                "value {value:?} must not change the factory list"
+            );
         }
     }
 

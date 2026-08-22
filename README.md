@@ -11,14 +11,19 @@ users never build it directly.
 
 ## Which release asset do I want?
 
-The default asset for your platform always works. GPU assets are opt-in **except
-on Apple Silicon**, where acceleration is free (statically linked, nothing to
-install). Intel Macs are CPU-only: ONNX Runtime publishes no prebuilt for
+The default asset for your platform always works, and GPU assets are opt-in.
+Intel Macs are CPU-only: ONNX Runtime publishes no prebuilt for
 `x86_64-apple-darwin`, so no ORT-based engine can be built for them at all.
+
+Apple Silicon is the exception in both directions. CoreML is compiled into the
+default asset (statically linked, nothing to install), but as of 1.5.0 it is no
+longer what runs by default: for model families `tract` can run, tract is both
+faster and far cheaper in memory than CoreML on this hardware, so it is
+preferred. See [Choosing an engine on macOS](#choosing-an-engine-on-macos).
 
 | Your machine | Asset | Accelerator | Host prerequisite |
 | --- | --- | --- | --- |
-| macOS (Apple Silicon) | default | CoreML (ANE + GPU) | none |
+| macOS (Apple Silicon) | default | none by default (tract, CPU); CoreML for families tract cannot run, or opt in per model | none |
 | macOS (Intel) | default | none (tract, CPU) | none |
 | Linux x86_64 + NVIDIA GPU | `…-x86_64-unknown-linux-gnu-cuda` | CUDA | CUDA runtime + cuDNN, glibc 2.38+, and a Haswell-or-newer CPU (`x86-64-v3`) |
 | Windows x86_64 + any GPU | `…-x86_64-pc-windows-msvc-directml.exe` | DirectML (Intel, AMD **or** NVIDIA) | a DirectX 12 GPU |
@@ -121,6 +126,45 @@ host (notably: no ORT feature builds on a Windows *GNU* toolchain).
 Backend selection at runtime is capability-based: each registered backend
 declares which model families it can run, and the sidecar picks the first
 backend, in preference order, that can serve the model actually being loaded.
+Accelerated engines come first, except on macOS (see below).
+
+### Choosing an engine on macOS
+
+Since 1.5.0, macOS prefers `tract` over CoreML for families tract can run.
+Measured on Apple Silicon with the shipped bge-small model over an identical
+30k-document corpus, release builds: tract ran about 2x the throughput at every
+point and peaked at 743 MB RSS, finishing in 8m35s, where CoreML peaked near
+4.0 GB and never finished the corpus. CoreML loses because ORT fragments the
+BERT graph into roughly 97 CoreML/CPU partitions, paying a copy at every seam,
+plus a dynamic-shape recompile tax. The flip is gated to macOS, so Linux/CUDA
+and Windows/DirectML keep accelerated-first ordering.
+
+CoreML is still reached on macOS for families `tract` cannot run (ModernBERT,
+nomic-bert), and can be opted back into per model with `macos_engine` in that
+model's `model.toml`:
+
+| `macos_engine` | Effect on macOS |
+| --- | --- |
+| `auto` (default) | Prefer `tract` for families it can run; fall through to ORT/CoreML otherwise. |
+| `tract` | Force `tract`, dropping every ORT engine. A loud error for a family tract cannot run, rather than a silent fallback. |
+| `ort` | Restore accelerated-first ordering. Set this only for a model benchmarked faster on CoreML. |
+
+It defaults to `auto`, so existing `model.toml` files need no migration, and it
+has no effect off macOS.
+
+**`macos_engine` does not survive a reinstall.** `travsr embed init` rewrites
+`model.toml` from a closed field set that does not yet include it, and does so
+even when the model files were already present, so a hand-set value reverts to
+`auto` on the next `embed init`. For an override that has to persist, use the
+`TRAVSR_EMBED_ENGINE` environment variable instead.
+
+### Environment variables
+
+| Variable | Effect |
+| --- | --- |
+| `TRAVSR_EMBED_ENGINE` | `tract` drops every ORT engine (both accelerated and ORT CPU) from the cascade, forcing the pure-Rust CPU engine regardless of what is compiled in or what the catalog says. `auto`, or unset, keeps the normal cascade. The switch can only ever remove ORT, so an unrecognised value warns and changes nothing. Also reflected in `--capabilities`, so the handshake never advertises acceleration that has been switched off. |
+| `TRAVSR_EMBED_TOKEN_BUDGET` | Overrides the derived per-worker padded-token budget, for tuning. By default a total budget of 8,192 is divided across the requested `--parallel` workers, floored at 1,024 and capped at 4,096, which keeps peak memory roughly flat as workers scale. Single-submitter backends (GPU/ORT) keep the whole budget. |
+| `ORT_DYLIB_PATH` | Where the `-directml` (and any `ort-dynamic`) build loads `onnxruntime.dll` from, when not beside the executable. |
 
 ### Reporting what a build can do
 

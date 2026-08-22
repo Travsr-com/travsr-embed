@@ -5,7 +5,11 @@ All notable changes to `travsr-embed` are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.5.0] - 2026-08-22
+
+Hardening and memory release. Reverses 1.4.0's macOS engine choice on measured
+evidence, makes parallel reindex cheap in memory rather than expensive, and
+clears the crash residue that could make a killed reindex poison every later run.
 
 ### Added
 - **`TRAVSR_EMBED_ENGINE` kill-switch.** Setting it to `tract` drops every ORT
@@ -24,6 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   were already present, so a hand-set value reverts to `auto` on the next
   `embed init`. Use the env kill-switch for an override that has to survive a
   reinstall. (Tracked for a CLI-side fix; the env switch is unaffected.)
+- **`TRAVSR_EMBED_TOKEN_BUDGET`** overrides the derived per-worker padded-token
+  budget for tuning. The value is clamped up to one full sequence so a batch can
+  always hold a single item.
 
 ### Changed
 - **macOS now prefers tract over CoreML by default** for families tract can run
@@ -36,8 +43,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   macOS, so Linux/CUDA keeps accelerated-first ordering, and `resolve()` is
   split into a testable `resolve_with(is_macos)` so the ordering is
   deterministic on any CI host.
+- **Inference tokens are budgeted across all workers, not per worker.** The
+  padded-token budget bounds the largest activation tensor **one** worker
+  allocates, and every worker runs one batch at a time, so peak sidecar memory
+  scaled with `workers x budget`. A fixed per-worker 4,096 therefore made memory
+  grow linearly with `-j`, which is what made parallelism expensive: on a
+  1,453-node repo, 8 workers peaked at 634 MB against 345 MB for the 2-worker
+  default, for only a 1.7x speedup. A total budget of 8,192 is now divided by
+  the requested workers, floored at 1,024 and capped at the historical 4,096.
+  Memory stays roughly flat as workers scale and throughput improves rather than
+  degrades, because large batches mostly buy `BatchLongest` padding waste:
+  8 workers measured 45.4s / 316 MB against 48.1s / 634 MB at the old fixed
+  budget. One and two workers keep exactly 4,096, so the configurations where
+  the old default was already right do not regress. Single-submitter backends
+  (GPU/ORT) run one inference loop whatever `-j` says, so they keep the whole
+  budget. Batch composition never changes the vectors (attention masking makes
+  padding inert, verified bit-identical across budgets on texts spanning 12 to
+  480 characters), so this is purely a compute/memory trade-off, not a quality
+  one.
+- **The serving path memory-maps the HNSW index** (usearch `view`) on Linux and
+  macOS instead of copying it into RAM, so the OS pages it in on demand and can
+  evict under pressure. A viewed index is immutable, so the lazy-embed add
+  becomes a no-op (the vector still persists to `embed.db` and enters the index
+  on the next reindex) and reloads re-view. Windows keeps the load fallback,
+  where a live file mapping takes a sharing lock that would break the reindex
+  sidecar's save.
+- **Both reindex paths stop materialising the whole pending corpus.** A `COUNT`
+  query provides totals, then 50k rows are fetched, embedded and committed per
+  pass. Committed chunks drop out of the `NOT EXISTS` filter, so the loop needs
+  no `OFFSET` and always terminates.
 
 ### Fixed
+- **A KNN index reload transiently doubled index memory** (travsr#736 RCA). The
+  reload built the replacement index while the previous one was still alive, a
+  transient 2x of the full index size at exactly the moment a just-finished
+  reindex had already elevated memory. The old graph is now freed before the
+  updated file is loaded, for RAM-copy handles where that 2x is the real
+  concern.
+- **ONNX Runtime sized its thread pools from the host, ignoring cgroup limits**
+  (travsr#736 RCA). Left unset, ORT probes the host's physical core count, so a
+  container limited to 2 CPUs on a 64-core host got roughly 64 spinning threads
+  and permanent throttling. Intra-op threads are now capped at
+  `available_parallelism()` (cgroup quota-aware on Linux) and inter-op at 1.
 - **Crash residue from a killed reindex could crash or stall the serving
   sidecar (travsr#735 follow-up).** Four hardening changes:
 
@@ -240,6 +287,8 @@ Initial release of the `travsr-embed` sidecar (RFC-018).
 ### Changed
 - Relicensed from MIT to Apache-2.0.
 
+[1.5.0]: https://github.com/Travsr-com/travsr-embed/compare/v1.4.0...v1.5.0
+[1.4.0]: https://github.com/Travsr-com/travsr-embed/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/Travsr-com/travsr-embed/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/Travsr-com/travsr-embed/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/Travsr-com/travsr-embed/compare/v1.0.0...v1.1.0

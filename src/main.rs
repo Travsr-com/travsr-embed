@@ -65,6 +65,50 @@ fn backend_label(model_id: &str, dim: usize) -> String {
 // MAX_BATCH=512, so the budget is the effective limit in practice.
 const MAX_BATCH: usize = 512;
 const TOKEN_BUDGET: usize = 4_096;
+
+/// Padded-token budget shared across ALL inference workers.
+///
+/// `TOKEN_BUDGET` bounds the largest activation tensor **one** worker
+/// allocates (`max_seq × rows × hidden × 4 B`), and every worker runs one batch
+/// at a time — so peak sidecar memory scales with `workers × per-worker
+/// budget`, not with the corpus. Holding the *per-worker* budget fixed
+/// therefore made memory grow linearly with `-j`, which is what made raising
+/// the worker count expensive: measured on a 1,453-node repo, 8 workers at a
+/// fixed 4,096 peaked at 634 MB versus 345 MB for the 2-worker default.
+///
+/// Budgeting the *total* instead keeps peak memory roughly flat as workers
+/// scale, and costs nothing in throughput because large batches mostly buy
+/// padding waste: 8 workers at 1,024 each measured 45.4 s / 316 MB against
+/// 48.1 s / 634 MB for the same workers at 4,096 — faster on half the memory.
+///
+/// 8,192 is chosen so the historical 4,096 is preserved exactly at one and two
+/// workers (no regression where the old default was already right; at 2
+/// workers a smaller budget measured ~9 % slower).
+const TOTAL_TOKEN_BUDGET: usize = 8_192;
+
+/// Floor for the per-worker budget, so a high `-j` cannot shrink batches into
+/// per-batch overhead. At 8 workers this is the binding constraint.
+const MIN_TOKEN_BUDGET: usize = 1_024;
+
+/// Per-worker padded-token budget for `parallel` requested workers.
+///
+/// Batch composition never changes the vectors — attention masking makes
+/// padding inert, verified bit-identical across budgets — so this is purely a
+/// compute/memory trade-off. `TRAVSR_EMBED_TOKEN_BUDGET` overrides it for
+/// tuning; the value is clamped to at least one full sequence so a batch can
+/// always hold a single item.
+fn token_budget_for(parallel: usize, single_submitter: bool) -> usize {
+    if let Some(v) = std::env::var("TRAVSR_EMBED_TOKEN_BUDGET")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        return v.max(crate::encode::MAX_SEQ);
+    }
+    // A single-submitter backend (GPU/ORT) runs one inference loop regardless
+    // of `-j`, so it gets the whole budget rather than a divided share.
+    let workers = if single_submitter { 1 } else { parallel.max(1) };
+    (TOTAL_TOKEN_BUDGET / workers).clamp(MIN_TOKEN_BUDGET, TOKEN_BUDGET)
+}
 // Commit to embed.db every TX_BATCH rows. Kept small so embed.db reflects
 // progress in near-real-time (the CLI progress bar and `embed status` poll it).
 // Cheap: embed.db uses synchronous=OFF, so a commit is a WAL append, not an
@@ -1173,7 +1217,8 @@ fn reindex(
         let batch_ranges: Vec<std::ops::Range<usize>> = if model.is_accelerated() {
             build_batch_ranges_bucketed(&est_lens, &encode::GPU_BUCKETS)
         } else {
-            build_batch_ranges(&est_lens)
+            // Non-parallel path: one inference loop, so it gets the whole budget.
+            build_batch_ranges(&est_lens, token_budget_for(1, true))
         };
 
         for range in batch_ranges {
@@ -1431,10 +1476,15 @@ fn reindex_parallel(
         let mut sorted = chunk;
         sorted.sort_by_key(|(_, t)| estimate_tokens(t));
         let est_lens: Vec<usize> = sorted.iter().map(|(_, t)| estimate_tokens(t)).collect();
+        // Budget the TOTAL activation footprint across workers, not each worker
+        // independently — see TOTAL_TOKEN_BUDGET. Keyed on the requested
+        // `parallel`, which is known here (the final `n_workers` depends on
+        // `n_batches`, which this call produces).
+        let per_worker_budget = token_budget_for(parallel, model.single_submitter());
         let batch_ranges = if model.is_accelerated() {
             build_batch_ranges_bucketed(&est_lens, &encode::GPU_BUCKETS)
         } else {
-            build_batch_ranges(&est_lens)
+            build_batch_ranges(&est_lens, per_worker_budget)
         };
         let n_batches = batch_ranges.len();
 
@@ -1715,14 +1765,14 @@ fn build_batch_ranges_bucketed(
 
 /// Partition a slice of per-item token estimates into token-budget batches.
 /// Items must be pre-sorted shortest-first so BatchLongest padding is minimised.
-fn build_batch_ranges(est_lens: &[usize]) -> Vec<std::ops::Range<usize>> {
+fn build_batch_ranges(est_lens: &[usize], budget: usize) -> Vec<std::ops::Range<usize>> {
     let mut ranges = Vec::new();
     let mut start = 0usize;
     let mut max_est = 0usize;
     for (i, &est) in est_lens.iter().enumerate() {
         let new_max = max_est.max(est);
         let projected = new_max * (i - start + 1);
-        if i > start && (projected > TOKEN_BUDGET || (i - start) >= MAX_BATCH) {
+        if i > start && (projected > budget || (i - start) >= MAX_BATCH) {
             ranges.push(start..i);
             start = i;
             max_est = est;
@@ -2275,6 +2325,63 @@ mod flush_policy_tests {
 }
 
 #[cfg(test)]
+mod token_budget_tests {
+    use super::*;
+
+    /// The budget is shared across workers, so peak activation memory stays
+    /// roughly flat as `-j` rises instead of growing linearly with it.
+    #[test]
+    fn total_budget_is_divided_across_workers() {
+        assert_eq!(token_budget_for(4, false), 2_048);
+        assert_eq!(token_budget_for(8, false), 1_024);
+        assert!(
+            token_budget_for(2, false) * 2 <= TOTAL_TOKEN_BUDGET,
+            "workers x per-worker budget must stay within the total"
+        );
+    }
+
+    /// Low worker counts keep the historical 4,096 exactly: that is where the
+    /// old default was already right, and a smaller budget measured slower.
+    #[test]
+    fn low_worker_counts_are_unchanged() {
+        assert_eq!(token_budget_for(1, false), TOKEN_BUDGET);
+        assert_eq!(token_budget_for(2, false), TOKEN_BUDGET);
+    }
+
+    /// A high `-j` must not shrink batches into per-batch overhead, and a
+    /// single-submitter backend (GPU/ORT) runs one loop whatever `-j` says, so
+    /// it keeps the whole budget.
+    #[test]
+    fn floor_and_single_submitter_are_respected() {
+        assert_eq!(token_budget_for(64, false), MIN_TOKEN_BUDGET);
+        assert_eq!(
+            token_budget_for(0, false),
+            TOKEN_BUDGET,
+            "0 must not divide by zero"
+        );
+        assert_eq!(token_budget_for(16, true), TOKEN_BUDGET);
+    }
+
+    /// Every batch must still respect whatever budget it was given, at any
+    /// worker count — the invariant the batcher's own tests assert at 4,096.
+    #[test]
+    fn batches_respect_a_divided_budget() {
+        let lens: Vec<usize> = (1..=200).map(|i| (i * 7) % 300 + 8).collect();
+        let mut sorted = lens.clone();
+        sorted.sort_unstable();
+        for parallel in [1usize, 2, 4, 8, 16] {
+            let budget = token_budget_for(parallel, false);
+            for r in build_batch_ranges(&sorted, budget) {
+                let longest = sorted[r.end - 1];
+                assert!(
+                    longest * r.len() <= budget || r.len() == 1,
+                    "batch {r:?} exceeds budget {budget} at -j {parallel}"
+                );
+            }
+        }
+    }
+}
+#[cfg(test)]
 mod query_memo_tests {
     use super::*;
     use std::time::Duration;
@@ -2406,7 +2513,7 @@ mod batching_tests {
                 .iter()
                 .map(shape_of)
                 .collect();
-        let plain: std::collections::HashSet<_> = build_batch_ranges(&sorted)
+        let plain: std::collections::HashSet<_> = build_batch_ranges(&sorted, TOKEN_BUDGET)
             .iter()
             .map(|r| {
                 let longest = sorted[r.start..r.end].iter().copied().max().unwrap_or(1);
@@ -2448,7 +2555,7 @@ mod batching_tests {
     #[test]
     fn non_accelerated_batching_is_the_token_budget_batcher() {
         let lens: Vec<usize> = (1..=500).collect();
-        let plain = build_batch_ranges(&lens);
+        let plain = build_batch_ranges(&lens, TOKEN_BUDGET);
         assert!(!plain.is_empty());
         covers_everything(&plain, lens.len());
         // Token budget respected: max_est × rows stays within TOKEN_BUDGET unless

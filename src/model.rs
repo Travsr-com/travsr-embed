@@ -107,8 +107,13 @@ impl ModelDescriptor {
 
 /// Unpack a `dim`×4-byte BLOB into f32 values (little-endian).
 pub fn blob_to_f32(blob: &[u8]) -> Vec<f32> {
-    blob.chunks_exact(4)
-        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+    // as_chunks over chunks_exact: same semantics (trailing partial chunk
+    // ignored), no per-chunk try_into, and what clippy 1.98's
+    // chunks_exact_to_as_chunks lint asks for.
+    blob.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
         .collect()
 }
 

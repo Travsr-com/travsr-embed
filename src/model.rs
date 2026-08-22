@@ -81,6 +81,14 @@ pub struct ModelDescriptor {
     pub family: String,
     /// macOS engine preference (see [`MacosEngine`]). Defaults to `auto` so
     /// existing model.toml files need no migration.
+    ///
+    /// Not durable against the CLI: `travsr embed init` rewrites `model.toml`
+    /// from a closed field set that does not include this one, and it does so
+    /// unconditionally at the end of the run, even when every model file was
+    /// already present. A hand-set value therefore reverts to `auto` on the next
+    /// `embed init` with no warning. Until the CLI carries this field through
+    /// (or the catalog supplies it), prefer the `TRAVSR_EMBED_ENGINE` env
+    /// kill-switch for anything that has to survive a reinstall.
     #[serde(default)]
     pub macos_engine: MacosEngine,
 }

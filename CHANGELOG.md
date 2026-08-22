@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`TRAVSR_EMBED_ENGINE` kill-switch.** Setting it to `tract` drops every ORT
+  factory from the cascade, forcing the pure-Rust CPU engine regardless of what
+  is compiled in or what the catalog says. `auto` (or unset) keeps the normal
+  cascade. The switch can only ever remove ORT, so an unrecognised value warns
+  and changes nothing.
+- **Per-model `macos_engine` in `model.toml`**: `auto` (default) | `tract`
+  (per-model kill-switch) | `ort` (opt back into accelerated-first, for a model
+  benchmarked faster on CoreML). Defaults to `auto`, so existing `model.toml`
+  files need no migration. Setting `tract` for a family tract cannot run
+  (ModernBERT, nomic-bert) is a loud error rather than a silent fallback.
+
+  Note: `travsr embed init` rewrites `model.toml` from a closed field set that
+  does not yet include `macos_engine`, and does so even when the model files
+  were already present, so a hand-set value reverts to `auto` on the next
+  `embed init`. Use the env kill-switch for an override that has to survive a
+  reinstall. (Tracked for a CLI-side fix; the env switch is unaffected.)
+
+### Changed
+- **macOS now prefers tract over CoreML by default** for families tract can run
+  (issue #19). Measured on Apple Silicon with the shipped bge-small model over
+  an identical 30k-document corpus, release builds: tract ran about 2x the
+  throughput at every point and peaked at 743 MB RSS, finishing in 8m35s, where
+  CoreML peaked near 4.0 GB and never finished the corpus. CoreML loses because
+  ORT fragments the BERT graph into roughly 97 CoreML/CPU partitions, paying a
+  copy at every seam, plus a dynamic-shape recompile tax. The flip is gated to
+  macOS, so Linux/CUDA keeps accelerated-first ordering, and `resolve()` is
+  split into a testable `resolve_with(is_macos)` so the ordering is
+  deterministic on any CI host.
+
 ### Fixed
 - **Crash residue from a killed reindex could crash or stall the serving
   sidecar (travsr#735 follow-up).** Four hardening changes:
@@ -37,6 +67,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
      failures are counted and logged, and a chunk consisting only of
      undecodable rows aborts loudly instead of ending the run "successfully"
      with pending work the daemon would respawn forever.
+
+### Notes for upgraders
+- **macOS Apple Silicon users will see a backend change, the reverse of
+  1.4.0's.** bert-family models now resolve back to `tract` instead of
+  `ort/CoreML`, so the first reindex after upgrading logs the existing
+  backend-provenance warning and recommends `travsr embed reindex --rebuild`.
+  This is the exact mirror of the note 1.4.0 shipped for the tract-to-CoreML
+  flip, and the reason is the same: GPU and CPU float accumulation differ in the
+  last decimal places, and the warning exists to stop an index being half one
+  and half the other. Anyone who reindexed under 1.4.0 on Apple Silicon should
+  rebuild. To stay on CoreML instead, set `macos_engine = "ort"` in that model's
+  `model.toml`.
 
 ## [1.4.0] - 2026-08-15
 

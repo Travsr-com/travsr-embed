@@ -908,6 +908,38 @@ fn embed_db_path_for(db_path: &Path) -> PathBuf {
 /// When `shard = Some((i, n))`, only processes nodes where `id % n = i` and
 /// skips all HNSW operations — the CLI orchestrator calls rebuild_index() when
 /// all n shards have finished.
+/// Decode one pending-query row into `(node_id, embed_text)`, tolerating NULL
+/// or mistyped text columns (travsr#735 follow-up).
+///
+/// The previous inline mappers used typed `row.get::<_, String>` for
+/// kind/signature/path, so a row with an unexpected NULL failed to decode and
+/// was silently dropped by `filter_map(|r| r.ok())`. A dropped row is never
+/// embedded, never INSERTed, and therefore re-selected by `NOT EXISTS` in
+/// every subsequent chunk: worst case one full pending SELECT (two correlated
+/// GROUP_CONCAT subqueries over `edges`) per surviving row, and a chunk of
+/// only-bad rows exited the run "successfully" with `inserted < total`, so the
+/// daemon respawned a reindex that could never finish, every tick.
+///
+/// Tolerating NULLs makes every selected row embeddable (empty parts degrade
+/// to a weaker text, same as `build_node_text` already does for absent
+/// callers/callees), so every selected row is INSERTed and the loop provably
+/// drains. Only a row whose `id` cannot be read still fails; the callers count
+/// those loudly instead of dropping them silently.
+fn pending_row_to_text(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, String)> {
+    let id: i64 = row.get(0)?;
+    let opt = |i: usize| -> Option<String> { row.get::<_, Option<String>>(i).ok().flatten() };
+    let kind = opt(1).unwrap_or_default();
+    let sig = opt(2).unwrap_or_default();
+    let path = opt(3).unwrap_or_default();
+    let embed_text = opt(4);
+    let callers = opt(5);
+    let callees = opt(6);
+    let text = embed_text.unwrap_or_else(|| {
+        build_node_text(&kind, &sig, &path, callers.as_deref(), callees.as_deref())
+    });
+    Ok((id, text))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn reindex(
     model_dir: &Path,
@@ -1099,11 +1131,14 @@ fn reindex(
     let idx: Option<index::VecIndex> = if worker_mode || matches!(phase, Phase::Phase2(_)) {
         None
     } else {
-        let idx = if index_path.exists() {
-            index::VecIndex::try_load(&index_path)
-                .context("load existing HNSW index")?
-                .expect("index file exists but load returned None")
-        } else {
+        // travsr#735 follow-up: sweep a stale .tmp left by a save() that was
+        // killed between write and rename; it is dead weight the atomic-rename
+        // protocol will never look at again.
+        let _ = std::fs::remove_file(index_path.with_extension("usearch.tmp"));
+        // Build a fresh writable index from whatever embed.db already holds
+        // (or empty when it holds nothing). Shared by the no-file case and the
+        // corrupt-file recovery below.
+        let build_fresh = || -> Result<index::VecIndex> {
             let existing: usize = conn
                 .query_row(
                     "SELECT COUNT(*) FROM edb.node_embeddings WHERE model_id = ?1",
@@ -1124,11 +1159,34 @@ fn reindex(
                 .context("rebuild HNSW from existing embeddings before adding pending")?;
                 index::VecIndex::try_load(&index_path)
                     .context("load freshly-rebuilt HNSW")?
-                    .expect("just-rebuilt index must be loadable")
+                    .context("just-rebuilt index must be loadable")
             } else {
-                index::VecIndex::new_empty(&index_path, total, dim)
-                    .context("create new HNSW index")?
+                index::VecIndex::new_empty(&index_path, total, dim).context("create new HNSW index")
             }
+        };
+        let idx = if index_path.exists() {
+            match index::VecIndex::try_load(&index_path) {
+                Ok(Some(idx)) => idx,
+                // Raced away between exists() and load: treat as absent.
+                Ok(None) => build_fresh()?,
+                // travsr#735 follow-up: a partial/corrupt file from a killed
+                // run used to fail this load with exit 1 on EVERY subsequent
+                // reindex, and the daemon respawned one per tick, forever.
+                // This is the write path (the file is about to be replaced by
+                // this very run), so quarantining it and rebuilding from
+                // embed.db loses nothing.
+                Err(e) => {
+                    tracing::warn!(
+                        path = %index_path.display(),
+                        "existing HNSW index failed to load; quarantining and \
+                         rebuilding from embed.db: {e:#}"
+                    );
+                    index::quarantine_corrupt_index(&index_path);
+                    build_fresh()?
+                }
+            }
+        } else {
+            build_fresh()?
         };
         // #18 review: flush_buffer treats add()'s Ok as "vector indexed", but
         // a viewed (serving) handle silently no-ops adds — every vector would
@@ -1178,31 +1236,48 @@ fn reindex(
     // #736 item 7: chunked outer loop — fetch, sort, batch, and embed at most
     // PENDING_CHUNK_ROWS rows at a time.
     loop {
+        // travsr#735 follow-up: rows are decoded by the NULL-tolerant
+        // pending_row_to_text, and the few that can still fail (unreadable id)
+        // are COUNTED, not silently dropped — see the bail below for why a
+        // silent drop here could loop the whole reindex.
+        let mut decode_failures = 0usize;
         let mut texts: Vec<(i64, String)> = {
             let mut stmt = conn.prepare(&sql)?;
             // Bound to a local (not the block's tail expression) so the
             // statement's row borrow ends before `stmt` drops — the tail
             // expression's temporaries outlive block locals (E0597).
             let rows: Vec<(i64, String)> = stmt
-                .query_map([model_id], |row| {
-                    let id: i64 = row.get(0)?;
-                    let kind: String = row.get(1)?;
-                    let sig: String = row.get(2)?;
-                    let path: String = row.get(3)?;
-                    let embed_text: Option<String> = row.get(4)?;
-                    let callers: Option<String> = row.get(5)?;
-                    let callees: Option<String> = row.get(6)?;
-                    let text = embed_text.unwrap_or_else(|| {
-                        build_node_text(&kind, &sig, &path, callers.as_deref(), callees.as_deref())
-                    });
-                    Ok((id, text))
-                })?
-                .filter_map(|r| r.ok())
+                .query_map([model_id], pending_row_to_text)?
+                .filter_map(|r| match r {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        decode_failures += 1;
+                        if decode_failures <= 3 {
+                            tracing::warn!(error = %e, "pending row skipped: undecodable");
+                        }
+                        None
+                    }
+                })
                 .collect();
             rows
         };
         if texts.is_empty() {
+            // A chunk that selected only undecodable rows must be a loud
+            // failure: breaking here would end the run "successfully" with
+            // work still pending, so the daemon would respawn a reindex that
+            // can never finish, every tick.
+            anyhow::ensure!(
+                decode_failures == 0,
+                "all {decode_failures} pending rows in this chunk failed to decode; \
+                 aborting instead of looping (see warnings above)"
+            );
             break;
+        }
+        if decode_failures > 0 {
+            tracing::warn!(
+                decode_failures,
+                "some pending rows failed to decode and were skipped this chunk"
+            );
         }
         texts.sort_by_key(|(_, text)| estimate_tokens(text));
 
@@ -1443,6 +1518,9 @@ fn reindex_parallel(
         if cancelled.load(Ordering::SeqCst) {
             break;
         }
+        // travsr#735 follow-up: NULL-tolerant decode + loud failure counting,
+        // mirroring the non-parallel loop (see pending_row_to_text).
+        let mut decode_failures = 0usize;
         let chunk: Vec<(i64, String)> = {
             let mut stmt = ro_conn
                 .prepare(&select_sql)
@@ -1451,26 +1529,37 @@ fn reindex_parallel(
             // statement's row borrow ends before `stmt` drops — the tail
             // expression's temporaries outlive block locals (E0597).
             let rows: Vec<(i64, String)> = stmt
-                .query_map([model_id], |row| {
-                    let id: i64 = row.get(0)?;
-                    let kind: String = row.get(1)?;
-                    let sig: String = row.get(2)?;
-                    let path: String = row.get(3)?;
-                    let embed_text: Option<String> = row.get(4)?;
-                    let callers: Option<String> = row.get(5)?;
-                    let callees: Option<String> = row.get(6)?;
-                    let text = embed_text.unwrap_or_else(|| {
-                        build_node_text(&kind, &sig, &path, callers.as_deref(), callees.as_deref())
-                    });
-                    Ok((id, text))
-                })
+                .query_map([model_id], pending_row_to_text)
                 .context("query pending nodes")?
-                .filter_map(|r| r.ok())
+                .filter_map(|r| match r {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        decode_failures += 1;
+                        if decode_failures <= 3 {
+                            tracing::warn!(error = %e, "pending row skipped: undecodable");
+                        }
+                        None
+                    }
+                })
                 .collect();
             rows
         };
         if chunk.is_empty() {
+            // Same termination guard as the non-parallel loop: a chunk of only
+            // undecodable rows must abort loudly, never end the run
+            // "successfully" with pending work the daemon will respawn forever.
+            anyhow::ensure!(
+                decode_failures == 0,
+                "all {decode_failures} pending rows in this chunk failed to decode; \
+                 aborting instead of looping (see warnings above)"
+            );
             break;
+        }
+        if decode_failures > 0 {
+            tracing::warn!(
+                decode_failures,
+                "some pending rows failed to decode and were skipped this chunk"
+            );
         }
 
         let mut sorted = chunk;
@@ -1858,6 +1947,14 @@ fn rebuild_index(db_path: &Path, embed_db_path: &Path, model_id: &str) -> Result
     anyhow::ensure!(
         code_existing > 0 || doc_existing > 0,
         "no embeddings in embed.db — run `travsr embed reindex` first"
+    );
+
+    // travsr#735 follow-up: sweep stale .tmp siblings from saves killed
+    // between write and rename; the atomic-rename protocol never reads them.
+    let _ =
+        std::fs::remove_file(index_path_for_db(db_path, model_id).with_extension("usearch.tmp"));
+    let _ = std::fs::remove_file(
+        doc_index_path_for_db(db_path, model_id).with_extension("usearch.tmp"),
     );
 
     if code_existing > 0 {
@@ -2381,6 +2478,72 @@ mod token_budget_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod pending_row_tests {
+    use super::*;
+
+    /// travsr#735 follow-up: a pending row with NULL text columns must decode
+    /// (degrading to a weaker text), never fail and get silently re-selected
+    /// by NOT EXISTS in every later chunk.
+    #[test]
+    fn null_text_columns_still_decode_to_an_embeddable_row() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE pending (id INTEGER, kind TEXT, signature TEXT, path TEXT,
+                                   embed_text TEXT, callers TEXT, callees TEXT);
+             INSERT INTO pending VALUES (1, NULL, NULL, NULL, NULL, NULL, NULL);
+             INSERT INTO pending VALUES (2, 'fn', 'do_work', 'src/a.rs', NULL, 'caller_a', NULL);
+             INSERT INTO pending VALUES (3, 'fn', 'x', 'src/b.rs', 'stored text wins', NULL, NULL);",
+        )
+        .unwrap();
+        let mut stmt = conn
+            .prepare("SELECT id, kind, signature, path, embed_text, callers, callees FROM pending ORDER BY id")
+            .unwrap();
+        let rows: Vec<(i64, String)> = stmt
+            .query_map([], pending_row_to_text)
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .expect("every row must decode");
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].0, 1, "the all-NULL row must survive decoding");
+        assert_eq!(rows[1].0, 2);
+        assert!(
+            rows[1].1.contains("do_work"),
+            "fallback text must be built from the non-NULL parts: {}",
+            rows[1].1
+        );
+        assert_eq!(
+            rows[2].1, "stored text wins",
+            "a present embed_text must be used verbatim"
+        );
+    }
+
+    /// A numeric value in a text column (SQLite is dynamically typed) must not
+    /// kill the row either: the tolerant getter treats it as absent.
+    #[test]
+    fn mistyped_text_column_degrades_instead_of_failing() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE pending (id INTEGER, kind TEXT, signature TEXT, path TEXT,
+                                   embed_text TEXT, callers TEXT, callees TEXT);
+             INSERT INTO pending VALUES (7, 42, 'sig', 'p', NULL, NULL, NULL);",
+        )
+        .unwrap();
+        let mut stmt = conn
+            .prepare("SELECT id, kind, signature, path, embed_text, callers, callees FROM pending")
+            .unwrap();
+        let rows: Vec<(i64, String)> = stmt
+            .query_map([], pending_row_to_text)
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .expect("mistyped column must not fail the row");
+        assert_eq!(rows[0].0, 7);
+        assert!(rows[0].1.contains("sig"));
+    }
+}
+
 #[cfg(test)]
 mod query_memo_tests {
     use super::*;

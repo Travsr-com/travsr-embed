@@ -28,7 +28,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::model::ModelDescriptor;
+use crate::model::{MacosEngine, ModelDescriptor};
 
 /// A ready-to-use inference engine bound to one loaded model.
 pub trait EmbedBackend: Send + Sync {
@@ -102,7 +102,39 @@ fn registry() -> Vec<Box<dyn BackendFactory>> {
     factories.push(Box::new(tract::TractFactory));
     #[cfg(feature = "ort")]
     factories.push(Box::new(ort::OrtFactory::cpu()));
+
+    apply_engine_override(
+        &mut factories,
+        std::env::var("TRAVSR_EMBED_ENGINE").ok().as_deref(),
+    );
     factories
+}
+
+/// Kill-switch (no rebuild required): force the pure-Rust tract CPU engine when
+/// the ORT/CoreML path misbehaves — e.g. the macOS CoreML EP's per-inference
+/// native leak. `TRAVSR_EMBED_ENGINE=tract` drops every ORT factory (both the
+/// accelerated and CPU ORT engines) so the resolver can only pick tract; `auto`
+/// or unset keeps the normal preference cascade; anything else is ignored with a
+/// warning.
+///
+/// Applied inside [`registry()`] so [`capabilities()`] reports the same
+/// restricted set the resolver will use — the handshake never advertises
+/// acceleration the user has switched off. Split out from `registry()` (taking
+/// the env value as an argument) so the filtering can be tested without mutating
+/// process-wide env under a parallel test run.
+fn apply_engine_override(factories: &mut Vec<Box<dyn BackendFactory>>, engine: Option<&str>) {
+    match engine.map(str::trim) {
+        Some(v) if v.eq_ignore_ascii_case("tract") => {
+            factories.retain(|f| f.engine() == "tract");
+        }
+        Some(v) if !v.is_empty() && !v.eq_ignore_ascii_case("auto") => {
+            tracing::warn!(
+                value = v,
+                "unknown TRAVSR_EMBED_ENGINE (expected 'tract' or 'auto') — using default engine selection"
+            );
+        }
+        _ => {}
+    }
 }
 
 /// What this compiled sidecar can run, for the CLI's pre-flight handshake.
@@ -162,10 +194,55 @@ pub fn create_backend(model_dir: &Path, desc: &ModelDescriptor) -> Result<Arc<dy
 }
 
 fn resolve(
-    mut factories: Vec<Box<dyn BackendFactory>>,
+    factories: Vec<Box<dyn BackendFactory>>,
     model_dir: &Path,
     desc: &ModelDescriptor,
 ) -> Result<Arc<dyn EmbedBackend>> {
+    resolve_with(factories, model_dir, desc, cfg!(target_os = "macos"))
+}
+
+/// Whether the default ordering should rank tract above the accelerated ORT
+/// engine. macOS-only (that is the platform where "accelerated" is CoreML, which
+/// loses to tract for the BERT models we ship, see issue #19) and off when the
+/// model explicitly opted into ORT via `macos_engine = "ort"`.
+fn prefer_tract_over_accelerated(macos_engine: MacosEngine, is_macos: bool) -> bool {
+    is_macos && macos_engine != MacosEngine::Ort
+}
+
+/// Whether the model's catalog entry forces tract-only on this host: the
+/// per-model twin of the `TRAVSR_EMBED_ENGINE=tract` kill-switch.
+fn forces_tract_only(macos_engine: MacosEngine, is_macos: bool) -> bool {
+    is_macos && macos_engine == MacosEngine::Tract
+}
+
+/// Sort key: tract is lifted just above [`PREF_ACCELERATED`] when `prefer_tract`
+/// is set, so it wins whenever it survived the capability filter; otherwise each
+/// factory keeps its declared preference.
+fn effective_preference(f: &dyn BackendFactory, prefer_tract: bool) -> i32 {
+    if prefer_tract && f.engine() == "tract" {
+        PREF_ACCELERATED + 1
+    } else {
+        f.preference()
+    }
+}
+
+/// Testable core of [`resolve`]. `is_macos` is threaded in explicitly (rather
+/// than read from `cfg!` here) so the macOS-specific ordering is deterministic
+/// to unit-test on any host / CI runner.
+fn resolve_with(
+    mut factories: Vec<Box<dyn BackendFactory>>,
+    model_dir: &Path,
+    desc: &ModelDescriptor,
+    is_macos: bool,
+) -> Result<Arc<dyn EmbedBackend>> {
+    // Catalog per-model override: `macos_engine = "tract"` drops every ORT
+    // factory before capability filtering, the per-model twin of the
+    // TRAVSR_EMBED_ENGINE kill-switch. `"ort"` and `"auto"` change only the
+    // ordering below, not the candidate set.
+    if forces_tract_only(desc.macos_engine, is_macos) {
+        factories.retain(|f| f.engine() == "tract");
+    }
+
     let compiled: Vec<&str> = factories.iter().map(|f| f.engine()).collect();
     factories.retain(|f| f.can_run(&desc.family));
     anyhow::ensure!(
@@ -175,7 +252,12 @@ fn resolve(
         desc.family,
         compiled.join(", ")
     );
-    factories.sort_by_key(|f| Reverse(f.preference()));
+    // Default ordering, with the macOS flip: tract outranks the accelerated ORT
+    // (CoreML) engine for families tract can run (issue #19). Off macOS
+    // "accelerated" is CUDA/etc. and keeps its top preference; a model that set
+    // `macos_engine = "ort"` also keeps accelerated-first.
+    let prefer_tract = prefer_tract_over_accelerated(desc.macos_engine, is_macos);
+    factories.sort_by_key(|f| Reverse(effective_preference(f.as_ref(), prefer_tract)));
 
     let mut failures: Vec<String> = Vec::new();
     for factory in &factories {
@@ -213,7 +295,7 @@ fn resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Pooling;
+    use crate::model::{MacosEngine, Pooling};
 
     fn desc(family: &str) -> ModelDescriptor {
         ModelDescriptor {
@@ -223,6 +305,7 @@ mod tests {
             n_inputs: 3,
             truncate_dim: 0,
             family: family.to_owned(),
+            macos_engine: MacosEngine::Auto,
         }
     }
 
@@ -326,14 +409,81 @@ mod tests {
         })
     }
 
+    /// Baseline resolve on a NON-macOS host, so the macOS-only tract flip is off
+    /// and these assert the platform-neutral capability/preference behaviour.
+    /// macOS-specific ordering has its own tests via [`run_macos`].
     fn run(factories: Vec<Box<dyn BackendFactory>>, family: &str) -> Result<Arc<dyn EmbedBackend>> {
-        resolve(factories, Path::new("/nonexistent"), &desc(family))
+        resolve_with(factories, Path::new("/nonexistent"), &desc(family), false)
+    }
+
+    /// Resolve as if on macOS with an explicit `macos_engine`, to exercise the
+    /// flip and the catalog override deterministically on any CI host.
+    fn run_macos(
+        factories: Vec<Box<dyn BackendFactory>>,
+        family: &str,
+        macos_engine: MacosEngine,
+    ) -> Result<Arc<dyn EmbedBackend>> {
+        let mut d = desc(family);
+        d.macos_engine = macos_engine;
+        resolve_with(factories, Path::new("/nonexistent"), &d, true)
     }
 
     fn run_expecting_err(factories: Vec<Box<dyn BackendFactory>>, family: &str) -> String {
         match run(factories, family) {
             Ok(b) => panic!("expected error, got backend '{}'", b.backend_name()),
             Err(e) => format!("{e:#}"),
+        }
+    }
+
+    fn engine_names(factories: &[Box<dyn BackendFactory>]) -> Vec<&'static str> {
+        factories.iter().map(|f| f.engine()).collect()
+    }
+
+    /// The kill-switch: `TRAVSR_EMBED_ENGINE=tract` must drop every ORT factory
+    /// (accelerated + CPU) so the resolver can only reach tract — this is the
+    /// no-rebuild escape from the macOS CoreML EP's per-inference native leak.
+    /// Case-insensitive and whitespace-tolerant so a value from a shell profile
+    /// still takes effect.
+    #[test]
+    fn engine_override_tract_drops_every_ort_factory() {
+        for value in ["tract", "TRACT", "  tract  "] {
+            let mut factories = vec![
+                ort_accel_like(Outcome::Chosen),
+                tract_like(Outcome::Chosen),
+                ort_cpu_like(Outcome::Chosen),
+            ];
+            apply_engine_override(&mut factories, Some(value));
+            assert_eq!(
+                engine_names(&factories),
+                vec!["tract"],
+                "value {value:?} must leave only the tract factory"
+            );
+        }
+    }
+
+    /// `auto`, unset, empty, and unrecognised values all leave the cascade
+    /// untouched — the kill-switch only ever *removes* ORT, never silently
+    /// changes selection for a typo.
+    #[test]
+    fn engine_override_auto_unset_and_unknown_keep_all_factories() {
+        for value in [
+            None,
+            Some("auto"),
+            Some("AUTO"),
+            Some(""),
+            Some("gpu-please"),
+        ] {
+            let mut factories = vec![
+                ort_accel_like(Outcome::Chosen),
+                tract_like(Outcome::Chosen),
+                ort_cpu_like(Outcome::Chosen),
+            ];
+            apply_engine_override(&mut factories, value);
+            assert_eq!(
+                engine_names(&factories),
+                vec!["ort-accelerated", "tract", "ort-cpu"],
+                "value {value:?} must not change the factory list"
+            );
         }
     }
 
@@ -468,6 +618,107 @@ mod tests {
             msg.contains("ort-accelerated") && msg.contains("ort-cpu"),
             "{msg}"
         );
+    }
+
+    // ── macOS engine policy: the tract flip + catalog override (issue #19) ──
+
+    /// macOS auto: for a family tract can run, tract now outranks the confirmed
+    /// CoreML accelerator (the flip) — CoreML loses to tract for shipped BERT.
+    #[test]
+    fn macos_auto_prefers_tract_over_coreml_for_runnable_family() {
+        let b = run_macos(
+            vec![
+                ort_accel_like(Outcome::Chosen),
+                tract_like(Outcome::Chosen),
+                ort_cpu_like(Outcome::Chosen),
+            ],
+            "bert",
+            MacosEngine::Auto,
+        )
+        .unwrap();
+        assert_eq!(b.backend_name(), "tract");
+    }
+
+    /// macOS auto: a family tract cannot run still uses accelerated ORT — the
+    /// flip only lifts tract when tract survived the capability filter.
+    #[test]
+    fn macos_auto_still_uses_accelerated_when_tract_cannot_run() {
+        let b = run_macos(
+            vec![
+                ort_accel_like(Outcome::Chosen),
+                tract_like(Outcome::Chosen),
+                ort_cpu_like(Outcome::Chosen),
+            ],
+            "modernbert",
+            MacosEngine::Auto,
+        )
+        .unwrap();
+        assert_eq!(b.backend_name(), "ort-accelerated");
+    }
+
+    /// Catalog `macos_engine = "ort"` opts a model back into accelerated-first
+    /// even on macOS — the escape valve for a model benchmarked faster on CoreML.
+    #[test]
+    fn macos_engine_ort_restores_accelerated_first() {
+        let b = run_macos(
+            vec![
+                ort_accel_like(Outcome::Chosen),
+                tract_like(Outcome::Chosen),
+                ort_cpu_like(Outcome::Chosen),
+            ],
+            "bert",
+            MacosEngine::Ort,
+        )
+        .unwrap();
+        assert_eq!(b.backend_name(), "ort-accelerated");
+    }
+
+    /// Catalog `macos_engine = "tract"` drops every ORT factory, the per-model
+    /// twin of the kill-switch.
+    #[test]
+    fn macos_engine_tract_forces_tract_only() {
+        let b = run_macos(
+            vec![
+                ort_accel_like(Outcome::Chosen),
+                tract_like(Outcome::Chosen),
+                ort_cpu_like(Outcome::Chosen),
+            ],
+            "bert",
+            MacosEngine::Tract,
+        )
+        .unwrap();
+        assert_eq!(b.backend_name(), "tract");
+    }
+
+    /// Forcing tract on a family tract cannot run errors loudly rather than
+    /// silently using an ORT engine the operator switched off for this model.
+    #[test]
+    fn macos_engine_tract_on_incapable_family_errors() {
+        let mut d = desc("modernbert");
+        d.macos_engine = MacosEngine::Tract;
+        let r = resolve_with(
+            vec![ort_accel_like(Outcome::Chosen), tract_like(Outcome::Chosen)],
+            Path::new("/nonexistent"),
+            &d,
+            true,
+        );
+        assert!(r.is_err(), "tract-forced on modernbert must error loudly");
+    }
+
+    #[test]
+    fn prefer_tract_and_forces_tract_only_truth_table() {
+        use MacosEngine::{Auto, Ort, Tract};
+        // Flip tract over accelerated: macOS, unless the model asked for ORT.
+        assert!(prefer_tract_over_accelerated(Auto, true));
+        assert!(prefer_tract_over_accelerated(Tract, true));
+        assert!(!prefer_tract_over_accelerated(Ort, true));
+        assert!(!prefer_tract_over_accelerated(Auto, false));
+        assert!(!prefer_tract_over_accelerated(Tract, false));
+        // Force tract-only: macOS + Tract only.
+        assert!(forces_tract_only(Tract, true));
+        assert!(!forces_tract_only(Auto, true));
+        assert!(!forces_tract_only(Ort, true));
+        assert!(!forces_tract_only(Tract, false));
     }
 
     // ── Real registry / factory properties ──────────────────────────────────

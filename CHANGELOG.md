@@ -5,6 +5,27 @@ All notable changes to `travsr-embed` are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **A killed reindex could poison every later run and turn the serving daemon
+  into an allocation loop (travsr#735 follow-up).** Three hardening changes:
+  (1) a partial/corrupt `.hnsw.usearch` left by an interrupted run made every
+  subsequent reindex fail at load, exit 1, and get respawned by the daemon each
+  tick, forever; the reindex write path now quarantines an unloadable index as
+  `.corrupt` and rebuilds from embed.db, and stale `.usearch.tmp` files are
+  swept. (2) The daemon-mode KNN path retried a failed index reload on every
+  single call and re-mapped the file per query when its mtime kept moving; both
+  are now throttled to one attempt per 5 seconds, and a served (mmap) index
+  keeps answering from the previous mapping when a re-view fails instead of
+  degrading to an empty index. (3) Pending rows whose text columns failed to
+  decode (unexpected NULL or mistyped values) were silently dropped and then
+  re-selected by `NOT EXISTS` in every later chunk; decoding is now
+  NULL-tolerant so every selected row is embedded and inserted, residual
+  failures are counted and logged, and a chunk consisting only of undecodable
+  rows aborts the run loudly instead of ending it "successfully" with pending
+  work the daemon would respawn forever.
+
 ## [1.4.0] - 2026-08-15
 
 Completes the second half of issue #6. 1.3.0 landed the engine architecture; this

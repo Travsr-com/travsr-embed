@@ -38,6 +38,37 @@ fn reload_due(mtime_changed: bool, last_attempt: Option<Instant>, now: Instant) 
     mtime_changed && last_attempt.is_none_or(|t| now.duration_since(t) >= RELOAD_MIN_INTERVAL)
 }
 
+/// Smallest on-disk size a legitimately published index can have.
+///
+/// usearch's native `view()`/`load()` parse the file header without
+/// validation and can SIGSEGV on truncated bytes (observed under test on
+/// Linux), so obviously-degenerate files must be rejected in Rust before any
+/// native parsing. Every published code/doc index holds at least one
+/// f32-384 vector (1536 bytes of data alone) and is written via
+/// save-to-tmp + rename, so a smaller file is always truncation residue from
+/// a killed process, never a valid index. This floor cannot catch LARGE
+/// garbage; that residual risk is bounded by the host's respawn cap.
+const MIN_PLAUSIBLE_INDEX_BYTES: u64 = 512;
+
+/// Cheap Rust-side sanity gate run before handing a file to native usearch
+/// parsing (travsr#735 follow-up). Errors on files too small to be a real
+/// index; the caller decides whether to quarantine (write path) or keep
+/// serving the previous index (serve path).
+fn plausible_index_file(index_path: &Path) -> Result<()> {
+    let len = std::fs::metadata(index_path)
+        .with_context(|| format!("stat {}", index_path.display()))?
+        .len();
+    anyhow::ensure!(
+        len >= MIN_PLAUSIBLE_INDEX_BYTES,
+        "index file {} is {} bytes, below the {} byte minimum any published \
+         index can have; treating as truncated residue from an interrupted run",
+        index_path.display(),
+        len,
+        MIN_PLAUSIBLE_INDEX_BYTES
+    );
+    Ok(())
+}
+
 /// Move a corrupt index file aside as `<name>.corrupt` so the next open starts
 /// from a clean slate instead of failing on the same bytes forever (travsr#735
 /// follow-up: nothing ever cleaned a corrupt index, so a reindex that died
@@ -147,6 +178,9 @@ impl VecIndex {
         if !index_path.exists() {
             return Ok(None);
         }
+        // Reject truncation residue before native parsing (see
+        // MIN_PLAUSIBLE_INDEX_BYTES); the reindex caller quarantines on Err.
+        plausible_index_file(index_path)?;
         // dim is read from the file by usearch on load() — pass 1 as a placeholder.
         let inner = Index::new(&make_options(1)).context("create usearch Index")?;
         let path_str = index_path
@@ -198,6 +232,9 @@ impl VecIndex {
             if !index_path.exists() {
                 return Ok(None);
             }
+            // Reject truncation residue before native parsing (see
+            // MIN_PLAUSIBLE_INDEX_BYTES).
+            plausible_index_file(index_path)?;
             let inner = Index::new(&make_options(1)).context("create usearch Index")?;
             let path_str = index_path
                 .to_str()
@@ -417,48 +454,18 @@ impl VecIndex {
             Instant::now(),
         ) {
             self.last_reload_attempt = Some(Instant::now());
-            tracing::info!("index file updated — reloading");
-            let path_str = self
-                .index_path
-                .to_str()
-                .ok_or_else(|| anyhow::anyhow!("index path is not valid UTF-8"))?;
-            // A serving handle re-views (mmap), a reindex handle re-loads —
-            // reload must never silently change the handle's mutability class.
-            if self.viewed {
-                // A view is a file mapping, not a RAM copy, so building the
-                // replacement before dropping the old one costs address space
-                // only — and on failure the daemon KEEPS SERVING the previous
-                // index instead of degrading to an empty one (travsr#735
-                // follow-up; the file is published by atomic rename, so a
-                // failed view means a genuinely bad file, not a torn write).
-                let fresh = Index::new(&make_options(1)).context("create usearch Index")?;
-                match fresh.view(path_str) {
-                    Ok(()) => {
-                        self.inner = fresh;
-                        self.last_modified = mtime;
-                        tracing::info!(count = self.inner.size(), "HNSW index reloaded");
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            path = %self.index_path.display(),
-                            "re-view of updated HNSW index failed; keeping the \
-                             previous index and retrying after backoff: {e}"
-                        );
-                    }
-                }
+            // Reject truncation residue BEFORE freeing or replacing anything:
+            // native usearch parsing can crash on such bytes, and even a clean
+            // failure would cost the current index on the load() branch. Keep
+            // whatever is being served (search proceeds below on the current
+            // index) and retry after the backoff.
+            if let Err(e) = plausible_index_file(&self.index_path) {
+                tracing::warn!(
+                    "updated index file looks like truncation residue; keeping \
+                     the current index and retrying after backoff: {e}"
+                );
             } else {
-                // #736 C2: a load() is a RAM copy, so free the old graph BEFORE
-                // loading the new file — building the replacement while the old
-                // one is alive is a transient 2x of the index's full size, at
-                // exactly the moment a just-finished reindex has already
-                // elevated memory. A reload that then fails leaves an empty
-                // index; the throttle above bounds how often it is retried.
-                self.inner = Index::new(&make_options(1)).context("create usearch Index")?;
-                self.inner
-                    .load(path_str)
-                    .context("reload usearch index from disk")?;
-                self.last_modified = mtime;
-                tracing::info!(count = self.inner.size(), "HNSW index reloaded");
+                self.reload_from_disk(mtime)?;
             }
         }
 
@@ -478,6 +485,55 @@ impl VecIndex {
             .zip(results.distances.iter())
             .map(|(&key, &dist)| (key as i64, dist))
             .collect())
+    }
+
+    /// Replace `inner` from the on-disk file after an mtime change; called
+    /// only through the throttled, plausibility-checked gate in [`Self::knn`].
+    fn reload_from_disk(&mut self, mtime: SystemTime) -> Result<()> {
+        tracing::info!("index file updated — reloading");
+        let path_str = self
+            .index_path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("index path is not valid UTF-8"))?;
+        // A serving handle re-views (mmap), a reindex handle re-loads —
+        // reload must never silently change the handle's mutability class.
+        if self.viewed {
+            // A view is a file mapping, not a RAM copy, so building the
+            // replacement before dropping the old one costs address space
+            // only — and on failure the daemon KEEPS SERVING the previous
+            // index instead of degrading to an empty one (travsr#735
+            // follow-up; the file is published by atomic rename, so a
+            // failed view means a genuinely bad file, not a torn write).
+            let fresh = Index::new(&make_options(1)).context("create usearch Index")?;
+            match fresh.view(path_str) {
+                Ok(()) => {
+                    self.inner = fresh;
+                    self.last_modified = mtime;
+                    tracing::info!(count = self.inner.size(), "HNSW index reloaded");
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %self.index_path.display(),
+                        "re-view of updated HNSW index failed; keeping the \
+                         previous index and retrying after backoff: {e}"
+                    );
+                }
+            }
+        } else {
+            // #736 C2: a load() is a RAM copy, so free the old graph BEFORE
+            // loading the new file — building the replacement while the old
+            // one is alive is a transient 2x of the index's full size, at
+            // exactly the moment a just-finished reindex has already
+            // elevated memory. A reload that then fails leaves an empty
+            // index; the throttle in knn() bounds how often it is retried.
+            self.inner = Index::new(&make_options(1)).context("create usearch Index")?;
+            self.inner
+                .load(path_str)
+                .context("reload usearch index from disk")?;
+            self.last_modified = mtime;
+            tracing::info!(count = self.inner.size(), "HNSW index reloaded");
+        }
+        Ok(())
     }
 
     /// Reserve capacity for `total` elements (absolute, not additional).
@@ -581,10 +637,11 @@ mod tests {
     }
 
     /// travsr#735 follow-up: when a served index is replaced on disk by
-    /// garbage, the daemon must keep answering from the previously mapped
-    /// index instead of degrading to an empty one, and must not retry the
-    /// failed re-view on every call inside the backoff window.
-    #[cfg(not(windows))] // windows serves from a load() copy; keep-old applies to views
+    /// truncation residue, the daemon must keep answering from the previously
+    /// held index instead of degrading to an empty one (or handing the bytes
+    /// to native usearch parsing, which was observed to SIGSEGV on Linux),
+    /// and must not retry on every call inside the backoff window. Runs on
+    /// every platform: the plausibility gate fires before the view/load split.
     #[test]
     fn failed_review_keeps_serving_the_old_index() {
         let dir =
@@ -612,15 +669,40 @@ mod tests {
         std::fs::write(&garbage, b"garbage that is not an index").unwrap();
         std::fs::rename(&garbage, &path).unwrap();
 
-        // The re-view fails, but KNN must still answer from the old mapping.
+        // The reload is refused by the plausibility gate, and KNN must still
+        // answer from the previously held index.
         let results = served
             .knn(&query, 3)
-            .expect("knn must not error when the re-view fails");
+            .expect("knn must not error when the replacement file is rejected");
         assert_eq!(
             results[0].0, 3,
-            "old index must keep serving after a failed re-view"
+            "old index must keep serving after a rejected reload"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// travsr#735 follow-up: the write path's try_load must reject truncation
+    /// residue with a clean Err (which the reindex caller quarantines), never
+    /// hand it to native parsing.
+    #[test]
+    fn try_load_rejects_truncation_residue_cleanly() {
+        let dir = std::env::temp_dir().join(format!(
+            "travsr_embed_tiny_index_test_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tiny.hnsw.usearch");
+        std::fs::write(&path, b"way too small to be an index").unwrap();
+
+        let err = match VecIndex::try_load(&path) {
+            Ok(_) => panic!("tiny file must be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("below the"),
+            "error must explain the size floor, got: {err:#}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

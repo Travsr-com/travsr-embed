@@ -8,23 +8,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
-- **A killed reindex could poison every later run and turn the serving daemon
-  into an allocation loop (travsr#735 follow-up).** Three hardening changes:
-  (1) a partial/corrupt `.hnsw.usearch` left by an interrupted run made every
-  subsequent reindex fail at load, exit 1, and get respawned by the daemon each
-  tick, forever; the reindex write path now quarantines an unloadable index as
-  `.corrupt` and rebuilds from embed.db, and stale `.usearch.tmp` files are
-  swept. (2) The daemon-mode KNN path retried a failed index reload on every
-  single call and re-mapped the file per query when its mtime kept moving; both
-  are now throttled to one attempt per 5 seconds, and a served (mmap) index
-  keeps answering from the previous mapping when a re-view fails instead of
-  degrading to an empty index. (3) Pending rows whose text columns failed to
-  decode (unexpected NULL or mistyped values) were silently dropped and then
-  re-selected by `NOT EXISTS` in every later chunk; decoding is now
-  NULL-tolerant so every selected row is embedded and inserted, residual
-  failures are counted and logged, and a chunk consisting only of undecodable
-  rows aborts the run loudly instead of ending it "successfully" with pending
-  work the daemon would respawn forever.
+- **Crash residue from a killed reindex could crash or stall the serving
+  sidecar (travsr#735 follow-up).** Four hardening changes:
+
+  1. **Truncated index bytes could SIGSEGV the process.** usearch's native
+     `view()`/`load()` parse the file header without validating it, so a
+     partially-written `.hnsw.usearch` from a killed run could crash the
+     sidecar outright rather than returning an error (reproduced on Linux and
+     macOS CI). Every published index holds at least one f32-384 vector and is
+     written save-to-tmp + rename, so a file below a 512-byte floor is always
+     truncation residue; it is now rejected in Rust before any native parsing,
+     on the serve path, the load path, and the KNN reload path.
+  2. **A failed index reload was retried on every KNN call, forever**, and a
+     rapidly republished file was re-mapped per query — both construct a fresh
+     native index per query. Reload attempts are now throttled to one per five
+     seconds, and a served (mmap) index keeps answering from its previous
+     mapping when a reload is rejected instead of degrading to an empty index.
+  3. **A corrupt index was never cleaned up on the load-based reindex path.**
+     A direct `--reindex` without `--parallel` failed at load and exited 1 on
+     every attempt; that path now quarantines the unloadable file as
+     `.corrupt` and rebuilds from embed.db, and stale `.usearch.tmp` files are
+     swept. (The `--parallel` path the daemon always uses never loads the
+     existing index — it rebuilds and renames at end of run — so it already
+     recovered on its own.)
+  4. **Undecodable pending rows were silently dropped** by `filter_map(r.ok())`
+     and then re-selected by `NOT EXISTS` in every later chunk. Decoding is now
+     NULL-tolerant so every selected row is embedded and inserted, residual
+     failures are counted and logged, and a chunk consisting only of
+     undecodable rows aborts loudly instead of ending the run "successfully"
+     with pending work the daemon would respawn forever.
 
 ## [1.4.0] - 2026-08-15
 
